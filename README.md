@@ -1,3 +1,15 @@
+> [!NOTE]
+> **This is a personal fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).**
+>
+> - **Upstream:** [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent) — the canonical source; bug reports and PRs go there.
+> - **This repo:** `cachacon-ai/hermes-agent-linux-pantheon` — my Linux/Pantheon track. `upstream` remote points at NousResearch; everything below is the upstream README preserved verbatim.
+> - **Frozen snapshot:** the [`known-good-linux-pantheon-2026-09-03`](https://github.com/cachacon-ai/hermes-agent-linux-pantheon/releases/tag/known-good-linux-pantheon-2026-09-03) tag points at commit `527da6084`, the last state I personally confirmed working on my machine.
+> - **Other fork:** I also keep a separate frozen July snapshot at [`cachacon-ai/hermes-agent`](https://github.com/cachacon-ai/hermes-agent) — deliberately preserved old state, please do not mix the two up.
+>
+> If you arrived here from the install command on the upstream site, you want [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent), not this fork.
+
+---
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
