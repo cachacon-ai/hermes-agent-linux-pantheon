@@ -180,3 +180,53 @@ class TestCustomReasoningWithNumCtx:
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
 
+
+class TestQwen38FlashNextUserTurnWireShape:
+    """Local qwen3.8-flash-next uses chat_template_kwargs, not top-level effort."""
+
+    def test_low_user_turn_body(self, custom_profile):
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "low"},
+            model="qwen3.8-flash-next",
+            base_url="http://127.0.0.1:8080/v1",
+        )
+        assert tl == {}
+        assert eb["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+            "reasoning_effort": "low",
+        }
+
+    def test_non_qwen_custom_still_uses_top_level_reasoning_effort(self, custom_profile):
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="glm-5.2",
+            base_url="http://127.0.0.1:8080/v1",
+        )
+        assert tl == {"reasoning_effort": "high"}
+        assert "chat_template_kwargs" not in eb
+
+    def test_qwen_caps_max_tokens_via_profile_default(self, custom_profile):
+        assert custom_profile.get_max_tokens("qwen3.8-flash-next") == 8192
+        assert custom_profile.get_max_tokens("glm-5.2") == 65536
+
+    def test_qwen_low_user_turn_full_kwargs(self, custom_profile):
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        kw = ChatCompletionsTransport().build_kwargs(
+            model="qwen3.8-flash-next",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            provider_profile=custom_profile,
+            reasoning_config={"enabled": True, "effort": "low"},
+            base_url="http://127.0.0.1:8080/v1",
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+        )
+        assert "reasoning_effort" not in kw
+        assert kw["max_tokens"] == 8192
+        assert kw["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+            "reasoning_effort": "low",
+        }
+
