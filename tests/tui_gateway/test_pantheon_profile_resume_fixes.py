@@ -169,28 +169,40 @@ class TestProviderSwitchClearsKeyEnv:
         assert "key_env" not in model_cfg
         assert model_cfg["api_key"] == "sk-inline-should-stay"
 
+    def test_provider_switch_scrubs_legacy_api_when_key_env_present(self):
+        with patch.dict(
+            sys.modules,
+            {"hermes_cli.env_loader": MagicMock(), "hermes_cli.banner": MagicMock()},
+        ):
+            from hermes_cli.web_server import _apply_main_model_assignment
+
+        model_cfg = {
+            "provider": "engramhalo",
+            "default": "qwen3.8-flash-next",
+            "key_env": "ENGRAMHALO_API_KEY",
+            "api": "sk-legacy-alias",
+        }
+        _apply_main_model_assignment(model_cfg, "ollama-cloud", "glm-5.1")
+        assert "key_env" not in model_cfg
+        assert "api" not in model_cfg
+
 
 class TestEagerResumeReasoningOnPublishedSession:
-    @pytest.mark.parametrize(
-        "title",
-        ["Regular chat", "Bot Chat"],
-    )
-    def test_eager_resume_sets_create_reasoning_on_live_session(
-        self, resume_server, hermes_home, title
+    def test_eager_resume_sets_create_reasoning_on_normal_chat(
+        self, resume_server, hermes_home
     ):
         db = SessionDB(db_path=hermes_home / "state.db")
-        reasoning = {"enabled": True, "effort": "xhigh" if title == "Bot Chat" else "low"}
-        model_config = {
-            "model": "test-model",
-            "provider": "openrouter",
-            "reasoning_config": reasoning,
-        }
-        if title == "Bot Chat":
-            model_config["follow_profile_config"] = True
-        sid = _seed_resume_row(db, title=title, model_config=model_config)
+        reasoning = {"enabled": True, "effort": "low"}
+        sid = _seed_resume_row(
+            db,
+            title="Regular chat",
+            model_config={
+                "model": "test-model",
+                "provider": "openrouter",
+                "reasoning_config": reasoning,
+            },
+        )
         db.close()
-
-        effort_before = yaml.safe_load(get_config_path().read_text())["agent"]["reasoning_effort"]
 
         resp = resume_server.handle_request(
             {
@@ -200,12 +212,61 @@ class TestEagerResumeReasoningOnPublishedSession:
             }
         )
         assert "error" not in resp, resp.get("error")
-        live_sid = resp["result"]["session_id"]
-        published = resume_server._sessions[live_sid]
+        published = resume_server._sessions[resp["result"]["session_id"]]
         assert published["create_reasoning_override"] == reasoning
+
+    def _assert_bot_chat_skips_model_pin(self, resume_server, hermes_home, model_config):
+        db = SessionDB(db_path=hermes_home / "state.db")
+        sid = _seed_resume_row(db, title="Bot Chat", model_config=model_config)
+        db.close()
+
+        effort_before = yaml.safe_load(get_config_path().read_text())["agent"]["reasoning_effort"]
+        reasoning = model_config["reasoning_config"]
+
+        resp = resume_server.handle_request(
+            {
+                "id": "resume",
+                "method": "session.resume",
+                "params": {"session_id": sid, "eager_build": True, "omit_messages": True},
+            }
+        )
+        assert "error" not in resp, resp.get("error")
+        published = resume_server._sessions[resp["result"]["session_id"]]
+        assert published["create_reasoning_override"] == reasoning
+        assert published.get("model_override") is None
+        overrides = published.get("resume_runtime_overrides") or {}
+        assert overrides.get("model_override") is None
+        assert overrides.get("provider_override") is None
 
         effort_after = yaml.safe_load(get_config_path().read_text())["agent"]["reasoning_effort"]
         assert effort_after == effort_before == "medium"
+
+    def test_eager_resume_bot_chat_with_follow_profile_config_marker(
+        self, resume_server, hermes_home
+    ):
+        self._assert_bot_chat_skips_model_pin(
+            resume_server,
+            hermes_home,
+            {
+                "model": "test-model",
+                "provider": "openrouter",
+                "follow_profile_config": True,
+                "reasoning_config": {"enabled": True, "effort": "xhigh"},
+            },
+        )
+
+    def test_eager_resume_legacy_bot_chat_title_only(
+        self, resume_server, hermes_home
+    ):
+        self._assert_bot_chat_skips_model_pin(
+            resume_server,
+            hermes_home,
+            {
+                "model": "test-model",
+                "provider": "openrouter",
+                "reasoning_config": {"enabled": True, "effort": "medium"},
+            },
+        )
 
 
 class TestBranchModelConfigMerge:
