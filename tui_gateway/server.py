@@ -5552,6 +5552,37 @@ def _overrides_have_routable_provider(overrides: dict) -> bool:
         return False
 
 
+def _parse_stored_row_model_config(row: dict) -> dict:
+    raw_config = row.get("model_config")
+    if isinstance(raw_config, dict):
+        return raw_config
+    if isinstance(raw_config, str) and raw_config.strip():
+        try:
+            parsed = json.loads(raw_config)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            logger.debug("failed to parse stored session model_config", exc_info=True)
+    return {}
+
+
+def _reasoning_only_stored_runtime_overrides(model_config: dict) -> dict:
+    reasoning_config = model_config.get("reasoning_config")
+    if isinstance(reasoning_config, dict):
+        return {"reasoning_config_override": reasoning_config}
+    return {}
+
+
+def _sync_create_reasoning_override_from_resume_overrides(session: dict) -> None:
+    """Cold resume: non-routable stored bundles read create_reasoning_override."""
+    overrides = session.get("resume_runtime_overrides")
+    if not isinstance(overrides, dict):
+        return
+    reasoning_config = overrides.get("reasoning_config_override")
+    if isinstance(reasoning_config, dict):
+        session["create_reasoning_override"] = dict(reasoning_config)
+
+
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """Return runtime fields persisted with a stored session.
 
@@ -5563,6 +5594,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """
     if not row:
         return {}
+
+    model_config = _parse_stored_row_model_config(row)
 
     # Bot-Mode room plumbing sessions (hidden, titled "Group: <name>") are
     # per-member scratch conversations inside a group chat. They must always
@@ -5580,22 +5613,12 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # shape is kept as a legacy fallback so rows created by older desktop
     # builds (which never sent the marker) still behave correctly until the
     # client catches up.
-    raw_plumbing = row.get("model_config")
-    if isinstance(raw_plumbing, dict):
-        _plumbing_marker = raw_plumbing.get("room_plumbing")
-    elif isinstance(raw_plumbing, str) and raw_plumbing.strip():
-        try:
-            _plumbing_marker = json.loads(raw_plumbing).get("room_plumbing")
-        except Exception:
-            _plumbing_marker = None
-    else:
-        _plumbing_marker = None
-    if _plumbing_marker:
-        return {}
+    if model_config.get("room_plumbing"):
+        return _reasoning_only_stored_runtime_overrides(model_config)
     _row_title = str(row.get("title") or "").strip()
     _row_hidden = row.get("hidden")
     if _row_hidden and _row_title.startswith("Group:"):
-        return {}
+        return _reasoning_only_stored_runtime_overrides(model_config)
 
     # Bot-Mode canonical chats (the ONE forever DM per bot) and room plumbing
     # sessions are plugin-owned scratch conversations. They must always rebuild
@@ -5609,18 +5632,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # The primary signal is the EXPLICIT ``follow_profile_config`` contract
     # persisted by session.create consumers (desktop Bot Mode) — a deliberate
     # marker, not a presentation heuristic.
-    raw_follow = row.get("model_config")
-    if isinstance(raw_follow, dict):
-        _follow_marker = raw_follow.get("follow_profile_config")
-    elif isinstance(raw_follow, str) and raw_follow.strip():
-        try:
-            _follow_marker = json.loads(raw_follow).get("follow_profile_config")
-        except Exception:
-            _follow_marker = None
-    else:
-        _follow_marker = None
-    if _follow_marker:
-        return {}
+    if model_config.get("follow_profile_config"):
+        return _reasoning_only_stored_runtime_overrides(model_config)
     # Legacy backfill: canonical Bot Chats created BEFORE the
     # follow_profile_config contract existed carry no marker, yet they are
     # still the plugin-owned forever-DM. The plugin's own identity rule is
@@ -5630,19 +5643,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # exists in the field stays pinned to its stale stored provider until
     # the user deletes it — the exact live-report shape (#89497 / #94818).
     if _row_title == "Bot Chat":
-        return {}
-
-    raw_config = row.get("model_config")
-    model_config: dict = {}
-    if isinstance(raw_config, dict):
-        model_config = raw_config
-    elif isinstance(raw_config, str) and raw_config.strip():
-        try:
-            parsed = json.loads(raw_config)
-            if isinstance(parsed, dict):
-                model_config = parsed
-        except Exception:
-            logger.debug("failed to parse stored session model_config", exc_info=True)
+        return _reasoning_only_stored_runtime_overrides(model_config)
 
     overrides: dict = {}
     model = str(row.get("model") or model_config.get("model") or "").strip()
@@ -9362,10 +9363,15 @@ def _init_session(
     source: str | None = None,
     profile_home: str | None = None,
     explicit_cwd: bool = False,
+    *,
+    create_reasoning_override: dict | None = None,
+    resume_runtime_overrides: dict | None = None,
+    model_override: dict | None = None,
+    display_history_prefix: list | None = None,
 ):
     now = time.time()
     with _sessions_lock:
-        _sessions[sid] = {
+        session_record = {
             "agent": agent,
             "session_key": key,
             "history": history,
@@ -9393,11 +9399,17 @@ def _init_session(
             # Per-session model override set by an in-session /model switch.
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
-            "model_override": None,
+            "model_override": model_override,
+            "display_history_prefix": list(display_history_prefix or []),
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        if create_reasoning_override is not None:
+            session_record["create_reasoning_override"] = dict(create_reasoning_override)
+        if resume_runtime_overrides is not None:
+            session_record["resume_runtime_overrides"] = resume_runtime_overrides
+        _sessions[sid] = session_record
         _session_todo_state(_sessions[sid])
     _init_owns_db = False
     if session_db is not None:

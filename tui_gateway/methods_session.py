@@ -872,6 +872,7 @@ def _(rid, params: dict) -> dict:
                 resume_runtime_overrides=overrides or None,
                 explicit_cwd=bool(profile_resume_cwd),
             )
+            _sync_create_reasoning_override_from_resume_overrides(record)
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
             record["resume_message_count"] = int(found.get("message_count") or 0)
@@ -973,6 +974,7 @@ def _(rid, params: dict) -> dict:
                 todo_state=_todo_state_from_history(history),
                 explicit_cwd=bool(profile_resume_cwd),
             )
+            _sync_create_reasoning_override_from_resume_overrides(record)
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
 
@@ -1051,6 +1053,10 @@ def _(rid, params: dict) -> dict:
                 # stored session row so switching chats does not inherit whatever
                 # global model another chat last selected.
                 stored_runtime_overrides = _stored_session_runtime_overrides(found)
+                resume_seed = {
+                    "resume_runtime_overrides": stored_runtime_overrides or None,
+                }
+                _sync_create_reasoning_override_from_resume_overrides(resume_seed)
                 agent = _make_agent(
                     sid,
                     target,
@@ -1063,6 +1069,7 @@ def _(rid, params: dict) -> dict:
                     ),
                     **stored_runtime_overrides,
                 )
+                eager_create_reasoning = resume_seed.get("create_reasoning_override")
             finally:
                 _clear_session_context(tokens)
         except Exception as e:
@@ -1111,6 +1118,11 @@ def _(rid, params: dict) -> dict:
                         session_db=db,
                         source=source,
                         explicit_cwd=bool(profile_resume_cwd),
+                        profile_home=str(profile_home) if profile_home else None,
+                        create_reasoning_override=eager_create_reasoning,
+                        resume_runtime_overrides=stored_runtime_overrides or None,
+                        model_override=stored_runtime_overrides.get("model_override"),
+                        display_history_prefix=display_history_prefix,
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
@@ -1148,16 +1160,6 @@ def _(rid, params: dict) -> dict:
                     if init_secret_token is not None:
                         reset_secret_scope(init_secret_token)
                 if sid in _sessions:
-                    if stored_runtime_overrides.get("model_override") is not None:
-                        _sessions[sid]["model_override"] = stored_runtime_overrides[
-                            "model_override"
-                        ]
-                    _sessions[sid]["display_history_prefix"] = display_history_prefix
-                    # Remember the profile home so each turn re-binds HERMES_HOME (the
-                    # agent persists to its own db, but mid-turn home reads — memory,
-                    # skills — must resolve to the resumed profile too).
-                    if profile_home is not None:
-                        _sessions[sid]["profile_home"] = str(profile_home)
                     _sessions[sid]["active_session_lease"] = lease
             except Exception as e:
                 # _init_session registers _sessions[sid] BEFORE its first read

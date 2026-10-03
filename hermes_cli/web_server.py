@@ -2081,21 +2081,23 @@ def _apply_main_model_assignment(
         # re-assignment keeps the user's configured base_url intact.
         model_cfg["base_url"] = ""
     # The endpoint key follows the same lifecycle as base_url: an explicit key
-    # is always persisted; an existing key is dropped only when switching to a
-    # different provider (it belonged to the old endpoint), and preserved on a
-    # same-provider re-pick so re-selecting a model doesn't wipe the key.
+    # argument is always persisted; on a provider switch, stale endpoint
+    # material is cleared — ``key_env`` and the legacy ``api`` alias always go,
+    # and inline ``api_key`` is cleared unless ``key_env`` is also present (the
+    # env indirection is what is being dropped, not a deliberate inline secret).
     if api_key.strip():
         model_cfg["api_key"] = api_key.strip()
         model_cfg.pop("api", None)
     elif (model_cfg.get("api_key") or model_cfg.get("api")) and new_provider != prev_provider:
-        # A stale endpoint secret can live under the legacy ``api`` alias with
-        # no ``api_key`` (the resolver still reads ``model.api`` as a key), so
-        # the switch-clears-the-key path must trigger on either field — else the
-        # old endpoint's secret survives in config.yaml and contaminates a later
-        # custom resolution. clear_model_endpoint_credentials scrubs both.
-        clear_model_endpoint_credentials(model_cfg, clear_api_mode=False)
+        if model_cfg.get("key_env"):
+            model_cfg.pop("api", None)
+        else:
+            clear_model_endpoint_credentials(model_cfg, clear_api_mode=False)
     if new_provider != prev_provider:
-        clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
+        clear_model_endpoint_credentials(
+            model_cfg, clear_api_key=False, clear_key_env=True
+        )
+        model_cfg.pop("api", None)
     model_cfg.pop("context_length", None)
     return model_cfg
 

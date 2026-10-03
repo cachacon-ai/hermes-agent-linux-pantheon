@@ -838,10 +838,10 @@ async def create_profile_endpoint(body: ProfileCreate):
         _log.exception("POST /api/profiles failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Optional explicit model assignment for the new profile. Best-effort:
-    # the profile already exists, so a model-write hiccup must not 500 the
-    # whole create — the user can set the model later from the Models page
-    # or `<profile> setup`.
+    # Optional explicit model assignment for the new profile. Fail closed when
+    # the caller supplied an explicit pin: the profile row already exists, so
+    # a model-write failure is surfaced as HTTP 500 rather than returning
+    # success with the seed/default model still in place.
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
     model_set = False
@@ -849,8 +849,12 @@ async def create_profile_endpoint(body: ProfileCreate):
         try:
             _write_profile_model(path, provider, model)
             model_set = True
-        except Exception:
+        except Exception as e:
             _log.exception("Setting model for new profile %s failed", body.name)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Profile '{body.name}' was created but model assignment failed: {e}",
+            ) from e
 
     # Optional MCP servers. Best-effort, same rationale as model assignment.
     mcp_written = 0

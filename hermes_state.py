@@ -7219,10 +7219,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``create_session`` then carries the real ``model`` / ``model_config`` /
         ``system_prompt``. A plain ``INSERT OR IGNORE`` silently dropped that
         enrichment, leaving gateway sessions with NULL model/billing metadata.
-        The ``ON CONFLICT`` upsert backfills those fields via ``COALESCE`` —
-        only filling columns that are still NULL, never overwriting values an
-        earlier writer already set (so a later bare call with source="unknown"
-        can't clobber a real source/model).
+        The ``ON CONFLICT`` upsert backfills scalar columns via ``COALESCE``
+        (only filling columns that are still NULL). ``model_config`` merges
+        incoming keys into an existing JSON object when the row already
+        exists: non-``None`` values replace/add keys, ``None`` values are
+        ignored (they do not delete keys — agent upserts often carry explicit
+        ``None`` placeholders). When both sides are present on conflict, the
+        merged JSON is stored wholesale.
 
         ``chat_id``/``thread_id`` record the messaging origin (the chat/room and
         thread the session was started in) so that gateway ``/resume`` can prove
@@ -7263,8 +7266,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not (profile_name or "").strip():
             profile_name = self._own_profile_name()
 
+        def _parse_model_config_column(raw) -> Dict[str, Any]:
+            if isinstance(raw, dict):
+                return dict(raw)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return {}
+
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            effective_model_config = model_config
+            if model_config:
+                existing_row = conn.execute(
+                    "SELECT model_config FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if existing_row is not None:
+                    existing_cfg = _parse_model_config_column(
+                        existing_row["model_config"]
+                        if isinstance(existing_row, sqlite3.Row)
+                        else existing_row[0]
+                    )
+                    if existing_cfg:
+                        merged = dict(existing_cfg)
+                        for key, value in model_config.items():
+                            if value is None:
+                                continue
+                            merged[key] = value
+                        effective_model_config = merged
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
@@ -7290,9 +7324,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                                    sessions.model_config, '$._reset_from'
                                )
                            )
-                           ELSE COALESCE(
-                               sessions.model_config, excluded.model_config
-                           )
+                           WHEN excluded.model_config IS NOT NULL
+                           THEN excluded.model_config
+                           ELSE sessions.model_config
                        END,
                        system_prompt_hash = COALESCE(
                            sessions.system_prompt_hash,
@@ -7323,7 +7357,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     chat_type,
                     thread_id,
                     model,
-                    json.dumps(model_config) if model_config else None,
+                    json.dumps(effective_model_config) if effective_model_config else None,
                     system_prompt_hash,
                     parent_session_id,
                     cwd,
