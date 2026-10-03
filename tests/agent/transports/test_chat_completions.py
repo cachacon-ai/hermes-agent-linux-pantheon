@@ -548,6 +548,68 @@ class TestChatCompletionsLmStudioReasoning:
 
 
 
+class TestChatCompletionsEngramHaloReasoning:
+    """EngramHalo (llama-server, provider "engramhalo") reads the TOP-LEVEL
+    ``reasoning_effort`` string into its chat template; ``extra_body.reasoning``
+    is ignored there. The template accepts exactly xhigh|medium|low (high is
+    rewritten to xhigh, anything else raises), so the transport maps high→xhigh
+    and emits only the three accepted levels — an unmapped effort or disabled
+    thinking omits the field rather than raise. Not gated on
+    ``supports_reasoning`` (False for this host): the generic extra_body emit
+    must never fire for engramhalo.
+    """
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
+    def test_emits_top_level_effort(self, transport, effort):
+        kw = transport.build_kwargs(
+            model="qwen3.8-flash-next",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="engramhalo",
+            reasoning_config={"enabled": True, "effort": effort},
+        )
+        assert kw["reasoning_effort"] == effort
+        assert "reasoning" not in kw.get("extra_body", {})
+
+    def test_maps_high_to_xhigh(self, transport):
+        kw = transport.build_kwargs(
+            model="qwen3.8-flash-next",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="engramhalo",
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert kw["reasoning_effort"] == "xhigh"
+        assert "reasoning" not in kw.get("extra_body", {})
+
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [
+            {"enabled": True, "effort": "max"},  # in the wire tuple, raises the template
+            {"enabled": True, "effort": "ultra"},
+            {"enabled": False, "effort": "medium"},  # thinking off — C++ handles it
+            None,  # no override — the template's own default applies
+        ],
+        ids=["max", "ultra", "disabled", "absent"],
+    )
+    def test_omits_field_when_unmapped(self, transport, reasoning_config):
+        kw = transport.build_kwargs(
+            model="qwen3.8-flash-next",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="engramhalo",
+            reasoning_config=reasoning_config,
+        )
+        assert "reasoning_effort" not in kw
+        assert "reasoning" not in kw.get("extra_body", {})
+
+    def test_other_providers_unaffected(self, transport):
+        kw = transport.build_kwargs(
+            model="qwen3.8-flash-next",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="openrouter",
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert "reasoning_effort" not in kw
+
+
 
 class TestChatCompletionsValidate:
 

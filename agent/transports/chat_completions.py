@@ -192,6 +192,33 @@ def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> di
     return reasoning_config
 
 
+def engramhalo_wire_effort(reasoning_config: dict | None) -> str | None:
+    """Map a reasoning_config to EngramHalo's (llama-server) template vocabulary.
+
+    The server's ``oaicompat_chat_params_parse`` reads the TOP-LEVEL
+    ``reasoning_effort`` string into the chat template; ``extra_body.reasoning``
+    is ignored there. The live template accepts exactly ``xhigh | medium | low``
+    (a missing value defaults to xhigh, ``high`` is rewritten to xhigh, and any
+    other value raises the template), and ``none`` turns thinking off in C++
+    before the template runs. So the only safe emissions are the three
+    accepted levels: ``high`` maps to ``xhigh``, and a disabled thinking flag
+    or an unmapped effort returns None — the caller then OMITS the field
+    rather than risk a template raise. Deliberately NOT clamped with
+    ``OPENAI_COMPAT_WIRE_EFFORTS`` (that tuple admits ``high``/``max``;
+    ``max`` would raise this template).
+    """
+    if not isinstance(reasoning_config, dict):
+        return None
+    if reasoning_config.get("enabled") is False:
+        return None
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    if effort == "high":
+        return "xhigh"
+    if effort in ("low", "medium", "xhigh"):
+        return effort
+    return None
+
+
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
     """Translate Hermes/OpenRouter-style reasoning config to Gemini thinkingConfig."""
     if reasoning_config is None or not isinstance(reasoning_config, dict):
@@ -721,12 +748,26 @@ class ChatCompletionsTransport(ProviderTransport):
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
+        # EngramHalo (llama-server, provider "engramhalo"): TOP-LEVEL
+        # reasoning_effort — its oaicompat template reads the top-level field
+        # and ignores extra_body.reasoning, so the generic extra_body emit
+        # below (gated on supports_reasoning, which is False for this host)
+        # never fires. Vocabulary: exactly low|medium|xhigh, with high mapped
+        # to xhigh (engramhalo_wire_effort); anything unmapped omits the
+        # field rather than raise the template. Not gated on
+        # _supports_reasoning_extra_body() — engramhalo is intentionally not
+        # in that host list and must not be added.
+        provider_name = str(params.get("provider_name") or "").strip().lower()
+        if provider_name == "engramhalo":
+            _eh_effort = engramhalo_wire_effort(reasoning_config)
+            if _eh_effort is not None:
+                api_kwargs["reasoning_effort"] = _eh_effort
+
         # extra_body assembly
         extra_body: dict[str, Any] = {}
 
         is_openrouter = params.get("is_openrouter", False)
         is_github_models = params.get("is_github_models", False)
-        provider_name = str(params.get("provider_name") or "").strip().lower()
         base_url = params.get("base_url")
 
         provider_prefs = params.get("provider_preferences")
