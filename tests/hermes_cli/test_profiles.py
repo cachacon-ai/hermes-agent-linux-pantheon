@@ -151,6 +151,50 @@ class TestCreateProfile:
         assert cfg["model"]["provider"] == "nous"
         assert cfg["model"]["default"] == "some/model"
 
+    def test_fresh_profile_inherits_launch_providers_map_without_api_key(
+        self, profile_env
+    ):
+        """Custom providers in ``providers:`` must seed with the new profile.
+
+        The model pin alone is not enough — resolution needs the provider entry
+        (base_url, models, key_env). Inline api_key values must not be copied.
+        """
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {
+                        "provider": "engramhalo",
+                        "default": "qwen3.8-flash-next",
+                    },
+                    "providers": {
+                        "engramhalo": {
+                            "name": "EngramHalo",
+                            "base_url": "http://127.0.0.1:8080/v1",
+                            "key_env": "ENGRAMHALO_API_KEY",
+                            "api_key": "sk-must-not-leak",
+                            "models": {"qwen3.8-flash-next": {}},
+                        }
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile("worker", no_alias=True)
+        raw = (profile_dir / "config.yaml").read_text()
+        cfg = yaml.safe_load(raw)
+
+        assert cfg["model"]["provider"] == "engramhalo"
+        assert cfg["model"]["default"] == "qwen3.8-flash-next"
+        entry = cfg["providers"]["engramhalo"]
+        assert entry["base_url"] == "http://127.0.0.1:8080/v1"
+        assert entry["key_env"] == "ENGRAMHALO_API_KEY"
+        assert entry["models"]["qwen3.8-flash-next"] == {}
+        assert "api_key" not in entry
+        assert "sk-must-not-leak" not in raw
+
 
     def test_fresh_profile_model_is_copied_not_linked(self, profile_env):
         """Profiles stay independent islands.
