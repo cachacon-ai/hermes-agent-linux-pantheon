@@ -7219,10 +7219,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``create_session`` then carries the real ``model`` / ``model_config`` /
         ``system_prompt``. A plain ``INSERT OR IGNORE`` silently dropped that
         enrichment, leaving gateway sessions with NULL model/billing metadata.
-        The ``ON CONFLICT`` upsert backfills those fields via ``COALESCE`` —
-        only filling columns that are still NULL, never overwriting values an
-        earlier writer already set (so a later bare call with source="unknown"
-        can't clobber a real source/model).
+        The ``ON CONFLICT`` upsert backfills scalar columns via ``COALESCE``
+        (only filling columns that are still NULL). ``model_config`` merges
+        incoming keys into an existing JSON object when the row already
+        exists: non-``None`` values replace/add keys, ``None`` values are
+        ignored (they do not delete keys — agent upserts often carry explicit
+        ``None`` placeholders). When both sides are present on conflict, the
+        merged JSON is stored wholesale.
 
         ``chat_id``/``thread_id`` record the messaging origin (the chat/room and
         thread the session was started in) so that gateway ``/resume`` can prove
@@ -7293,9 +7296,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         merged = dict(existing_cfg)
                         for key, value in model_config.items():
                             if value is None:
-                                merged.pop(key, None)
-                            else:
-                                merged[key] = value
+                                continue
+                            merged[key] = value
                         effective_model_config = merged
             conn.execute(
                 """INSERT INTO sessions (

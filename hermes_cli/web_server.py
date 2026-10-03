@@ -2087,12 +2087,18 @@ def _apply_main_model_assignment(
     if api_key.strip():
         model_cfg["api_key"] = api_key.strip()
         model_cfg.pop("api", None)
-    elif (model_cfg.get("api_key") or model_cfg.get("api")) and new_provider != prev_provider:
+    elif (
+        (model_cfg.get("api_key") or model_cfg.get("api"))
+        and new_provider != prev_provider
+        and not model_cfg.get("key_env")
+    ):
         # A stale endpoint secret can live under the legacy ``api`` alias with
         # no ``api_key`` (the resolver still reads ``model.api`` as a key), so
         # the switch-clears-the-key path must trigger on either field — else the
         # old endpoint's secret survives in config.yaml and contaminates a later
         # custom resolution. clear_model_endpoint_credentials scrubs both.
+        # When ``key_env`` is also present, only drop the env indirection on
+        # switch (below) — do not wipe an inline ``api_key`` in the same pass.
         clear_model_endpoint_credentials(model_cfg, clear_api_mode=False)
     if new_provider != prev_provider:
         clear_model_endpoint_credentials(

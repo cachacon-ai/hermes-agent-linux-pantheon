@@ -9363,10 +9363,15 @@ def _init_session(
     source: str | None = None,
     profile_home: str | None = None,
     explicit_cwd: bool = False,
+    *,
+    create_reasoning_override: dict | None = None,
+    resume_runtime_overrides: dict | None = None,
+    model_override: dict | None = None,
+    display_history_prefix: list | None = None,
 ):
     now = time.time()
     with _sessions_lock:
-        _sessions[sid] = {
+        session_record = {
             "agent": agent,
             "session_key": key,
             "history": history,
@@ -9394,11 +9399,17 @@ def _init_session(
             # Per-session model override set by an in-session /model switch.
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
-            "model_override": None,
+            "model_override": model_override,
+            "display_history_prefix": list(display_history_prefix or []),
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        if create_reasoning_override is not None:
+            session_record["create_reasoning_override"] = dict(create_reasoning_override)
+        if resume_runtime_overrides is not None:
+            session_record["resume_runtime_overrides"] = resume_runtime_overrides
+        _sessions[sid] = session_record
         _session_todo_state(_sessions[sid])
     _init_owns_db = False
     if session_db is not None:

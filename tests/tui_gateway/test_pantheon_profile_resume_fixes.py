@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
+import types
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
-from hermes_cli.config import clear_model_endpoint_credentials, get_config_path, save_config
+from hermes_cli.config import get_config_path, save_config
 from hermes_state import SessionDB
 
 
@@ -31,6 +35,53 @@ def _import_tui_server():
         import tui_gateway.server as server
 
         return importlib.reload(server)
+
+
+@pytest.fixture()
+def resume_server(hermes_home, monkeypatch):
+    server = _import_tui_server()
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_home / "state.db")
+    monkeypatch.setattr(server, "_db", None, raising=False)
+    monkeypatch.setattr(server, "_db_error", None, raising=False)
+    monkeypatch.setattr(server, "_hermes_home", str(hermes_home), raising=False)
+    monkeypatch.setattr(server, "_find_live_session_by_key", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *a, **k: types.SimpleNamespace(model="test-model", close=lambda: None),
+    )
+    save_config({"model": {"provider": "openrouter", "default": "test-model"}, "agent": {"reasoning_effort": "medium"}})
+    known = set(server._sessions)
+    yield server
+    live = [
+        sid
+        for sid in list(server._sessions)
+        if sid not in known
+    ]
+    for sid in live:
+        server.handle_request(
+            {"id": "close", "method": "session.close", "params": {"session_id": sid}}
+        )
+    with server._sessions_lock:
+        for sid in live:
+            server._sessions.pop(sid, None)
+
+
+def _seed_resume_row(db: SessionDB, *, title: str, model_config: dict) -> str:
+    sid = uuid.uuid4().hex[:12]
+    db.create_session(
+        sid,
+        source="desktop",
+        model=str(model_config.get("model") or "test-model"),
+        model_config=model_config,
+    )
+    db.set_session_title(sid, title)
+    db.append_message(sid, "user", "hello")
+    db.append_message(sid, "assistant", "hi")
+    return sid
 
 
 class TestProfileCreateModelPinFailClosed:
@@ -100,112 +151,66 @@ class TestProfileCreateModelPinFailClosed:
 
 
 class TestProviderSwitchClearsKeyEnv:
-    def test_clear_model_endpoint_credentials_pops_key_env(self):
-        model_cfg = {
-            "provider": "openrouter",
-            "default": "anthropic/claude-sonnet-4.6",
-            "key_env": "OPENROUTER_API_KEY",
-        }
-        clear_model_endpoint_credentials(model_cfg, clear_api_key=False, clear_key_env=True)
-        assert "key_env" not in model_cfg
+    def test_apply_main_model_assignment_clears_key_env_not_inline_api_key(self):
+        with patch.dict(
+            sys.modules,
+            {"hermes_cli.env_loader": MagicMock(), "hermes_cli.banner": MagicMock()},
+        ):
+            from hermes_cli.web_server import _apply_main_model_assignment
 
-    def test_provider_switch_invokes_clear_key_env(self):
         model_cfg = {
             "provider": "engramhalo",
             "default": "qwen3.8-flash-next",
             "key_env": "ENGRAMHALO_API_KEY",
+            "api_key": "sk-inline-should-stay",
         }
-        prev_provider = str(model_cfg.get("provider") or "").strip().lower()
-        new_provider = "ollama-cloud"
-        if new_provider != prev_provider:
-            clear_model_endpoint_credentials(
-                model_cfg, clear_api_key=False, clear_key_env=True
-            )
+        _apply_main_model_assignment(model_cfg, "ollama-cloud", "glm-5.1")
+        assert model_cfg["provider"] == "ollama-cloud"
         assert "key_env" not in model_cfg
+        assert model_cfg["api_key"] == "sk-inline-should-stay"
 
 
-class TestColdResumeReasoningRestore:
-    def test_normal_row_restores_reasoning_override(self):
-        server = _import_tui_server()
-        _stored_session_runtime_overrides = server._stored_session_runtime_overrides
-
-        row = {
-            "model": "glm-5.1",
-            "model_config": json.dumps(
-                {
-                    "model": "glm-5.1",
-                    "provider": "ollama-cloud",
-                    "reasoning_config": {"enabled": True, "effort": "medium"},
-                }
-            ),
+class TestEagerResumeReasoningOnPublishedSession:
+    @pytest.mark.parametrize(
+        "title",
+        ["Regular chat", "Bot Chat"],
+    )
+    def test_eager_resume_sets_create_reasoning_on_live_session(
+        self, resume_server, hermes_home, title
+    ):
+        db = SessionDB(db_path=hermes_home / "state.db")
+        reasoning = {"enabled": True, "effort": "xhigh" if title == "Bot Chat" else "low"}
+        model_config = {
+            "model": "test-model",
+            "provider": "openrouter",
+            "reasoning_config": reasoning,
         }
-        overrides = _stored_session_runtime_overrides(row)
-        assert overrides["reasoning_config_override"] == {
-            "enabled": True,
-            "effort": "medium",
-        }
+        if title == "Bot Chat":
+            model_config["follow_profile_config"] = True
+        sid = _seed_resume_row(db, title=title, model_config=model_config)
+        db.close()
 
-    def test_bot_chat_restores_reasoning_without_model_pin(self):
-        server = _import_tui_server()
-        _stored_session_runtime_overrides = server._stored_session_runtime_overrides
+        effort_before = yaml.safe_load(get_config_path().read_text())["agent"]["reasoning_effort"]
 
-        row = {
-            "title": "Bot Chat",
-            "model": "qwen3.8-flash-next",
-            "billing_provider": "engramhalo",
-            "model_config": json.dumps(
-                {
-                    "model": "qwen3.8-flash-next",
-                    "provider": "engramhalo",
-                    "follow_profile_config": True,
-                    "reasoning_config": {"enabled": True, "effort": "xhigh"},
-                }
-            ),
-        }
-        overrides = _stored_session_runtime_overrides(row)
-        assert "model_override" not in overrides
-        assert overrides["reasoning_config_override"] == {
-            "enabled": True,
-            "effort": "xhigh",
-        }
-
-    def test_sync_create_reasoning_from_resume_overrides(self):
-        server = _import_tui_server()
-        _sync_create_reasoning_override_from_resume_overrides = (
-            server._sync_create_reasoning_override_from_resume_overrides
-        )
-
-        session = {
-            "resume_runtime_overrides": {
-                "reasoning_config_override": {"enabled": True, "effort": "low"},
+        resp = resume_server.handle_request(
+            {
+                "id": "resume",
+                "method": "session.resume",
+                "params": {"session_id": sid, "eager_build": True, "omit_messages": True},
             }
-        }
-        _sync_create_reasoning_override_from_resume_overrides(session)
-        assert session["create_reasoning_override"] == {"enabled": True, "effort": "low"}
-
-    def test_sync_does_not_touch_profile_config(self, hermes_home):
-        server = _import_tui_server()
-        _sync_create_reasoning_override_from_resume_overrides = (
-            server._sync_create_reasoning_override_from_resume_overrides
         )
-        save_config({"agent": {"reasoning_effort": "medium"}})
+        assert "error" not in resp, resp.get("error")
+        live_sid = resp["result"]["session_id"]
+        published = resume_server._sessions[live_sid]
+        assert published["create_reasoning_override"] == reasoning
 
-        session = {
-            "resume_runtime_overrides": {
-                "reasoning_config_override": {"enabled": True, "effort": "xhigh"},
-            }
-        }
-        _sync_create_reasoning_override_from_resume_overrides(session)
-        import yaml
-
-        cfg = yaml.safe_load(get_config_path().read_text())
-        assert cfg["agent"]["reasoning_effort"] == "medium"
+        effort_after = yaml.safe_load(get_config_path().read_text())["agent"]["reasoning_effort"]
+        assert effort_after == effort_before == "medium"
 
 
 class TestBranchModelConfigMerge:
     def test_later_reasoning_config_merges_with_branched_from(self, tmp_path):
-        db_path = tmp_path / "state.db"
-        db = SessionDB(db_path)
+        db = SessionDB(tmp_path / "state.db")
         db.create_session(
             "branch-child",
             source="desktop",
@@ -220,6 +225,11 @@ class TestBranchModelConfigMerge:
                 "provider": "ollama-cloud",
                 "reasoning_config": {"enabled": True, "effort": "low"},
             },
+        )
+        db.create_session(
+            "branch-child",
+            source="desktop",
+            model_config={"reasoning_config": None, "max_tokens": None},
         )
         row = db.get_session("branch-child")
         cfg = json.loads(row["model_config"])
