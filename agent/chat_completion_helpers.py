@@ -3311,6 +3311,24 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             agent._resolve_lmstudio_summary_reasoning_effort()
             if _is_lmstudio_summary else None
         )
+        # EngramHalo (llama-server, provider "engramhalo"): top-level
+        # reasoning_effort, same mapping as
+        # ChatCompletionsTransport.build_kwargs — mirrored because the summary
+        # path calls chat.completions.create() directly. Deliberately NOT
+        # gated on _supports_reasoning_extra_body(): engramhalo is not in that
+        # host list and the top-level field is the only shape its template
+        # reads.
+        _is_engramhalo_summary = (
+            (agent.provider or "").strip().lower() == "engramhalo"
+        )
+        if _is_engramhalo_summary:
+            from agent.transports.chat_completions import engramhalo_wire_effort
+
+            _engramhalo_reasoning_effort: str | None = engramhalo_wire_effort(
+                agent.reasoning_config
+            )
+        else:
+            _engramhalo_reasoning_effort = None
         if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
             if agent.reasoning_config is not None:
                 summary_extra_body["reasoning"] = agent.reasoning_config
@@ -3341,6 +3359,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
             if _lm_reasoning_effort is not None:
                 summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
+            if _engramhalo_reasoning_effort is not None:
+                summary_kwargs["reasoning_effort"] = _engramhalo_reasoning_effort
 
             # Merge the profile's canonical body even when routing is unset:
             # profiles may always emit required metadata such as Portal tags.
@@ -3476,6 +3496,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
                 if _lm_reasoning_effort is not None:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
+                if _engramhalo_reasoning_effort is not None:
+                    summary_kwargs["reasoning_effort"] = _engramhalo_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
