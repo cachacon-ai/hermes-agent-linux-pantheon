@@ -18,6 +18,50 @@ from urllib.parse import urlparse
 from providers import register_provider
 from providers.base import ProviderProfile
 
+QWEN38_FLASH_NEXT_MODEL = "qwen3.8-flash-next"
+QWEN38_FLASH_NEXT_MAX_OUTPUT_TOKENS = 8192
+
+
+def _normalize_model_id(model: str | None) -> str:
+    return (model or "").strip().lower()
+
+
+def _is_qwen38_flash_next(model: str | None) -> bool:
+    """True for the local EngramHalo Qwen model id (with or without a prefix)."""
+    norm = _normalize_model_id(model)
+    if not norm:
+        return False
+    if norm == QWEN38_FLASH_NEXT_MODEL:
+        return True
+    if norm.endswith(f"/{QWEN38_FLASH_NEXT_MODEL}"):
+        return True
+    return norm.endswith(f":{QWEN38_FLASH_NEXT_MODEL}")
+
+
+def _qwen38_flash_next_chat_template_kwargs(
+    reasoning_config: dict | None,
+) -> dict[str, Any]:
+    """llama-server Qwen template kwargs (Rakazo / EngramHalo user-turn shape).
+
+    Top-level ``reasoning_effort`` must not be sent — llama-server copies it
+    into the template after kwargs and can override ``chat_template_kwargs``.
+    """
+    from agent.transports.chat_completions import engramhalo_wire_effort
+
+    template_kwargs: dict[str, Any] = {"preserve_thinking": True}
+    if not isinstance(reasoning_config, dict):
+        template_kwargs["enable_thinking"] = True
+        return template_kwargs
+
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    enabled = reasoning_config.get("enabled", True)
+    thinking_on = enabled is not False and effort != "none"
+    template_kwargs["enable_thinking"] = thinking_on
+    wire_effort = engramhalo_wire_effort(reasoning_config) if thinking_on else None
+    if wire_effort is not None:
+        template_kwargs["reasoning_effort"] = wire_effort
+    return template_kwargs
+
 
 def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
     """True when ``base_url`` is an Ollama host, not a generic OpenAI-compat relay.
@@ -52,6 +96,11 @@ def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
 
+    def get_max_tokens(self, model: str | None) -> int | None:
+        if _is_qwen38_flash_next(model):
+            return QWEN38_FLASH_NEXT_MAX_OUTPUT_TOKENS
+        return self.default_max_tokens
+
     def build_api_kwargs_extras(
         self,
         *,
@@ -61,6 +110,17 @@ class CustomProfile(ProviderProfile):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
+        model = ctx.get("model")
+
+        if _is_qwen38_flash_next(model):
+            extra_body["chat_template_kwargs"] = _qwen38_flash_next_chat_template_kwargs(
+                reasoning_config
+            )
+            if ollama_num_ctx:
+                options = extra_body.get("options", {})
+                options["num_ctx"] = ollama_num_ctx
+                extra_body["options"] = options
+            return extra_body, top_level
 
         # Ollama context window
         if ollama_num_ctx:
