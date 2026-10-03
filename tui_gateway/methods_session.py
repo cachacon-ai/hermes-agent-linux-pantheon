@@ -2925,8 +2925,26 @@ def _(rid, params: dict) -> dict:
 @method("session.history")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
-    if err:
-        return err
+    if session is None:
+        target = str(params.get("session_id") or "").strip()
+        profile = (params.get("profile") or "").strip() or None
+        profile_home = _profile_home(profile)
+        live = _find_live_session_by_key(target, profile_home) if target else None
+        if live is not None:
+            session = live[1]
+        else:
+            history, cold_err = _load_persisted_history_messages(
+                target, profile=profile, rid=rid
+            )
+            if cold_err:
+                return cold_err
+            return _ok(
+                rid,
+                {
+                    "count": len(history),
+                    "messages": _history_to_messages(history),
+                },
+            )
     history = list(session.get("history", []))
     if session.get("session_key"):
         with _session_db(session) as db:

@@ -11294,6 +11294,65 @@ def _find_live_session_by_key(
     return None
 
 
+def _load_persisted_history_messages(
+    target: str,
+    *,
+    profile: str | None = None,
+    rid=None,
+) -> tuple[list[dict] | None, dict | None]:
+    """Read a stored session transcript when no in-memory runtime exists.
+
+    Mobile and REST clients often keep the durable ``session_key`` (state.db id)
+    across reconnects. ``session.history`` used to require a live runtime id in
+    ``_sessions``, so a process restart returned 4001/4007 "session not found"
+    even though the row and messages were still on disk.
+    """
+    needle = str(target or "").strip()
+    if not needle:
+        return None, _err(rid, 4006, "session_id required")
+
+    profile_home = _profile_home(profile)
+    owns_db = False
+    if profile_home is not None:
+        try:
+            from hermes_state import get_shared_session_db
+
+            db = get_shared_session_db(profile_home / "state.db")
+            owns_db = True
+        except Exception:
+            db = None
+    else:
+        db = _get_db()
+
+    if db is None:
+        return None, _db_unavailable_error(rid, code=5000)
+
+    try:
+        stored_id = db.resolve_session_id(needle)
+        if not stored_id or not db.get_session(stored_id):
+            by_title = db.get_session_by_title(needle)
+            if by_title:
+                stored_id = by_title["id"]
+            else:
+                return None, _err(rid, 4007, "session not found")
+        stored_id = db.resolve_resume_session_id(stored_id)
+        history = db.get_messages_as_conversation(
+            stored_id,
+            include_ancestors=True,
+            include_row_ids=True,
+        )
+        return history, None
+    except Exception as exc:
+        logger.debug("cold history load failed for %s", needle, exc_info=True)
+        return None, _err(rid, 5000, f"history load failed: {exc}")
+    finally:
+        if owns_db and db is not None:
+            with contextlib.suppress(Exception):
+                from hermes_state import release_or_close
+
+                release_or_close(db)
+
+
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
