@@ -19,6 +19,7 @@ Usage::
     hermes profile delete coder          # remove profile + alias + service
 """
 
+import copy
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 from hermes_cli.archive_safe import (
@@ -770,13 +771,34 @@ def _read_config_model(profile_dir: Path) -> tuple:
         return None, None
 
 
+def _copy_launch_providers_for_seed(providers: object) -> Dict[str, Any]:
+    """Copy the launch profile's ``providers:`` map for a fresh profile seed.
+
+    Credentials stay in ``.env`` (mirrored separately when requested). Only
+    ``key_env`` references are carried — never an inline ``api_key``.
+    """
+    from hermes_cli.config import stringify_provider_map
+
+    if not isinstance(providers, dict) or not providers:
+        return {}
+    out: Dict[str, Any] = {}
+    for key, entry in stringify_provider_map(providers).items():
+        if not isinstance(entry, dict):
+            continue
+        copied = copy.deepcopy(entry)
+        copied.pop("api_key", None)
+        copied.pop("apiKey", None)
+        out[key] = copied
+    return out
+
+
 def _seed_model_config(profile_dir: Path) -> None:
     """Give a profile created without a clone source a usable model block.
 
     Such a profile gets its directory tree but no ``config.yaml`` at all, so it
     resolves no provider and its first turn dies with "No LLM provider
     configured" — created, but unable to run. Copy the active profile's
-    ``model`` block over at creation time.
+    ``model`` block and ``providers:`` map over at creation time.
 
     This is a copy, not a link: profiles remain independent islands, and
     editing either one afterwards never touches the other. "Fresh" means fresh
@@ -793,11 +815,20 @@ def _seed_model_config(profile_dir: Path) -> None:
         source = get_hermes_home() / "config.yaml"
         if not source.is_file():
             return
-        model_cfg = read_user_config_raw(source).get("model")
+        source_cfg = read_user_config_raw(source)
+        model_cfg = source_cfg.get("model")
         if not model_cfg:
             return
+        if isinstance(model_cfg, dict):
+            model_cfg = copy.deepcopy(model_cfg)
+            model_cfg.pop("api_key", None)
+            model_cfg.pop("apiKey", None)
+        payload: Dict[str, Any] = {"model": model_cfg}
+        providers_copy = _copy_launch_providers_for_seed(source_cfg.get("providers"))
+        if providers_copy:
+            payload["providers"] = providers_copy
         config_path.write_text(
-            yaml.safe_dump({"model": model_cfg}, sort_keys=False),
+            yaml.safe_dump(payload, sort_keys=False),
             encoding="utf-8",
         )
     except Exception:
