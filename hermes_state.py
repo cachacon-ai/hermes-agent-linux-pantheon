@@ -7263,8 +7263,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not (profile_name or "").strip():
             profile_name = self._own_profile_name()
 
+        def _parse_model_config_column(raw) -> Dict[str, Any]:
+            if isinstance(raw, dict):
+                return dict(raw)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return {}
+
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            effective_model_config = model_config
+            if model_config:
+                existing_row = conn.execute(
+                    "SELECT model_config FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if existing_row is not None:
+                    existing_cfg = _parse_model_config_column(
+                        existing_row["model_config"]
+                        if isinstance(existing_row, sqlite3.Row)
+                        else existing_row[0]
+                    )
+                    if existing_cfg:
+                        merged = dict(existing_cfg)
+                        for key, value in model_config.items():
+                            if value is None:
+                                merged.pop(key, None)
+                            else:
+                                merged[key] = value
+                        effective_model_config = merged
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
@@ -7290,9 +7322,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                                    sessions.model_config, '$._reset_from'
                                )
                            )
-                           ELSE COALESCE(
-                               sessions.model_config, excluded.model_config
-                           )
+                           WHEN excluded.model_config IS NOT NULL
+                           THEN excluded.model_config
+                           ELSE sessions.model_config
                        END,
                        system_prompt_hash = COALESCE(
                            sessions.system_prompt_hash,
@@ -7323,7 +7355,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     chat_type,
                     thread_id,
                     model,
-                    json.dumps(model_config) if model_config else None,
+                    json.dumps(effective_model_config) if effective_model_config else None,
                     system_prompt_hash,
                     parent_session_id,
                     cwd,

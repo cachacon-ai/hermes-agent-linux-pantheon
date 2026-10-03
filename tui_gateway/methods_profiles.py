@@ -545,8 +545,12 @@ def _(rid, params: dict) -> dict:
 
             _write_profile_model(path, provider, model)
             model_set = True
-        except Exception:
-            pass
+        except Exception as e:
+            return _err(
+                rid,
+                5064,
+                f"Profile '{name}' was created but model assignment failed: {e}",
+            )
     elif is_truthy_value(params.get("mirror_credentials", True)):
         # No explicit pin: inherit the launch profile's provider+model so the
         # first turn resolves. Gate on the MODEL SECTION being absent, not on

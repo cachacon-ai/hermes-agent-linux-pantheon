@@ -2095,7 +2095,9 @@ def _apply_main_model_assignment(
         # custom resolution. clear_model_endpoint_credentials scrubs both.
         clear_model_endpoint_credentials(model_cfg, clear_api_mode=False)
     if new_provider != prev_provider:
-        clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
+        clear_model_endpoint_credentials(
+            model_cfg, clear_api_key=False, clear_key_env=True
+        )
     model_cfg.pop("context_length", None)
     return model_cfg
 

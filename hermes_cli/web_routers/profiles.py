@@ -849,8 +849,12 @@ async def create_profile_endpoint(body: ProfileCreate):
         try:
             _write_profile_model(path, provider, model)
             model_set = True
-        except Exception:
+        except Exception as e:
             _log.exception("Setting model for new profile %s failed", body.name)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Profile '{body.name}' was created but model assignment failed: {e}",
+            ) from e
 
     # Optional MCP servers. Best-effort, same rationale as model assignment.
     mcp_written = 0

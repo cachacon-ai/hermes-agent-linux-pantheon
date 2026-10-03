@@ -872,6 +872,7 @@ def _(rid, params: dict) -> dict:
                 resume_runtime_overrides=overrides or None,
                 explicit_cwd=bool(profile_resume_cwd),
             )
+            _sync_create_reasoning_override_from_resume_overrides(record)
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
             record["resume_message_count"] = int(found.get("message_count") or 0)
@@ -973,6 +974,7 @@ def _(rid, params: dict) -> dict:
                 todo_state=_todo_state_from_history(history),
                 explicit_cwd=bool(profile_resume_cwd),
             )
+            _sync_create_reasoning_override_from_resume_overrides(record)
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
 
@@ -1051,6 +1053,10 @@ def _(rid, params: dict) -> dict:
                 # stored session row so switching chats does not inherit whatever
                 # global model another chat last selected.
                 stored_runtime_overrides = _stored_session_runtime_overrides(found)
+                eager_session = {
+                    "resume_runtime_overrides": stored_runtime_overrides or None,
+                }
+                _sync_create_reasoning_override_from_resume_overrides(eager_session)
                 agent = _make_agent(
                     sid,
                     target,
@@ -1063,6 +1069,7 @@ def _(rid, params: dict) -> dict:
                     ),
                     **stored_runtime_overrides,
                 )
+                eager_create_reasoning = eager_session.get("create_reasoning_override")
             finally:
                 _clear_session_context(tokens)
         except Exception as e:
@@ -1152,6 +1159,8 @@ def _(rid, params: dict) -> dict:
                         _sessions[sid]["model_override"] = stored_runtime_overrides[
                             "model_override"
                         ]
+                    if eager_create_reasoning is not None:
+                        _sessions[sid]["create_reasoning_override"] = eager_create_reasoning
                     _sessions[sid]["display_history_prefix"] = display_history_prefix
                     # Remember the profile home so each turn re-binds HERMES_HOME (the
                     # agent persists to its own db, but mid-turn home reads — memory,
