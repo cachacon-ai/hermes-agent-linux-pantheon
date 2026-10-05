@@ -14831,6 +14831,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        include_hidden: bool = False,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -14840,6 +14841,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         is paired with a ``list_sessions_rich`` page (e.g. sidebar "load more"
         totals) so the total matches the number of listable rows — otherwise the
         raw row count is inflated by children and "load more" never settles.
+
+        Hidden rows are excluded by default, mirroring ``list_sessions_rich`` —
+        a count that includes rows the listing never returns breaks
+        page-against-total callers (they under-fetch pages and silently lose
+        rows). Stats surfaces that genuinely count every row must opt in with
+        ``include_hidden=True``.
 
         Pass ``exclude_sources`` to drop whole source classes from the count
         (e.g. ``["cron"]`` so the recents "load more" total matches a
@@ -14875,6 +14882,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        if not include_hidden:
+            where_clauses.append("s.hidden = 0")
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 

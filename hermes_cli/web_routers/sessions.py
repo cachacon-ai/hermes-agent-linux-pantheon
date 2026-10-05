@@ -102,6 +102,7 @@ def get_sessions(
     cwd_prefix: str = None,
     full: bool = False,
     profile: Optional[str] = None,
+    include_hidden: bool = False,
 ):
     """List sessions.
 
@@ -114,6 +115,11 @@ def get_sessions(
     start time) or ``recent`` (by latest activity across the compression
     chain). ``recent`` keeps a long-running conversation on the first page
     after it auto-compresses into a fresh continuation id.
+
+    ``include_hidden`` opts into hidden rows (canonical Bot Chat chats, peer
+    DMs) on BOTH the page and ``total`` — they stay excluded by default so
+    ``total`` always matches the number of rows a caller can actually page
+    through. Detail reads (``/api/sessions/{id}``) remain hidden-agnostic.
 
     Rows omit ``system_prompt``/``model_config`` (the payload-dominating
     fields no list UI reads) unless ``full=1`` is passed.
@@ -164,6 +170,7 @@ def get_sessions(
                 # with the API-level _strip_session_list_rows below).
                 compact_rows=not full,
                 include_pinned=True,
+                include_hidden=include_hidden,
             )
             total = db.session_count(
                 source=source or None,
@@ -174,6 +181,7 @@ def get_sessions(
                 include_archived=include_archived,
                 archived_only=archived_only,
                 exclude_children=True,
+                include_hidden=include_hidden,
             )
             now = time.time()
             # Same ownership contract as get_session_detail: rows are stamped
@@ -586,9 +594,11 @@ async def get_session_stats(profile: Optional[str] = None):
     """
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
-        total = db.session_count(include_archived=True)
-        active_store = db.session_count(include_archived=False)
-        archived = db.session_count(archived_only=True)
+        # Stats describe the whole store, hidden rows included — unlike
+        # page totals, nothing here is paged against the listing.
+        total = db.session_count(include_archived=True, include_hidden=True)
+        active_store = db.session_count(include_archived=False, include_hidden=True)
+        archived = db.session_count(archived_only=True, include_hidden=True)
         messages = db.message_count()
         by_source: Dict[str, int] = {}
         try:

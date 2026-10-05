@@ -1436,7 +1436,9 @@ def cmd_sessions(args, sessions_parser=None):
                 print("Aborted — nothing was changed.")
 
     elif action == "stats":
-        total = db.session_count()
+        # Stats describe the whole store, hidden rows included (nothing here
+        # is paged against the listing).
+        total = db.session_count(include_hidden=True)
         msgs = db.message_count()
         print(f"Total sessions: {total}")
         print(f"Total messages: {msgs}")
