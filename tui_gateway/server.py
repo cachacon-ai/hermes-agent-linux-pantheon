@@ -14414,9 +14414,18 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     img_dir = _session_images_dir(session)
     img_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
+    # Session-local counters can collide across conversations in the shared
+    # profile images directory. A random suffix gives each staged upload
+    # independent ownership, which also makes exact conversation cleanup safe.
     try:
-        img_path.write_bytes(img_bytes)
+        while True:
+            img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}_{uuid.uuid4().hex}{ext}"
+            try:
+                with img_path.open("xb") as staged:
+                    staged.write(img_bytes)
+                break
+            except FileExistsError:
+                continue
     except Exception:
         session["image_counter"] = max(0, session["image_counter"] - 1)
         raise
@@ -14576,8 +14585,17 @@ def _stage_session_file_attachment(
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
 
     upload_dir = _desktop_attachment_dir(session)
-    target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
-    target.write_bytes(payload)
+    safe_filename = _sanitize_attachment_name(filename)
+    while True:
+        target = _unique_attachment_path(upload_dir, safe_filename)
+        try:
+            with target.open("xb") as staged:
+                staged.write(payload)
+            break
+        except FileExistsError:
+            # Another session can stage the same filename between the
+            # existence check and write. Retry rather than replacing its copy.
+            continue
     return target.resolve(), True
 
 
