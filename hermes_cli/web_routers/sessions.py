@@ -17,6 +17,7 @@ import json
 import logging
 import sqlite3
 import time  # noqa: F401
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
@@ -739,6 +740,52 @@ async def get_session_messages(
             "returned": len(projected_messages),
         },
     }
+
+
+@manage_router.delete("/api/sessions/{session_id}/permanent")
+async def permanently_delete_session_endpoint(
+    session_id: str,
+    profile: Optional[str] = None,
+    allow_missing: bool = False,
+):
+    """Permanently erase a logical conversation and its compression chain.
+
+    This is a separate endpoint from the legacy DELETE contract. It is used by
+    confirmed product flows that must remove every compression segment and
+    hidden delegate while preserving explicit branch conversations. The
+    database keeps only content-free ID/time markers to fence late writes and
+    make failed filesystem cleanup retryable.
+    """
+    _profile_name, profile_home = _cron_profile_home(profile)
+
+    def _delete():
+        db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            sid = _resolve_session_id(db, session_id) or session_id
+            targets = db.delete_session_permanently(
+                sid,
+                sessions_dir=Path(profile_home) / "sessions",
+                allow_missing=allow_missing,
+            )
+            if not targets:
+                raise HTTPException(status_code=404, detail="Session not found")
+            return {
+                "ok": True,
+                "deleted": len(targets),
+                "deleted_session_ids": targets,
+            }
+        finally:
+            db.close()
+
+    try:
+        return await asyncio.to_thread(_delete)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception("DELETE /api/sessions/%s/permanent failed", session_id)
+        raise HTTPException(
+            status_code=500, detail="Permanent session deletion failed"
+        ) from exc
 
 
 @manage_router.delete("/api/sessions/{session_id}")
