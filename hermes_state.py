@@ -15196,6 +15196,186 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except OSError:
             pass
 
+    @staticmethod
+    def _remove_session_files_permanently(
+        sessions_dir: Optional[Path], session_id: str
+    ) -> None:
+        """Remove every known on-disk transcript/dump, failing on I/O errors.
+
+        Permanent deletion must not report success while recoverable transcript
+        files remain. Unlike the legacy best-effort cleanup, failures propagate;
+        the content-free deletion marker retains the IDs so a retry can finish.
+        """
+        if sessions_dir is None:
+            return
+        for suffix in (".json", ".jsonl"):
+            (sessions_dir / f"{session_id}{suffix}").unlink(missing_ok=True)
+        try:
+            paths = list(sessions_dir.iterdir())
+        except FileNotFoundError:
+            return
+        for path in paths:
+            if (
+                path.name.startswith(f"request_dump_{session_id}_")
+                and path.name.endswith(".json")
+            ):
+                path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _permanent_delete_marker_targets(conn, session_id: str) -> List[str]:
+        """Return prior deletion targets for an id, including its chain root."""
+        rows = conn.execute(
+            """SELECT DISTINCT requested_session_id
+               FROM permanent_session_deletions
+               WHERE session_id = ? OR requested_session_id = ?""",
+            (session_id, session_id),
+        ).fetchall()
+        roots = {str(row[0]) for row in rows}
+        if not roots:
+            return []
+        placeholders = ",".join("?" * len(roots))
+        targets = conn.execute(
+            f"""SELECT session_id FROM permanent_session_deletions
+                WHERE requested_session_id IN ({placeholders})""",
+            sorted(roots),
+        ).fetchall()
+        return sorted({str(row[0]) for row in targets})
+
+    def _collect_permanent_delete_targets(self, conn, session_id: str) -> List[str]:
+        """Find one logical compression chain and its hidden delegate trees.
+
+        Walk to the first compression ancestor, then down only canonical
+        compression edges. Explicit branch, delegate, and tool children are
+        boundaries; delegate children are included through Hermes' existing
+        marker-aware cascade. This preserves user-visible branches as separate
+        conversations while deleting all compression segments of the selected
+        logical conversation.
+        """
+        row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            return []
+        current = dict(row)
+        while not self._is_explicit_fork_child_row(current):
+            parent_id = current.get("parent_session_id")
+            if not parent_id:
+                break
+            parent = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (parent_id,)
+            ).fetchone()
+            if parent is None or parent["end_reason"] != "compression":
+                break
+            current = dict(parent)
+
+        targets: set[str] = set()
+        frontier = [str(current["id"])]
+        while frontier:
+            parent_id = frontier.pop()
+            if parent_id in targets:
+                continue
+            parent = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (parent_id,)
+            ).fetchone()
+            if parent is None:
+                continue
+            targets.add(parent_id)
+            frontier.extend(
+                child_id
+                for child_id in _collect_delegate_child_ids(conn, [parent_id])
+                if child_id not in targets
+            )
+            if parent["end_reason"] != "compression":
+                continue
+            children = conn.execute(
+                "SELECT * FROM sessions WHERE parent_session_id = ?",
+                (parent_id,),
+            ).fetchall()
+            for child in children:
+                child_row = dict(child)
+                if not self._is_explicit_fork_child_row(child_row):
+                    frontier.append(str(child_row["id"]))
+        return sorted(targets)
+
+    def delete_session_permanently(
+        self,
+        session_id: str,
+        sessions_dir: Optional[Path] = None,
+        *,
+        allow_missing: bool = False,
+    ) -> List[str]:
+        """Erase a logical conversation, its compression chain, and delegates.
+
+        Branch conversations remain as independent sessions. A durable,
+        content-free marker fences late writes and makes filesystem cleanup
+        retryable if unlinking fails after the SQLite transaction commits.
+        ``allow_missing`` is only for a just-created lazy session whose durable
+        ID is known by its caller but whose first message has not reached SQLite.
+        """
+        now = time.time()
+
+        def _do(conn):
+            targets = self._collect_permanent_delete_targets(conn, session_id)
+            if not targets:
+                prior = self._permanent_delete_marker_targets(conn, session_id)
+                if prior:
+                    return prior
+                if not allow_missing:
+                    return []
+                targets = [session_id]
+                conn.execute(
+                    """INSERT OR IGNORE INTO permanent_session_deletions
+                       (session_id, requested_session_id, deleted_at)
+                       VALUES (?, ?, ?)""",
+                    (session_id, session_id, now),
+                )
+                return targets
+
+            conn.executemany(
+                """INSERT OR IGNORE INTO permanent_session_deletions
+                   (session_id, requested_session_id, deleted_at)
+                   VALUES (?, ?, ?)""",
+                [(target, session_id, now) for target in targets],
+            )
+            placeholders = ",".join("?" * len(targets))
+            conn.execute(
+                f"""UPDATE sessions SET parent_session_id = NULL
+                    WHERE parent_session_id IN ({placeholders})
+                      AND id NOT IN ({placeholders})""",
+                [*targets, *targets],
+            )
+            conn.execute(
+                f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+                targets,
+            )
+            conn.execute(
+                f"DELETE FROM sessions WHERE id IN ({placeholders})", targets
+            )
+            conn.execute(
+                f"DELETE FROM compression_locks WHERE session_id IN ({placeholders})",
+                targets,
+            )
+            conn.execute(
+                f"DELETE FROM session_turn_leases WHERE conversation_id IN ({placeholders})",
+                targets,
+            )
+            # Delegation payloads can include prompts/results derived from the
+            # deleted conversation; remove them with their owning session.
+            for column in ("origin_session", "origin_ui_session_id", "parent_session_id"):
+                conn.execute(
+                    f"DELETE FROM async_delegations WHERE {column} IN ({placeholders})",
+                    targets,
+                )
+            self._delete_unreferenced_system_prompts(conn)
+            return targets
+
+        targets = self._execute_write(_do)
+        # Gateway conversation affinity can retain the deleted durable session
+        # id even after the transcript row is gone. Keep the generation counter
+        # (it prevents ABA reuse) but remove route entries that target these IDs.
+        self._delete_routing_entries_for_sessions(set(targets))
+        for target in targets:
+            self._remove_session_files_permanently(sessions_dir, target)
+        return targets
+
     def get_session_delete_targets(self, session_id: str) -> List[str]:
         """Return every session row that :meth:`delete_session` would remove.
 
