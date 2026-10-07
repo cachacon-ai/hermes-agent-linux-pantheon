@@ -215,11 +215,11 @@ def consume_gateway_turn_context_notes(agent: Any) -> str:
     prompt (auto-reset notes, the first-contact intro, voice-channel changes)
     and delivers them on the current user message via the api_content sidecar
     instead, so the composed system prompt stays byte-stable turn-over-turn.
-    tui_gateway clients (e.g. Pantheon via ``prompt.submit``'s
-    ``clock_context``) stage per-turn clock lines the same way. It stages the
-    rendered notes on ``agent._gateway_turn_context_notes`` right before
-    ``run_conversation``; this consumes them so a cached agent can never replay
-    a stale note on a later turn.
+    Pantheon per-turn clock lines use ``_prompt_clock_context`` instead — see
+    ``consume_prompt_clock_context``. It stages the rendered notes on
+    ``agent._gateway_turn_context_notes`` right before ``run_conversation``;
+    this consumes them so a cached agent can never replay a stale note on a
+    later turn.
     """
     notes = getattr(agent, "_gateway_turn_context_notes", "") or ""
     if hasattr(agent, "_gateway_turn_context_notes"):
@@ -228,6 +228,34 @@ def consume_gateway_turn_context_notes(agent: Any) -> str:
         except Exception:
             pass
     return notes if isinstance(notes, str) else ""
+
+
+def consume_prompt_clock_context(agent: Any) -> str:
+    """Pop Pantheon/tui_gateway per-turn clock text off the agent (one-shot).
+
+    Staged on ``agent._prompt_clock_context`` by ``prompt.submit`` before
+    ``run_conversation``. Delivered on the current user message without
+    mutating durable transcript content: string turns ride ``plugin_user_context``
+    / ``api_content``; multimodal turns are injected into the API wire copy only
+    (see ``append_prompt_clock_to_multimodal_api_content``).
+    """
+    clock = getattr(agent, "_prompt_clock_context", "") or ""
+    if hasattr(agent, "_prompt_clock_context"):
+        try:
+            agent._prompt_clock_context = ""
+        except Exception:
+            pass
+    return clock if isinstance(clock, str) else ""
+
+
+def append_prompt_clock_to_multimodal_api_content(content: Any, clock: str) -> Any:
+    """Append per-turn clock text to a multimodal API copy only (not durable)."""
+    if not clock or not isinstance(content, list):
+        return content
+    try:
+        return [*content, {"type": "text", "text": clock}]
+    except Exception:
+        return content
 
 
 def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
@@ -670,6 +698,7 @@ def build_turn_context(
 
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
+    agent._turn_prompt_clock = ""
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
@@ -1477,6 +1506,24 @@ def build_turn_context(
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
+
+    # Per-turn clock (Pantheon ``prompt.submit`` ``clock_context``): never append
+    # to durable multimodal content — inject on the API wire copy only.
+    _prompt_clock = consume_prompt_clock_context(agent)
+    if _prompt_clock:
+        agent._turn_prompt_clock = _prompt_clock
+        _clock_turn_content = (
+            messages[current_turn_user_idx].get("content")
+            if 0 <= current_turn_user_idx < len(messages)
+            and isinstance(messages[current_turn_user_idx], dict)
+            else None
+        )
+        if not isinstance(_clock_turn_content, list):
+            plugin_user_context = (
+                plugin_user_context + "\n\n" + _prompt_clock
+                if plugin_user_context
+                else _prompt_clock
+            )
 
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as

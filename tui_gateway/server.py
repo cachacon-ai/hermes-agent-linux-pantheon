@@ -13598,10 +13598,9 @@ def _run_prompt_submit(
             else:
                 agent.interim_assistant_callback = None
 
-            # Per-turn clock / device-time facts from Pantheon (and other
-            # tui_gateway clients) ride the gateway turn-context sidecar on
-            # the current user message — never the stored transcript content.
-            agent._gateway_turn_context_notes = clock_context or ""
+            # Per-turn clock from Pantheon (``prompt.submit`` ``clock_context``).
+            # Consumed by ``consume_prompt_clock_context`` in the turn prologue.
+            agent._prompt_clock_context = clock_context or ""
 
             run_kwargs = {
                 "conversation_history": list(history),

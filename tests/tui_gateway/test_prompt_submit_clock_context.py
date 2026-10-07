@@ -110,7 +110,7 @@ def test_run_prompt_submit_stages_pantheon_object_clock_context(turn_env):
     seen = {}
 
     def run_conversation(user_message, **kwargs):
-        seen["notes"] = getattr(agent, "_gateway_turn_context_notes", "")
+        seen["staged"] = getattr(agent, "_prompt_clock_context", "")
         return {
             "final_response": "Wednesday",
             "messages": [
@@ -135,7 +135,7 @@ def test_run_prompt_submit_stages_pantheon_object_clock_context(turn_env):
         clock_context=clock_context,
     )
 
-    assert seen["notes"] == PANTHEON_CLOCK["formatted"]
+    assert seen["staged"] == PANTHEON_CLOCK["formatted"]
     assert PANTHEON_CLOCK["formatted"] not in session["history"][0]["content"]
 
 
@@ -144,7 +144,7 @@ def test_run_prompt_submit_stages_clock_context_for_sidecar(turn_env):
     seen = {}
 
     def run_conversation(user_message, **kwargs):
-        seen["notes"] = getattr(agent, "_gateway_turn_context_notes", "")
+        seen["staged"] = getattr(agent, "_prompt_clock_context", "")
         seen["user_message"] = user_message
         return {
             "final_response": "Tuesday",
@@ -169,7 +169,7 @@ def test_run_prompt_submit_stages_clock_context_for_sidecar(turn_env):
         clock_context=CLOCK_LINE,
     )
 
-    assert seen["notes"] == CLOCK_LINE
+    assert seen["staged"] == CLOCK_LINE
     assert CLOCK_LINE not in seen["user_message"]
     assert CLOCK_LINE not in session["history"][0]["content"]
 
@@ -179,10 +179,35 @@ def test_clock_context_reaches_api_content_not_stored_content():
     from tests.agent.test_gateway_turn_sidecar import _FakeAgent, _build
 
     agent = _FakeAgent()
-    agent._gateway_turn_context_notes = CLOCK_LINE
+    agent._prompt_clock_context = CLOCK_LINE
     with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
         ctx = _build(agent, user_message=USER_TEXT)
     msg = ctx.messages[ctx.current_turn_user_idx]
     assert msg["content"] == USER_TEXT
     assert CLOCK_LINE in msg["api_content"]
     assert CLOCK_LINE not in msg["content"]
+
+
+def test_multimodal_clock_stays_off_durable_content():
+    """Multimodal turns: clock is API-wire only, not appended to stored content."""
+    from agent.conversation_loop import append_prompt_clock_to_multimodal_api_content
+    from agent.turn_context import append_notes_to_multimodal_content
+    from tests.agent.test_gateway_turn_sidecar import _FakeAgent, _build
+
+    multimodal = [
+        {"type": "text", "text": "describe this"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+    ]
+    agent = _FakeAgent()
+    agent._prompt_clock_context = CLOCK_LINE
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        ctx = _build(agent, user_message=multimodal)
+    msg = ctx.messages[ctx.current_turn_user_idx]
+    assert msg["content"] == multimodal
+    assert "api_content" not in msg
+    wire = append_prompt_clock_to_multimodal_api_content(multimodal, CLOCK_LINE)
+    assert wire[-1] == {"type": "text", "text": CLOCK_LINE}
+    # Gateway must-deliver notes still use the durable multimodal append path.
+    durable = list(multimodal)
+    append_notes_to_multimodal_content(durable, CLOCK_LINE)
+    assert durable[-1] == {"type": "text", "text": CLOCK_LINE}
