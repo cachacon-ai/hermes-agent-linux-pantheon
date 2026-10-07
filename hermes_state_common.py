@@ -456,6 +456,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
 
+-- Content-free fence for user-confirmed permanent deletes. A running agent can
+-- finish after its session row has been removed, so keep the identity long
+-- enough to reject late session/message inserts instead of recreating deleted
+-- history. These rows intentionally survive session cleanup.
+CREATE TABLE IF NOT EXISTS permanent_session_deletions (
+    session_id TEXT PRIMARY KEY,
+    requested_session_id TEXT NOT NULL,
+    deleted_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_permanent_session_deletions_request
+    ON permanent_session_deletions(requested_session_id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -482,6 +494,24 @@ CREATE TABLE IF NOT EXISTS messages (
     display_kind TEXT,
     display_metadata TEXT
 );
+
+CREATE TRIGGER IF NOT EXISTS guard_permanently_deleted_session_insert
+BEFORE INSERT ON sessions
+WHEN EXISTS (
+    SELECT 1 FROM permanent_session_deletions WHERE session_id = NEW.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session was permanently deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS guard_permanently_deleted_message_insert
+BEFORE INSERT ON messages
+WHEN EXISTS (
+    SELECT 1 FROM permanent_session_deletions WHERE session_id = NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session was permanently deleted');
+END;
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

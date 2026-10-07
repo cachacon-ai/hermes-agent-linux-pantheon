@@ -1376,6 +1376,60 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("session.resolve")
+def _(rid, params: dict) -> dict:
+    """Resolve a live session ID to its durable state.db ID without content.
+
+    Pantheon room records written by older clients contain the live ID used by
+    the WebSocket event bridge. New records persist the durable ID directly;
+    this RPC provides a safe migration path while the live session remains in
+    this gateway process, then falls back to exact/profile-scoped DB lookup.
+    """
+    target = str(params.get("session_id") or "").strip()
+    if not target:
+        return _err(rid, 4006, "session_id required")
+
+    session, _err_result = _sess_nowait(params, rid)
+    if session is not None:
+        requested_profile = str(params.get("profile") or "").strip()
+        active_home = session.get("profile_home")
+        active_profile = (
+            Path(active_home).name if active_home else _response_profile_name(None)
+        )
+        if (
+            not requested_profile
+            or active_profile == _response_profile_name(requested_profile)
+        ):
+            stored_id = str(session.get("session_key") or "").strip()
+            if stored_id:
+                return _ok(
+                    rid,
+                    {
+                        "live_session_id": target,
+                        "stored_session_id": stored_id,
+                        "active": True,
+                    },
+                )
+
+    try:
+        with _profile_db(params) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5036)
+            stored_id = db.resolve_session_id(target)
+    except Exception as exc:
+        return _err(rid, 5036, f"could not resolve session id: {exc}")
+    if not stored_id:
+        return _err(rid, 4007, "session not found")
+    return _ok(
+        rid,
+        {
+            "live_session_id": target,
+            "stored_session_id": stored_id,
+            "active": False,
+        },
+    )
+
+
 @method("session.delete")
 def _(rid, params: dict) -> dict:
     """Delete a stored session and its on-disk transcript files.

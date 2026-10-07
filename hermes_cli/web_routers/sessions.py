@@ -17,11 +17,13 @@ import json
 import logging
 import sqlite3
 import time  # noqa: F401
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
@@ -51,6 +53,59 @@ _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
 _session_latest_descendant = late("_session_latest_descendant")
 _strip_session_list_rows = late("_strip_session_list_rows")
+
+
+class PermanentSessionDeleteRequest(BaseModel):
+    """Optional exact paths for gateway-owned attachment staging copies."""
+
+    attachment_paths: List[str] = Field(default_factory=list, max_length=4096)
+
+
+def _validated_permanent_attachment_paths(
+    profile_home: Path, raw_paths: List[str]
+) -> List[Path]:
+    """Accept only direct children of this profile's staging directories.
+
+    The profile ``attachments/`` and ``images/`` directories are shared by
+    sessions, so permanent deletion must receive exact file paths and must
+    never recursively remove either directory. Resolving each parent rejects
+    traversal and symlinked parents outside the profile staging roots; unlink
+    acts on the leaf itself, so a leaf symlink is removed without following it.
+    """
+    if len(raw_paths) > 4096:
+        raise HTTPException(status_code=400, detail="Too many attachment paths")
+    roots = {
+        (Path(profile_home) / "attachments").resolve(),
+        (Path(profile_home) / "images").resolve(),
+    }
+    validated: List[Path] = []
+    seen = set()
+    for raw in raw_paths:
+        if not raw or "\x00" in raw:
+            raise HTTPException(status_code=400, detail="Invalid attachment path")
+        candidate = Path(raw)
+        if (
+            not candidate.is_absolute()
+            or ".." in candidate.parts
+            or candidate.name in {"", ".", ".."}
+        ):
+            raise HTTPException(status_code=400, detail="Invalid attachment path")
+        try:
+            parent = candidate.parent.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid attachment path") from exc
+        if parent not in roots:
+            raise HTTPException(status_code=400, detail="Attachment path is outside profile staging")
+        target = parent / candidate.name
+        try:
+            if target.is_dir() and not target.is_symlink():
+                raise HTTPException(status_code=400, detail="Attachment path is not a file")
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail="Invalid attachment path") from exc
+        if target not in seen:
+            seen.add(target)
+            validated.append(target)
+    return validated
 
 
 def _resolve_session_id(db, session_id: str) -> Optional[str]:
@@ -739,6 +794,61 @@ async def get_session_messages(
             "returned": len(projected_messages),
         },
     }
+
+
+@manage_router.delete("/api/sessions/{session_id}/permanent")
+async def permanently_delete_session_endpoint(
+    session_id: str,
+    profile: Optional[str] = None,
+    allow_missing: bool = False,
+    body: Optional[PermanentSessionDeleteRequest] = None,
+):
+    """Permanently erase a logical conversation and its compression chain.
+
+    This is a separate endpoint from the legacy DELETE contract. It is used by
+    confirmed product flows that must remove every compression segment and
+    hidden delegate while preserving explicit branch conversations. The
+    database keeps only content-free ID/time markers to fence late writes and
+    make failed filesystem cleanup retryable.
+    """
+    _profile_name, profile_home = _cron_profile_home(profile)
+    # Validate every exact path before the irreversible database operation.
+    staged_paths = _validated_permanent_attachment_paths(
+        Path(profile_home), body.attachment_paths if body else []
+    )
+
+    def _delete():
+        db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            sid = _resolve_session_id(db, session_id) or session_id
+            targets = db.delete_session_permanently(
+                sid,
+                sessions_dir=Path(profile_home) / "sessions",
+                allow_missing=allow_missing,
+            )
+            if not targets:
+                raise HTTPException(status_code=404, detail="Session not found")
+            # Keep these unlinks after the durable DB tombstone. If one fails,
+            # the endpoint returns 500 and a retry reuses the marker to finish.
+            for path in staged_paths:
+                path.unlink(missing_ok=True)
+            return {
+                "ok": True,
+                "deleted": len(targets),
+                "deleted_session_ids": targets,
+            }
+        finally:
+            db.close()
+
+    try:
+        return await asyncio.to_thread(_delete)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception("DELETE /api/sessions/%s/permanent failed", session_id)
+        raise HTTPException(
+            status_code=500, detail="Permanent session deletion failed"
+        ) from exc
 
 
 @manage_router.delete("/api/sessions/{session_id}")
