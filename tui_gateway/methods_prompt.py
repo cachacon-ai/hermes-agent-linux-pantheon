@@ -284,6 +284,19 @@ def _pending_reaction_notes(session: dict) -> str:
     return "\n".join(notes)
 
 
+def normalize_prompt_clock_context(raw) -> str | None:
+    """Parse ``prompt.submit`` ``clock_context`` (plain string or Pantheon object)."""
+    if isinstance(raw, str):
+        text = raw.strip()
+        return text or None
+    if isinstance(raw, dict):
+        formatted = raw.get("formatted")
+        if isinstance(formatted, str):
+            text = formatted.strip()
+            return text or None
+    return None
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -291,12 +304,7 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
-    raw_clock = params.get("clock_context")
-    clock_context = (
-        raw_clock.strip()
-        if isinstance(raw_clock, str) and raw_clock.strip()
-        else None
-    )
+    clock_context = normalize_prompt_clock_context(params.get("clock_context"))
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.

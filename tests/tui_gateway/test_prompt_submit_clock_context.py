@@ -11,12 +11,17 @@ RPC contract (Pantheon → ``hermes serve`` / tui_gateway)::
       "params": {
         "session_id": "<runtime session id from session.create>",
         "text": "<user message>",
-        "clock_context": "<optional per-turn clock line, e.g. IANA tz + local time>"
+        "clock_context": {
+          "iana_timezone": "America/New_York",
+          "formatted": "Current local time: Wed, Oct 7, 2026, 2:47 PM EDT (America/New_York)"
+        }
       }
     }
 
-``clock_context`` is optional, a single string (whitespace trimmed; empty
-omitted). It is **not** persisted in the user-visible transcript ``content``;
+``clock_context`` is optional. Accept either a non-empty string (whitespace
+trimmed) or an object with a non-empty ``formatted`` string (Pantheon also
+sends ``iana_timezone``; Hermes uses ``formatted`` for the model). Empty values
+are omitted. It is **not** persisted in the user-visible transcript ``content``;
 clients loading ``session.history`` / ``_history_to_messages`` see only
 ``text`` from ``content``. The model receives the stamp on the current turn's
 user message via ``api_content`` (or a trailing text part on multimodal turns).
@@ -31,6 +36,7 @@ from unittest.mock import patch
 import pytest
 
 from tui_gateway import server
+from tui_gateway.methods_prompt import normalize_prompt_clock_context
 
 
 class _InlineThread:
@@ -54,6 +60,10 @@ CLOCK_LINE = (
     "[Current local time: Wednesday, 2026-10-07 15:00:00 "
     "America/Los_Angeles (UTC-07:00)]"
 )
+PANTHEON_CLOCK = {
+    "iana_timezone": "America/New_York",
+    "formatted": "Current local time: Wed, Oct 7, 2026, 2:47 PM EDT (America/New_York)",
+}
 USER_TEXT = "What day is it?"
 
 
@@ -86,6 +96,47 @@ def _session(agent, **extra):
         "cols": 80,
         **extra,
     }
+
+
+def test_normalize_prompt_clock_context_accepts_pantheon_object():
+    assert normalize_prompt_clock_context(PANTHEON_CLOCK) == PANTHEON_CLOCK["formatted"]
+    assert normalize_prompt_clock_context(CLOCK_LINE) == CLOCK_LINE
+    assert normalize_prompt_clock_context({"formatted": "  "}) is None
+    assert normalize_prompt_clock_context({"iana_timezone": "UTC"}) is None
+
+
+def test_run_prompt_submit_stages_pantheon_object_clock_context(turn_env):
+    """Pantheon object shape → ``formatted`` staged for turn_context."""
+    seen = {}
+
+    def run_conversation(user_message, **kwargs):
+        seen["notes"] = getattr(agent, "_gateway_turn_context_notes", "")
+        return {
+            "final_response": "Wednesday",
+            "messages": [
+                {"role": "user", "content": USER_TEXT},
+                {"role": "assistant", "content": "Wednesday"},
+            ],
+        }
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent)
+    clock_context = normalize_prompt_clock_context(PANTHEON_CLOCK)
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        USER_TEXT,
+        clock_context=clock_context,
+    )
+
+    assert seen["notes"] == PANTHEON_CLOCK["formatted"]
+    assert PANTHEON_CLOCK["formatted"] not in session["history"][0]["content"]
 
 
 def test_run_prompt_submit_stages_clock_context_for_sidecar(turn_env):

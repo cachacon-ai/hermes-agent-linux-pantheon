@@ -530,12 +530,9 @@ class ComputeHost:
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            raw_clock = frame.get("clock_context")
-            clock_context = (
-                raw_clock.strip()
-                if isinstance(raw_clock, str) and raw_clock.strip()
-                else None
-            )
+            from tui_gateway.methods_prompt import normalize_prompt_clock_context
+
+            clock_context = normalize_prompt_clock_context(frame.get("clock_context"))
             server._run_prompt_submit(
                 request_id,
                 sid,
