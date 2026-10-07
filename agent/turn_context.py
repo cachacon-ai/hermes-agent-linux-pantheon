@@ -215,9 +215,11 @@ def consume_gateway_turn_context_notes(agent: Any) -> str:
     prompt (auto-reset notes, the first-contact intro, voice-channel changes)
     and delivers them on the current user message via the api_content sidecar
     instead, so the composed system prompt stays byte-stable turn-over-turn.
-    It stages the rendered notes on ``agent._gateway_turn_context_notes``
-    right before ``run_conversation``; this consumes them so a cached agent
-    can never replay a stale note on a later turn.
+    tui_gateway clients (e.g. Pantheon via ``prompt.submit``'s
+    ``clock_context``) stage per-turn clock lines the same way. It stages the
+    rendered notes on ``agent._gateway_turn_context_notes`` right before
+    ``run_conversation``; this consumes them so a cached agent can never replay
+    a stale note on a later turn.
     """
     notes = getattr(agent, "_gateway_turn_context_notes", "") or ""
     if hasattr(agent, "_gateway_turn_context_notes"):

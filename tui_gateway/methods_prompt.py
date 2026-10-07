@@ -291,6 +291,12 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    raw_clock = params.get("clock_context")
+    clock_context = (
+        raw_clock.strip()
+        if isinstance(raw_clock, str) and raw_clock.strip()
+        else None
+    )
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
@@ -931,7 +937,12 @@ def _(rid, params: dict) -> dict:
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            clock_context=clock_context,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -1051,6 +1062,7 @@ def _(rid, params: dict) -> dict:
             text,
             display_kind=display_kind,
             terminal_callback=hosted_terminal_callback,
+            clock_context=clock_context,
         )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
