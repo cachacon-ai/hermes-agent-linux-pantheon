@@ -530,12 +530,16 @@ class ComputeHost:
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
+            from tui_gateway.methods_prompt import normalize_prompt_clock_context
+
+            clock_context = normalize_prompt_clock_context(frame.get("clock_context"))
             server._run_prompt_submit(
                 request_id,
                 sid,
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
+                clock_context=clock_context,
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

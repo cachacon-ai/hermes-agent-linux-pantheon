@@ -48,6 +48,7 @@ from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
     build_turn_context,
+    append_prompt_clock_to_multimodal_api_content,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
 )
@@ -2233,6 +2234,18 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        _turn_clock = getattr(agent, "_turn_prompt_clock", "") or ""
+        if _turn_clock:
+            if isinstance(user_message, str):
+                user_message = (
+                    f"{user_message}\n\n{_turn_clock}"
+                    if user_message
+                    else _turn_clock
+                )
+            elif isinstance(user_message, list):
+                user_message = append_prompt_clock_to_multimodal_api_content(
+                    user_message, _turn_clock
+                )
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -2517,6 +2530,14 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                    elif isinstance(api_msg.get("content"), list):
+                        _turn_clock = getattr(agent, "_turn_prompt_clock", "") or ""
+                        if _turn_clock:
+                            api_msg["content"] = (
+                                append_prompt_clock_to_multimodal_api_content(
+                                    api_msg["content"], _turn_clock
+                                )
+                            )
             elif (
                 isinstance(_api_content, str)
                 and _api_content

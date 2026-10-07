@@ -2708,6 +2708,7 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    clock_context: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2717,7 +2718,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
-    return {
+    frame = {
         "type": "turn.start",
         "sid": sid,
         "request_id": rid,
@@ -2737,6 +2738,9 @@ def _compute_host_turn_frame(
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
+    if clock_context:
+        frame["clock_context"] = clock_context
+    return frame
 
 
 def _metadata_mirror(session: dict | None) -> dict:
@@ -2896,6 +2900,7 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    clock_context: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2906,6 +2911,7 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        clock_context=clock_context,
     )
 
     def _complete(done: dict) -> None:
@@ -13223,6 +13229,7 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+    clock_context: str | None = None,
 ) -> bool:
     # Ownership admission at the ONE chokepoint every fresh turn source must
     # cross. prompt.submit already claims the slot in its RPC handler (so this
@@ -13590,6 +13597,10 @@ def _run_prompt_submit(
                 agent.interim_assistant_callback = _interim_assistant_cb
             else:
                 agent.interim_assistant_callback = None
+
+            # Per-turn clock from Pantheon (``prompt.submit`` ``clock_context``).
+            # Consumed by ``consume_prompt_clock_context`` in the turn prologue.
+            agent._prompt_clock_context = clock_context or ""
 
             run_kwargs = {
                 "conversation_history": list(history),
