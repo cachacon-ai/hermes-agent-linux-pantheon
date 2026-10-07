@@ -98,6 +98,21 @@ def _session(agent, **extra):
     }
 
 
+def test_normalize_prompt_clock_context_on_server_globals_after_install():
+    """Rebound ``prompt.submit`` must resolve the helper (PAN-17 NameError hotfix).
+
+    ``method_ctx.install()`` rebinds handlers onto ``server.py`` globals; module-
+    level helpers are only visible if ``register()`` exports them. Calling the
+    helper through the installed handler's ``__globals__`` matches production.
+    """
+    assert hasattr(server, "normalize_prompt_clock_context")
+    handler = server._methods["prompt.submit"]
+    resolve = handler.__globals__["normalize_prompt_clock_context"]
+    assert resolve(PANTHEON_CLOCK) == PANTHEON_CLOCK["formatted"]
+    assert resolve(CLOCK_LINE) == CLOCK_LINE
+    assert resolve(None) is None
+
+
 def test_normalize_prompt_clock_context_accepts_pantheon_object():
     assert normalize_prompt_clock_context(PANTHEON_CLOCK) == PANTHEON_CLOCK["formatted"]
     assert normalize_prompt_clock_context(CLOCK_LINE) == CLOCK_LINE
