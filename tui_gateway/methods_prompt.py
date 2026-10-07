@@ -1947,6 +1947,9 @@ def register(server) -> None:
         _reconcile_client_ordinal,
         _pending_reaction_notes,
         _approval_respond_session_fallback,
+        # PAN-17: prompt.submit free-name; must be on server globals after
+        # method_ctx.install() rebinds the handler (NameError otherwise).
+        normalize_prompt_clock_context,
     ):
         setattr(
             server,
