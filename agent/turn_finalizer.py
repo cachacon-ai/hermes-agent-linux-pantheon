@@ -28,7 +28,9 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
-from agent.message_metadata import append_message, stamp_message_timestamp
+from agent.message_metadata import (
+    REPLY_SOURCE_ROW_ID_KEY, append_message, stamp_message_timestamp,
+)
 from agent.message_sanitization import _sanitize_surrogates
 
 
@@ -37,6 +39,44 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
         return False
     return not flatten_message_text(msg.get("content")).strip()
+
+
+def _is_exact_committed_reply(agent, message: dict) -> bool:
+    """Validate the selected physical row against SQLite, without searching.
+
+    A failed micro-compaction can mutate carried dictionaries' row IDs before
+    rollback while retaining their old persisted markers. Those markers alone
+    therefore cannot authorize a durable identity. Read this exact row only;
+    content/time checks validate its projection, never select or dedupe rows.
+    """
+    db = getattr(agent, "_session_db", None)
+    if db is None:
+        return False
+    try:
+        rows = db.get_messages_around(
+            agent.session_id, message["_row_id"], window=0,
+        )["window"]
+    except Exception:
+        # Identity is additive metadata. A read failure must not reclassify an
+        # already-persisted successful turn as a persistence/cleanup failure.
+        logging.getLogger(__name__).debug("Reply identity verification unavailable", exc_info=True)
+        return False
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    metadata = message.get("display_metadata")
+    persisted_metadata = row.get("display_metadata")
+    return (
+        row.get("active") == 1
+        and row.get("role") == "assistant"
+        and not row.get("_compressed_summary")
+        and isinstance(metadata, dict)
+        and isinstance(persisted_metadata, dict)
+        and metadata.get(REPLY_SOURCE_ROW_ID_KEY) == persisted_metadata.get(REPLY_SOURCE_ROW_ID_KEY)
+        and message.get("content") == row.get("content")
+        and message.get("timestamp") == row.get("timestamp")
+        and message.get("display_kind") == row.get("display_kind")
+    )
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -313,6 +353,7 @@ def finalize_turn(
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    _reply_row_id = None
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -401,6 +442,14 @@ def finalize_turn(
                 # creating an assistant→assistant pair.
                 _fill_assistant_tail_content(agent, _tail, final_response)
 
+        if not interrupted and not failed:
+            from agent.pantheon_artifacts import enabled, commit_response
+            if enabled(agent):
+                commit_response(agent, messages, conversation_history)
+        else:
+            from agent.pantheon_artifacts import cancel_turn
+            cancel_turn(agent)
+
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
         # final durable snapshot and returning the continuation history. Earlier
@@ -471,6 +520,28 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+        # Identity comes from the committed live row, never from answer text or
+        # a "latest row" database query. Micro-compaction above can replace the
+        # tail with a fresh active clone, so inspect its post-commit row id.
+        # Display-only footers and output hooks below must not change which
+        # durable reply this turn represents.
+        _reply_tail = messages[-1] if messages else None
+        if (
+            final_response
+            and not failed
+            and not interrupted
+            and getattr(agent, "_persist_disabled", False) is not True
+            and isinstance(_reply_tail, dict)
+            and _reply_tail.get("role") == "assistant"
+            and _reply_tail.get(_DB_PERSISTED_MARKER) is True
+            and not _reply_tail.get("_compressed_summary")
+            and _reply_tail.get("display_kind") != "hidden"
+            and flatten_message_text(_reply_tail.get("content")).strip()
+            and type(_reply_tail.get("_row_id")) is int
+            and 0 < _reply_tail["_row_id"] <= 2**53 - 1
+            and _is_exact_committed_reply(agent, _reply_tail)
+        ):
+            _reply_row_id = _reply_tail["_row_id"]
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -750,6 +821,13 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if _reply_row_id is not None:
+        result["reply_row_id"] = _reply_row_id
+    from agent.pantheon_artifacts import enabled
+    if enabled(agent) and not failed and not interrupted:
+        result["artifacts"] = getattr(agent, "_pantheon_committed_artifacts", [])
+        if result["artifacts"]:
+            result["reply_row_id"] = getattr(agent, "_pantheon_reply_row_id", None)
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

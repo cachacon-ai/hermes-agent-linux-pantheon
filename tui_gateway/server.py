@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -36,6 +37,7 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display
+from agent.message_metadata import REPLY_SOURCE_ROW_ID_KEY, valid_reply_row_id
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
@@ -2196,7 +2198,7 @@ def _gateway_started_at() -> float:
 
 
 def _heartbeat_refresher_loop(stop_event: threading.Event) -> None:
-    """Background loop that refreshes the heartbeat on a fixed cadence."""
+    """Refresh the backend heartbeat; artifact housekeeping is independent."""
     while not stop_event.is_set():
         try:
             _refresh_backend_heartbeat()
@@ -2221,6 +2223,11 @@ def _start_backend_heartbeat_refresher() -> None:
         if _heartbeat_refresher_started:
             return
         _heartbeat_refresher_started = True
+    try:
+        from hermes_artifacts import start_profile_artifact_housekeeping
+        start_profile_artifact_housekeeping()
+    except Exception as exc:
+        logger.warning('Artifact housekeeping startup failed (%s)', type(exc).__name__)
     # Write a row synchronously so the sweep run later in this same
     # process can see ourselves in the heartbeat table too.  Without
     # this, exclude_ids would have to cover every local session — a
@@ -2599,6 +2606,10 @@ def write_json(obj: dict) -> bool:
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     params: dict = {"type": event, "session_id": sid}
+    if event == "message.complete":
+        # Explicit capability even for error/unsaved/synthetic completions:
+        # absence of row_id is authoritative, not an old-server ambiguity.
+        payload = {**(payload or {}), "reply_identity_version": 1}
     if payload is not None:
         params["payload"] = payload
     return {"jsonrpc": "2.0", "method": "event", "params": params}
@@ -3518,6 +3529,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                kw["artifact_delivery_version"] = current.get("artifact_delivery_version", 0)
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -4141,6 +4153,9 @@ def _ensure_session_db_row(session: dict) -> bool:
     override = override if isinstance(override, dict) else {}
     row_model = str(override.get("model") or "").strip() or _resolve_model()
     model_config: dict = {}
+    for field in ("artifact_delivery_version", "artifact_delivery_unavailable_code", "artifact_delivery_unavailable_reason"):
+        if field in session:
+            model_config[field] = session[field]
     for src_key, cfg_key in (
         ("model", "model"),
         ("provider", "provider"),
@@ -7842,6 +7857,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         warn = _probe_credentials(agent)
         if warn:
             info["credential_warning"] = warn
+    info.update(_artifact_capability_payload(session or {}))
     return info
 
 
@@ -8050,8 +8066,26 @@ def _session_todo_state(session: dict) -> dict | None:
     return cached
 
 
+def _artifact_capability_payload(session: dict) -> dict:
+    version = session.get("artifact_delivery_version", 0)
+    agent = session.get("agent")
+    if agent is not None:
+        version = 1 if getattr(agent, "_pantheon_artifact_delivery_version", 0) == 1 else 0
+    key = session.get("session_key") or session.get("resume_session_id")
+    # The canonical compression root was resolved while resume owned its DB
+    # handle. Capability projection must not open/close additional profile
+    # stores while deferred hydration owns that handle.
+    root = session.get("conversation_root_id") or key
+    payload = {"artifact_delivery_version": version, "conversation_root_id": root, "profile": (session.get("artifact_profile") or _current_profile_name())}
+    if version != 1:
+        payload["artifact_delivery_unavailable_code"] = getattr(agent, "_pantheon_artifact_unavailable_code", None) or session.get("artifact_delivery_unavailable_code") or "legacy_session"
+        payload["artifact_delivery_unavailable_reason"] = getattr(agent, "_pantheon_artifact_unavailable_reason", None) or session.get("artifact_delivery_unavailable_reason") or "This conversation was created without file delivery; create a new conversation to enable it."
+    return payload
+
+
 def _attach_todo_state(payload: dict, session: dict) -> dict:
     """Attach the authoritative todo snapshot to a session response."""
+    payload.update(_artifact_capability_payload(session))
     state = _session_todo_state(session)
     if state is not None:
         payload["todo_state"] = state
@@ -9170,6 +9204,7 @@ def _make_agent(
     service_tier_override: str | None = None,
     platform_override: str | None = None,
     context_cwd_is_launch_artifact: bool | None = None,
+    artifact_delivery_version: int = 0,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -9299,6 +9334,15 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+    _session_toolsets = _load_enabled_toolsets(_resolve_agent_platform(platform_override))
+    _publication_unavailable = None
+    if artifact_delivery_version == 1 and runtime.get("api_mode") == "codex_app_server":
+        from agent.transports.codex_app_server_session import supports_pantheon_dynamic_tools
+        if not supports_pantheon_dynamic_tools():
+            artifact_delivery_version = 0
+            _publication_unavailable = ("unsupported_protocol", "The installed Codex adapter does not support the required publication protocol.")
+    if artifact_delivery_version == 1:
+        _session_toolsets = list(_session_toolsets if _session_toolsets is not None else ["hermes-cli"]) + ["pantheon_artifacts"]
     agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
@@ -9325,7 +9369,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        enabled_toolsets=_session_toolsets,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -9346,6 +9390,23 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    if _publication_unavailable:
+        agent._pantheon_artifact_unavailable_code, agent._pantheon_artifact_unavailable_reason = _publication_unavailable
+    if artifact_delivery_version == 1:
+        from hermes_constants import get_hermes_home
+        from tools.terminal_tool import get_session_cwd
+        agent._pantheon_artifact_delivery_version = 1
+        agent._pantheon_profile = _current_profile_name()
+        agent._pantheon_profile_home = str(get_hermes_home())
+        with _sessions_lock:
+            _publication_session = _sessions.get(sid) or {}
+        _publication_cwd = _publication_session.get("cwd") if _publication_session.get("explicit_cwd") else None
+        _publication_config = cfg.get("pantheon", {})
+        _extra_roots = _publication_config.get("artifact_source_roots", []) if isinstance(_publication_config, dict) else []
+        if not isinstance(_extra_roots, list) or not all(isinstance(root, str) for root in _extra_roots):
+            raise ValueError("pantheon.artifact_source_roots must be a list of absolute workspace roots")
+        agent._pantheon_artifact_roots = tuple(str(Path(root).resolve()) for root in [_publication_cwd, *_extra_roots] if root and Path(root).is_absolute())
+
     if context_cwd_is_launch_artifact is None:
         with _sessions_lock:
             context_session = _sessions.get(sid)
@@ -9411,6 +9472,13 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        if getattr(agent, "_pantheon_artifact_delivery_version", 0) == 1:
+            session_record["artifact_delivery_version"] = 1
+            session_record["artifact_profile"] = agent._pantheon_profile
+            session_record["conversation_root_id"] = key
+            if explicit_cwd and cwd:
+                roots = tuple(getattr(agent, "_pantheon_artifact_roots", ()))
+                agent._pantheon_artifact_roots = tuple(dict.fromkeys((*roots, str(Path(cwd).resolve()))))
         if create_reasoning_override is not None:
             session_record["create_reasoning_override"] = dict(create_reasoning_override)
         if resume_runtime_overrides is not None:
@@ -9859,6 +9927,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
+        if role == "assistant" and not content_text.strip():
+            from agent.pantheon_artifacts import reply_presentation
+            content_text = reply_presentation(m)
         if _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):
@@ -9919,6 +9990,18 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # reactions — needs this instead.
         if m.get("_row_id") is not None:
             msg["row_id"] = m["_row_id"]
+        if role == "assistant":
+            metadata = m.get("display_metadata")
+            source_row_id = metadata.get(REPLY_SOURCE_ROW_ID_KEY) if isinstance(metadata, dict) else None
+            if valid_reply_row_id(source_row_id):
+                msg["source_row_id"] = source_row_id
+            publications = metadata.get("pantheon_artifacts") if isinstance(metadata, dict) else None
+            if publications:
+                msg["artifacts"] = publications
+                msg["source_delivery_id"] = publications[0]["source_delivery_id"]
+                msg["presentation_text"] = content_text
+                msg["provider_text"] = m.get("content") if isinstance(m.get("content"), str) else ""
+                msg["artifact_only"] = not bool(msg["provider_text"].strip())
         if role == "user":
             invocation = _skill_scaffold_projection(content_text)
             if invocation:
@@ -9942,6 +10025,46 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         messages.append(msg)
 
     return messages
+
+
+def _persisted_reply_identity(result: Any) -> dict:
+    """Project the exact committed reply selected by the agent finalizer.
+
+    The live completion can contain delivery-only hooks/footers. Use the same
+    display projection as session.history for canonical reply_text, without
+    matching text or guessing the latest assistant row (identical answers are
+    different messages). Unknown/unsaved/failed results carry no row identity.
+    """
+    if not isinstance(result, dict) or any(
+        result.get(flag) for flag in ("failed", "error", "interrupted")
+    ):
+        return {}
+    row_id = result.get("reply_row_id")
+    if type(row_id) is not int or not 0 < row_id <= 2**53 - 1:
+        return {}
+    rows = result.get("messages")
+    if not isinstance(rows, list):
+        return {}
+    matches = [
+        row for row in rows
+        if isinstance(row, dict)
+        and row.get("_row_id") == row_id
+        and row.get("_db_persisted") is True
+        and row.get("role") == "assistant"
+    ]
+    if len(matches) != 1:
+        return {}
+    projected = _history_to_messages(matches)
+    if len(projected) != 1 or not projected[0].get("text", "").strip():
+        return {}
+    reply = projected[0]
+    timestamp = reply.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+        return {}
+    identity = {"row_id": row_id, "timestamp": timestamp, "reply_text": reply["text"]}
+    if valid_reply_row_id(reply.get("source_row_id")):
+        identity["source_row_id"] = reply["source_row_id"]
+    return identity
 
 
 def _coerce_seed_history(value: Any) -> list[dict]:
@@ -13823,7 +13946,19 @@ def _run_prompt_submit(
                 raw = str(result)
                 status = "complete"
 
+            _artifacts = result.get("artifacts", []) if isinstance(result, dict) and status == "complete" else []
+            _provider_text = raw if isinstance(raw, str) else ""
+            if _artifacts and not str(raw or "").strip():
+                raw = "Generated " + ", ".join(a["name"] for a in _artifacts) + "."
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if _artifacts:
+                payload["artifacts"] = _artifacts
+                payload["source_delivery_id"] = _artifacts[0]["source_delivery_id"]
+                payload["source_row_id"] = _artifacts[0]["source_row_id"]
+                payload["presentation_text"] = raw
+                payload["provider_text"] = _provider_text
+                payload["artifact_only"] = not bool(_provider_text.strip())
+            payload.update(_persisted_reply_identity(result))
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -13906,6 +14041,8 @@ def _run_prompt_submit(
             if terminal_receipt_committed:
                 _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+            if _artifacts:
+                _emit("artifact.ready", sid, {"conversation_root_id": _artifacts[0]["conversation_root_id"]})
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

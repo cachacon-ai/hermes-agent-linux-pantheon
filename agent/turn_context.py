@@ -713,6 +713,8 @@ def build_turn_context(
         )
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
+    agent._pantheon_committed_artifacts = []
+    agent._pantheon_reply_row_id = None
     agent._current_api_request_id = ""
     # Tripwire: warn (with both turn ids) when this turn starts before the
     # previous turn's turn-end persist — concurrent turns on one session
@@ -847,6 +849,18 @@ def build_turn_context(
     # ``has_platform_message_id`` against this row.
     if persist_user_platform_id is not None:
         user_msg["platform_message_id"] = persist_user_platform_id
+    from agent.pantheon_artifacts import enabled as artifact_delivery_enabled, prepare_turn_output
+    if artifact_delivery_enabled(agent):
+        _publication_note = prepare_turn_output(agent)
+        _publication_original = user_msg.get("content")
+        if persist_user_message is None:
+            persist_user_message = _publication_original
+            agent._persist_user_message_override = _publication_original
+        if isinstance(_publication_original, str):
+            user_msg["content"] = _publication_original + "\n\n" + _publication_note
+        elif isinstance(_publication_original, list):
+            user_msg["content"] = list(_publication_original) + [{"type":"text","text":_publication_note}]
+        user_message = user_msg["content"]
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

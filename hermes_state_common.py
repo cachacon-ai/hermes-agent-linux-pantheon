@@ -354,7 +354,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 29
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -655,6 +655,10 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """
+
+from hermes_artifacts import ARTIFACT_SCHEMA_SQL
+SCHEMA_SQL += ARTIFACT_SCHEMA_SQL
+
 
 
 # Indexes that reference columns added in later schema versions must be

@@ -255,6 +255,10 @@ TOOLSETS = {
     # The renderer is a CLIENT — it can be driving a local, SSH, URL, or cloud
     # backend — so "was this process spawned by Electron?" is the wrong
     # question and silently strips these tools from every remote gateway.
+    "pantheon_artifacts": {
+        "description": "Explicit Pantheon file publication (session capability only)",
+        "tools": ["pantheon_publish_artifact"], "includes": [],
+    },
     "desktop_ui": {
         "description": "Desktop GUI affordances — in-app terminal/browser panes, pane focus, reactions (GUI sessions only)",
         "tools": [

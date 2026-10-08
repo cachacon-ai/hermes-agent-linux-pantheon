@@ -39,6 +39,7 @@ from pathlib import Path
 from agent.memory_manager import sanitize_context
 from agent.session_activity import ActivityProvenance
 from agent.message_sanitization import _sanitize_surrogates
+from agent.message_metadata import REPLY_SOURCE_ROW_ID_KEY, valid_reply_row_id
 # Intrinsic persistence marker stamped on message dicts that are known-durable
 # (#92231). One shared constant with agent.context_compressor (this module
 # already imports agent.* at module level, and context_compressor is a
@@ -5180,7 +5181,10 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
+from hermes_artifacts import SessionArtifactsMixin
+
+
+class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -5322,12 +5326,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(self, db_path: Path = None, read_only: bool = False, *, create_if_missing: bool = True):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
+        if not create_if_missing and not self.db_path.is_file():
+            raise FileNotFoundError('Existing session database is unavailable')
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -5513,7 +5519,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 initialization_complete = True
                 return
 
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            if create_if_missing:
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Read-only file/sidecar preflight (port of kilocode#12508):
             # repair-or-refuse BEFORE the first connection so users get an
@@ -5526,7 +5533,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # connect, and schema commit so concurrent openers don't race on an
             # absent-path -> connect -> schema-commit window.
             needs_startup_guard = (
-                not read_only
+                not read_only and create_if_missing
                 and (
                     not self.db_path.exists()
                     or is_zeroed_state_db(self.db_path)
@@ -5538,6 +5545,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self.db_path.exists()
                     and is_zeroed_state_db(self.db_path)
                 ):
+                    if not create_if_missing:
+                        raise sqlite3.DatabaseError('Existing session database is zeroed')
                     try:
                         zsize = self.db_path.stat().st_size
                     except OSError:
@@ -5566,7 +5575,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # holds a deleted sidecar inode.
                 refuse_deleted_wal_generation(self.db_path)
                 self._conn = _connect_tracked_db(
-                    str(self.db_path),
+                    str(self.db_path) if create_if_missing else self.db_path.absolute().as_uri()+'?mode=rw',
+                    **({} if create_if_missing else {'uri':True, 'tracking_path':self.db_path}),
                     check_same_thread=False,
                     # Short timeout — application-level retry with random
                     # jitter handles contention instead of sitting in
@@ -7430,6 +7440,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        )""",
                     (session_id,),
                 )
+            self._artifact_register_segment_on_conn(conn,session_id)
         # Session-row creation is transcript-critical: if it fails, the
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
@@ -8524,12 +8535,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _ceiling_clause = " AND id <= ?"
                     _params.append(int(watermark_ceiling))
                 tail_rows = conn.execute(
-                    "SELECT id, tool_calls FROM messages "
+                    "SELECT id, role, tool_calls, display_metadata FROM messages "
                     "WHERE session_id = ? AND active = 1 AND id > ?"
                     f"{_ceiling_clause} ORDER BY id",
                     _params,
                 ).fetchall()
                 if tail_rows:
+                    for row in tail_rows:
+                        if row["role"] == "assistant":
+                            meta = self._decode_display_metadata(row["display_metadata"]) or {}
+                            if not valid_reply_row_id(meta.get(REPLY_SOURCE_ROW_ID_KEY)):
+                                meta[REPLY_SOURCE_ROW_ID_KEY] = int(row["id"])
+                                conn.execute(
+                                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                                    (self._encode_display_metadata(meta), row["id"]),
+                                )
                     tail_ids = [int(r["id"]) for r in tail_rows]
                     placeholders = ",".join("?" for _ in tail_ids)
                     clone_cols = [
@@ -8565,6 +8585,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeError(
                     f"Compression parent changed during publication: {parent_session_id}"
                 )
+            self._artifact_register_segment_on_conn(conn,child_session_id)
 
         self._execute_write(_do)
 
@@ -9394,8 +9415,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return dict(row) if row else None
 
         current = _row(session_id)
+        mapped = conn.execute("SELECT root FROM pantheon_artifact_segments WHERE session_id=?", (session_id,)).fetchone()
+        if mapped is not None:
+            return str(mapped["root"])
         seen = {session_id}
         while current:
+            mapped = conn.execute("SELECT root FROM pantheon_artifact_segments WHERE session_id=?", (current["id"],)).fetchone()
+            if mapped is not None:
+                return str(mapped["root"])
             parent_id = current.get("parent_session_id")
             if (
                 not parent_id
@@ -10705,12 +10732,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND ended_at IS NOT NULL
                   AND started_at < ?
                   AND NOT EXISTS (
+                      SELECT 1 FROM pantheon_artifacts a WHERE a.state='staged'
+                        AND (a.session_id=sessions.id OR a.root=(
+                            SELECT root FROM pantheon_artifact_segments
+                            WHERE session_id=sessions.id
+                        ))
+                  )
+                  AND NOT EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id
                   )
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
             if ids:
+                self._artifact_before_session_delete_on_conn(conn,ids)
                 placeholders = ",".join("?" * len(ids))
+                conn.execute(f"UPDATE sessions SET parent_session_id=NULL WHERE parent_session_id IN ({placeholders})",ids)
                 conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
                 )
@@ -10718,6 +10754,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return ids
 
         removed_ids = self._execute_write(_do) or []
+        self.flush_artifact_cleanup()
         # Clean up any on-disk session files (belt-and-suspenders)
         if sessions_dir and removed_ids:
             for sid in removed_ids:
@@ -12706,6 +12743,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             msg_id = cursor.lastrowid
+            if role == "assistant" and msg_id is not None:
+                meta = self._decode_display_metadata(display_metadata) or {}
+                if not valid_reply_row_id(meta.get(REPLY_SOURCE_ROW_ID_KEY)):
+                    meta[REPLY_SOURCE_ROW_ID_KEY] = msg_id
+                    conn.execute(
+                        "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                        (self._encode_display_metadata(meta), msg_id),
+                    )
 
             # Update counters
             if num_tool_calls > 0:
@@ -12738,6 +12783,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        artifact_finalization: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -12766,8 +12812,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         leaves a partial seed), just with bounded lock holds. A turn flush
         never needs it. Returns the inserted row count.
         """
-        if not messages:
+        if not messages and artifact_finalization is None:
             return 0
+        if artifact_finalization is not None and chunk_rows is not None:
+            raise ValueError("Artifact response commits must be atomic")
 
         if chunk_rows is not None and len(messages) > chunk_rows:
             inserted_total = 0
@@ -12816,6 +12864,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
+                )
+            if artifact_finalization is not None:
+                artifact_finalization["artifacts"] = self._artifact_commit_on_conn(
+                    conn, session_id, artifact_finalization
                 )
             return inserted
 
@@ -13119,6 +13171,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
+            # Row serialization may share the live message's metadata dict.
+            # Canonical identity is tentative until this transaction commits;
+            # a rollback must not stamp a source id onto that live object.
+            display_metadata = dict(self._decode_display_metadata(msg.get("display_metadata")) or {})
+
             cur = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -13147,11 +13204,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
-                    self._encode_display_metadata(msg.get("display_metadata")),
+                    self._encode_display_metadata(display_metadata),
                 ),
             )
             if isinstance(msg, dict) and cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
+                if role == "assistant":
+                    if not valid_reply_row_id(display_metadata.get(REPLY_SOURCE_ROW_ID_KEY)):
+                        display_metadata[REPLY_SOURCE_ROW_ID_KEY] = cur.lastrowid
+                        conn.execute(
+                            "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                            (self._encode_display_metadata(display_metadata), cur.lastrowid),
+                        )
+                    msg["display_metadata"] = display_metadata
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -13392,12 +13457,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             tail_tool_calls = 0
             if watermark is not None:
                 for row in conn.execute(
-                    "SELECT id, tool_calls FROM messages "
+                    "SELECT id, role, tool_calls, display_metadata FROM messages "
                     "WHERE session_id = ? AND active = 1 AND id > ? "
                     "ORDER BY id",
                     (session_id, int(watermark)),
                 ).fetchall():
                     tail_ids.append(int(row["id"]))
+                    # A legacy concurrent append may not have been decoded
+                    # since upgrade. Seed its exact original id before the
+                    # SQL column clone assigns a new physical row id.
+                    if row["role"] == "assistant":
+                        meta = self._decode_display_metadata(row["display_metadata"]) or {}
+                        if not valid_reply_row_id(meta.get(REPLY_SOURCE_ROW_ID_KEY)):
+                            meta[REPLY_SOURCE_ROW_ID_KEY] = int(row["id"])
+                            conn.execute(
+                                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                                (self._encode_display_metadata(meta), row["id"]),
+                            )
                     raw = row["tool_calls"]
                     if raw:
                         try:
@@ -14023,6 +14099,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 decoded = self._decode_display_metadata(row["display_metadata"])
                 if decoded is not None:
                     msg["display_metadata"] = decoded
+            if row["role"] == "assistant":
+                meta = dict(msg.get("display_metadata") or {})
+                if not valid_reply_row_id(meta.get(REPLY_SOURCE_ROW_ID_KEY)):
+                    # This is the actual durable legacy row, not a guess at an
+                    # older pre-upgrade clone. Carry this id through future
+                    # compactions without rewriting stored message content.
+                    meta[REPLY_SOURCE_ROW_ID_KEY] = int(row["id"])
+                msg["display_metadata"] = meta
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             if row["timestamp"]:
@@ -14701,6 +14785,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"UPDATE messages SET active = 0 WHERE id IN ({placeholders})",
                     ids,
                 )
+            self._artifact_rewind_on_conn(conn, session_id, ids)
             if replacement is not None:
                 self._insert_message_rows(conn, session_id, [replacement])
                 inserted = conn.execute("SELECT last_insert_rowid()").fetchone()
@@ -15251,6 +15336,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         conversations while deleting all compression segments of the selected
         logical conversation.
         """
+        mapped=conn.execute('SELECT root FROM pantheon_artifact_segments WHERE session_id=?',(session_id,)).fetchone()
+        if mapped is not None:
+            aliases=[r['session_id'] for r in conn.execute('SELECT session_id FROM pantheon_artifact_segments WHERE root=?',(mapped['root'],))]
+            members=[r['id'] for r in conn.execute('SELECT s.id FROM sessions s JOIN pantheon_artifact_segments a ON a.session_id=s.id WHERE a.root=?',(mapped['root'],))]
+            if members:
+                return sorted(set(members)|set(_collect_delegate_child_ids(conn,aliases)))
         row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
         if row is None:
             return []
@@ -15329,6 +15420,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 return targets
 
+            self._artifact_erase_on_conn(conn, targets)
             conn.executemany(
                 """INSERT OR IGNORE INTO permanent_session_deletions
                    (session_id, requested_session_id, deleted_at)
@@ -15368,6 +15460,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return targets
 
         targets = self._execute_write(_do)
+        self.flush_artifact_cleanup()
         # Gateway conversation affinity can retain the deleted durable session
         # id even after the transcript row is gone. Keep the generation counter
         # (it prevents ABA reuse) but remove route entries that target these IDs.
@@ -15436,6 +15529,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 }
                 if actual_ids != expected_ids:
                     return False
+            self._artifact_before_session_delete_on_conn(conn,[session_id,*_collect_delegate_child_ids(conn,[session_id])])
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
@@ -15449,6 +15543,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return True
 
         deleted = self._execute_write(_do)
+        self.flush_artifact_cleanup()
         if deleted:
             for delegate_id in removed_delegate_ids:
                 self._remove_session_files(sessions_dir, delegate_id)
@@ -15475,13 +15570,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
-            cursor = conn.execute(
+            candidate = conn.execute(
                 """
-                DELETE FROM sessions
+                SELECT id FROM sessions
                 WHERE id = ?
                   AND title IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pantheon_artifacts a WHERE a.state='staged'
+                        AND (a.session_id=sessions.id OR a.root=(
+                            SELECT root FROM pantheon_artifact_segments
+                            WHERE session_id=sessions.id
+                        ))
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM sessions child
@@ -15490,11 +15592,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """,
                 (session_id,),
             )
-            if cursor.rowcount > 0:
-                self._delete_unreferenced_system_prompts(conn)
-            return cursor.rowcount > 0
+            if candidate.fetchone() is None: return False
+            self._artifact_before_session_delete_on_conn(conn,[session_id])
+            conn.execute('DELETE FROM sessions WHERE id=?',(session_id,))
+            self._delete_unreferenced_system_prompts(conn)
+            return True
 
         deleted = self._execute_write(_do)
+        self.flush_artifact_cleanup()
         if deleted:
             self._remove_session_files(sessions_dir, session_id)
         return bool(deleted)
@@ -15553,6 +15658,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return 0
 
             existing_placeholders = ",".join("?" * len(existing))
+            self._artifact_before_session_delete_on_conn(conn,[*existing,*_collect_delegate_child_ids(conn,existing)])
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
@@ -15577,6 +15683,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return len(existing)
 
         count = self._execute_write(_do)
+        self.flush_artifact_cleanup()
         for sid in removed_delegate_ids:
             self._remove_session_files(sessions_dir, sid)
         for sid in removed_ids:
@@ -15599,7 +15706,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "AND archived = 0 "
         "AND NOT EXISTS ("
         "SELECT 1 FROM messages WHERE messages.session_id = sessions.id"
-        ")"
+        ") AND NOT EXISTS (SELECT 1 FROM pantheon_artifacts a WHERE a.state='staged' "
+        "AND (a.session_id=sessions.id OR a.root=(SELECT root FROM "
+        "pantheon_artifact_segments WHERE session_id=sessions.id)))"
     )
 
     def count_empty_sessions(self) -> int:
@@ -15668,6 +15777,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not session_ids:
                 return 0
 
+            self._artifact_before_session_delete_on_conn(conn,session_ids)
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
@@ -15690,6 +15800,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return len(session_ids)
 
         count = self._execute_write(_do)
+        self.flush_artifact_cleanup()
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
         return count
@@ -16097,6 +16208,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not session_ids:
                 return 0
 
+            self._artifact_before_session_delete_on_conn(conn,session_ids)
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
@@ -16113,6 +16225,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return len(session_ids)
 
         count = self._execute_write(_do)
+        self.flush_artifact_cleanup()
         # Clean up on-disk files outside the DB transaction
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)

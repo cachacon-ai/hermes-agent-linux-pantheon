@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor, _DB_PERSISTED_MARKER
+from agent.message_metadata import REPLY_SOURCE_ROW_ID_KEY
 from agent.conversation_compression import (
     CompressionCommitFence,
     _is_real_user_message,
@@ -1612,6 +1613,13 @@ class TestTodoSnapshotScaffoldingTails:
             _msgs(), "sys", approx_tokens=120_000
         )
 
+        # The new assistant handoff receives canonical durable identity even
+        # when there is no todo injection. It must match its actual DB row.
+        expected[1]['display_metadata'] = {
+            REPLY_SOURCE_ROW_ID_KEY: compressed[1]['_row_id'],
+        }
+        persisted = db.get_messages_as_conversation(agent.session_id, include_row_ids=True)
+        assert persisted[1]['display_metadata'] == expected[1]['display_metadata']
         assert [
             {
                 k: v

@@ -394,13 +394,21 @@ def _eager_reconcile_own_session_db() -> None:
     """
     try:
         from hermes_state import SessionDB, _default_db_path
+        from hermes_artifacts import recover_profile_artifact_captures
 
-        SessionDB(db_path=Path(_default_db_path()), read_only=False).close()
+        with SessionDB(db_path=Path(_default_db_path()), read_only=False) as db:
+            recover_profile_artifact_captures(db)
     except Exception as exc:
         _log.warning(
             "startup schema reconcile of state.db failed (%s); session "
             "reads will retry the heal per poll", exc,
         )
+    finally:
+        try:
+            from hermes_artifacts import start_profile_artifact_housekeeping
+            start_profile_artifact_housekeeping()
+        except Exception as exc:
+            _log.warning('Artifact housekeeping startup failed (%s)', type(exc).__name__)
 
 
 @asynccontextmanager
@@ -12390,8 +12398,18 @@ def _session_latest_descendant(session_id: str, db):
             except Exception:
                 return None
 
+    # Exact retained owner aliases must win over unrelated prefix matches.
+    lookup = getattr(db, 'artifact_live_session', None)
+    if callable(lookup) and db.get_session(session_id) is None:
+        surviving = lookup(session_id)
+        if isinstance(surviving, str) and surviving:
+            return surviving, [session_id, surviving]
     sid = db.resolve_session_id(session_id)
     if not sid or not db.get_session(sid):
+        lookup=getattr(db,'artifact_live_session',None)
+        surviving=lookup(session_id) if callable(lookup) else None
+        if isinstance(surviving,str) and surviving:
+            return surviving,[session_id,surviving]
         return None, []
 
     conn = (

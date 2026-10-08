@@ -791,6 +791,7 @@ _LOCAL_CRON_DELIVERY_NOTE = (
 )
 
 PLATFORM_HINTS = {
+    "pantheon": ("You are chatting in Pantheon. Publish completed files explicitly with pantheon_publish_artifact from the approved project workspace. The tool captures immutable bytes; final successful response commits delivery. Maximum 25 MiB. Self-contained HTML, raster images, and supported documents are available. MEDIA tags, prose paths, and file creation alone never publish files. If the publication tool is unavailable, state that publication is unavailable in this session."),
     "whatsapp": (
         "You are on WhatsApp. Standard markdown auto-converts to WhatsApp "
         "syntax (*bold*, _italic_, ~strike~, monospace) \u2014 write markdown "
