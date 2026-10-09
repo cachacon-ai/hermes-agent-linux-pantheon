@@ -127,11 +127,28 @@ def safe_source_bytes(path, roots, *, limit=MAX_ARTIFACT_BYTES):
             if not chunk: break
             chunks.append(chunk);length+=len(chunk)
             if length>limit: raise ArtifactError('file_too_large','File exceeds 25 MiB')
+        data=b''.join(chunks)
         after=os.fstat(fd)
         fingerprint=lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
         if fingerprint(before)!=fingerprint(after) or length!=after.st_size:
             raise ArtifactError('source_changed','Source changed during capture; retry explicitly')
-        return b''.join(chunks)
+        # Same-size in-place rewrites may leave timestamps unchanged on coarse
+        # filesystems; confirm the path still exposes the bytes we captured.
+        verify_fd=os.open(relative.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+        try:
+            verify_stat=os.fstat(verify_fd)
+            if (verify_stat.st_dev,verify_stat.st_ino)!=(before.st_dev,before.st_ino):
+                raise ArtifactError('source_changed','Source changed during capture; retry explicitly')
+            verify=bytearray(); offset=0
+            while offset<length:
+                chunk=os.pread(verify_fd,min(1024*1024,length-offset),offset)
+                if not chunk: break
+                verify.extend(chunk); offset+=len(chunk)
+            if bytes(verify)!=data or len(verify)!=length:
+                raise ArtifactError('source_changed','Source changed during capture; retry explicitly')
+        finally:
+            os.close(verify_fd)
+        return data
     except OSError as exc:
         raise ArtifactError('source_unavailable','Source could not be opened safely') from exc
     finally:

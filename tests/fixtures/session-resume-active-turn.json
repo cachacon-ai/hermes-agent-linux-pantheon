@@ -6,11 +6,6 @@
     "skills": {},
     "tools": {}
   },
-  "inflight": {
-    "assistant": "partial answer",
-    "streaming": true,
-    "user": "current prompt"
-  },
   "message_count": 1,
   "messages": [
     {
@@ -19,11 +14,21 @@
     }
   ],
   "messages_omitted": false,
-  "resumed": "stored-running",
   "running": true,
+  "turn_started_at": 1700000123.5,
   "session_id": "rt-running",
   "session_key": "stored-running",
   "started_at": 1700000000.0,
   "status": "working",
-  "turn_started_at": 1700000123.5
+  "inflight": {
+    "assistant": "partial answer",
+    "streaming": true,
+    "user": "current prompt"
+  },
+  "artifact_delivery_version": 0,
+  "conversation_root_id": "stored-running",
+  "profile": "default",
+  "artifact_delivery_unavailable_code": "legacy_session",
+  "artifact_delivery_unavailable_reason": "This conversation was created without file delivery; create a new conversation to enable it.",
+  "resumed": "stored-running"
 }
