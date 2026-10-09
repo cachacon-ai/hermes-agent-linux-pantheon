@@ -70,6 +70,13 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    from agent.pantheon_artifacts import capability_details
+    publication_capability = capability_details(profile_home) if params.get("artifact_delivery_version") == 1 and source == "pantheon" else {
+        "artifact_delivery_version": 0,
+        "artifact_delivery_unavailable_code": "legacy_session",
+        "artifact_delivery_unavailable_reason": "This conversation was created without file delivery; create a new conversation to enable it.",
+    }
+    publication_version = publication_capability["artifact_delivery_version"]
     ready = threading.Event()
     now = time.time()
     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
@@ -77,6 +84,8 @@ def _(rid, params: dict) -> dict:
     with _sessions_lock:
         _sessions[sid] = {
             "agent": None,
+            **publication_capability,
+            "artifact_profile": _response_profile_name(profile),
             "agent_error": None,
             "agent_ready": ready,
             "attached_images": [],
@@ -104,6 +113,7 @@ def _(rid, params: dict) -> dict:
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
             "session_key": key,
+            "conversation_root_id": key,
             "show_reasoning": _load_show_reasoning(),
             "source": source,
             "slash_worker": None,
@@ -145,7 +155,7 @@ def _(rid, params: dict) -> dict:
                         key,
                         source=source,
                         model=_resolve_model(),
-                        model_config={"_branched_from": parent_key},
+                        model_config={"_branched_from": parent_key, **{field: _sessions[sid][field] for field in ("artifact_delivery_version", "artifact_delivery_unavailable_code", "artifact_delivery_unavailable_reason") if field in _sessions[sid]}},
                         parent_session_id=parent_key,
                         cwd=_sessions[sid]["cwd"],
                         profile_name=(
@@ -208,6 +218,7 @@ def _(rid, params: dict) -> dict:
         {
             "session_id": sid,
             "stored_session_id": key,
+            **_artifact_capability_payload(_sessions[sid]),
             "message_count": len(history),
             "messages": _history_to_messages(history),
             "info": {
@@ -489,6 +500,12 @@ def _(rid, params: dict) -> dict:
 
         found = db.get_session(target)
         if not found:
+            lookup=getattr(db,'artifact_live_session',None)
+            surviving=lookup(target) if callable(lookup) else None
+            if isinstance(surviving,str) and surviving:
+                target=surviving
+                found=db.get_session(target)
+        if not found:
             found = db.get_session_by_title(target)
             if found:
                 target = found["id"]
@@ -706,6 +723,29 @@ def _(rid, params: dict) -> dict:
                 target, exc,
             )
 
+        _publication_config = found.get("model_config") or {}
+        if isinstance(_publication_config, str):
+            try:
+                _publication_config = json.loads(_publication_config)
+            except (ValueError, TypeError):
+                _publication_config = {}
+        if isinstance(_publication_config, dict) and _publication_config.get("artifact_delivery_version") == 1:
+            from agent.pantheon_artifacts import capability_details
+            _publication_capability = capability_details(profile_home)
+        else:
+            _publication_capability = {"artifact_delivery_version": 0,
+                "artifact_delivery_unavailable_code": (_publication_config.get("artifact_delivery_unavailable_code") if isinstance(_publication_config, dict) else None) or "legacy_session",
+                "artifact_delivery_unavailable_reason": (_publication_config.get("artifact_delivery_unavailable_reason") if isinstance(_publication_config, dict) else None) or "This conversation was created without file delivery; create a new conversation to enable it."}
+        _publication_version = _publication_capability["artifact_delivery_version"]
+        try:
+            _publication_root = db.artifact_conversation_root(target) if hasattr(db, "artifact_conversation_root") else target
+        except Exception:
+            _publication_root = target
+            _publication_capability = {"artifact_delivery_version": 0,
+                "artifact_delivery_unavailable_code": "capability_unavailable",
+                "artifact_delivery_unavailable_reason": "The conversation publication authority is unavailable."}
+            _publication_version = 0
+
         profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
             profile_home
         )
@@ -872,6 +912,9 @@ def _(rid, params: dict) -> dict:
                 resume_runtime_overrides=overrides or None,
                 explicit_cwd=bool(profile_resume_cwd),
             )
+            record.update(_publication_capability)
+            record["conversation_root_id"] = _publication_root
+            record["artifact_profile"] = _response_profile_name(profile)
             _sync_create_reasoning_override_from_resume_overrides(record)
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
@@ -974,6 +1017,9 @@ def _(rid, params: dict) -> dict:
                 todo_state=_todo_state_from_history(history),
                 explicit_cwd=bool(profile_resume_cwd),
             )
+            record.update(_publication_capability)
+            record["conversation_root_id"] = _publication_root
+            record["artifact_profile"] = _response_profile_name(profile)
             _sync_create_reasoning_override_from_resume_overrides(record)
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -1063,6 +1109,7 @@ def _(rid, params: dict) -> dict:
                     session_id=target,
                     session_db=db,
                     platform_override=source,
+                    artifact_delivery_version=_publication_version,
                     context_cwd_is_launch_artifact=(
                         source in _LAUNCH_CWD_NOT_A_WORKSPACE
                         and not profile_resume_cwd
@@ -1178,6 +1225,10 @@ def _(rid, params: dict) -> dict:
                     lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
             session = _sessions.get(sid) or {}
+            session.update(_publication_capability)
+            session["conversation_root_id"] = _publication_root
+            if _publication_version and getattr(agent, "_pantheon_artifact_roots", ()) == () and profile_resume_cwd:
+                agent._pantheon_artifact_roots = (profile_resume_cwd,)
     finally:
         # Every return that does NOT reach the transfer above abandons this
         # handle — session-not-found, both "resume failed" paths, the live-session
@@ -3429,7 +3480,7 @@ def _(rid, params: dict) -> dict:
                 # the parent live (no end_reason='branched'), so the legacy
                 # end_reason heuristic never matches it — the marker is the only
                 # thing that surfaces TUI branches. See issue #20856.
-                model_config={"_branched_from": old_key},
+                model_config={"_branched_from": old_key, **{field: session[field] for field in ("artifact_delivery_version", "artifact_delivery_unavailable_code", "artifact_delivery_unavailable_reason") if field in session}},
                 parent_session_id=old_key,
                 cwd=_session_cwd(session),
                 # The branch stays on its parent's profile. Explicit stamp (not
@@ -3463,7 +3514,7 @@ def _(rid, params: dict) -> dict:
                         # restart, corrupting the truncate ordinal address
                         # space the same way #82756 did.
                         "display_kind": msg.get("display_kind"),
-                        "display_metadata": msg.get("display_metadata"),
+                        "display_metadata": {k:v for k,v in (msg.get("display_metadata") or {}).items() if k not in {"pantheon_artifacts", "pantheon_reply_preview"}},
                         # Preserve the parent's original message timestamps —
                         # branch copies are history, not new activity (9d73006ad).
                         "timestamp": msg.get("timestamp"),
@@ -3521,6 +3572,7 @@ def _(rid, params: dict) -> dict:
                     session_id=new_key,
                     session_db=branch_db,
                     platform_override=source,
+                    artifact_delivery_version=session.get("artifact_delivery_version", 0),
                     context_cwd_is_launch_artifact=(
                         _context_cwd_is_launch_artifact(session)
                     ),

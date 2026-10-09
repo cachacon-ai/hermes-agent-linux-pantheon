@@ -759,7 +759,27 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        _artifact_options = {}
+        from agent.pantheon_artifacts import enabled as artifacts_enabled
+        if artifacts_enabled(agent):
+            from agent.pantheon_artifacts import SCHEMA, dispatch, accept_result
+            from types import SimpleNamespace
+            # Native Codex writes on its app-server host/cwd, independently of
+            # Hermes terminal environment configuration.
+            native_source = SimpleNamespace(cwd=cwd, runtime="codex_app_server")
+            def publish_dynamic(params):
+                result = dispatch(agent, params["callId"], agent._current_task_id,
+                                  params.get("arguments"), native_environment=native_source)
+                accept_result(agent, params["callId"], result)
+                try:
+                    successful = not json.loads(result).get("error")
+                except (ValueError,TypeError):
+                    successful = False
+                return {"success":successful,"contentItems":[{"type":"inputText","text":result}]}
+            _artifact_options = {"dynamic_tools":[{"name":SCHEMA["name"],"description":SCHEMA["description"],"inputSchema":SCHEMA["parameters"]}],
+                                 "dynamic_tool_handler":publish_dynamic}
         agent._codex_session = CodexAppServerSession(
+            **_artifact_options,
             cwd=cwd,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
@@ -768,6 +788,11 @@ def run_codex_app_server_turn(
             ),
             on_event=make_codex_app_server_event_bridge(agent),
         )
+        if _artifact_options and not agent._codex_session.artifact_delivery_available:
+            agent._pantheon_artifact_delivery_version = 0
+            agent._pantheon_artifact_unavailable_code = "unsupported_protocol"
+            agent._pantheon_artifact_unavailable_reason = "The installed Codex adapter does not support the required publication protocol."
+            logger.warning("Pantheon publication unavailable: native Codex dynamic-tool protocol unsupported")
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
@@ -776,6 +801,8 @@ def run_codex_app_server_turn(
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
+        from agent.pantheon_artifacts import cancel_turn
+        cancel_turn(agent)
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
@@ -863,7 +890,12 @@ def run_codex_app_server_turn(
         # the already-flushed user turn). See gateway/run.py agent_persisted.
         if getattr(agent, "_session_db", None) is not None:
             try:
-                _codex_flush_ok = agent._flush_messages_to_session_db(messages)
+                from agent.pantheon_artifacts import commit_response, cancel_turn
+                if not turn.interrupted and not turn.error:
+                    _codex_flush_ok = commit_response(agent, messages)
+                else:
+                    cancel_turn(agent)
+                    _codex_flush_ok = agent._flush_messages_to_session_db(messages)
             except Exception:
                 _codex_flush_ok = False
                 logger.warning(
@@ -941,7 +973,17 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    from agent.pantheon_artifacts import enabled as artifacts_enabled, commit_response
+    if artifacts_enabled(agent) and not turn.projected_messages and not turn.interrupted and not turn.error:
+        commit_response(agent, messages)
+    _artifacts = getattr(agent, "_pantheon_committed_artifacts", []) if not turn.interrupted and not turn.error else []
+    _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
+    if callable(_apply_override):
+        _apply_override(messages)
+
     return {
+        "artifacts": _artifacts,
+        "reply_row_id": getattr(agent, "_pantheon_reply_row_id", None) if _artifacts else None,
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,

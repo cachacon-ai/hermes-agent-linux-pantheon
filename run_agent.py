@@ -2633,7 +2633,16 @@ class AIAgent:
             # NO markers were stamped, so the next flush re-scans and
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
-            if _batch_rows:
+            _artifact_finalization = getattr(self, "_pantheon_pending_commit", None)
+            if _batch_rows or isinstance(_artifact_finalization, dict):
+                _batch_kwargs = {}
+                if isinstance(_artifact_finalization, dict):
+                    # Exact source object may already be flushed. The DB helper
+                    # receives the row serialization for newly inserted tails.
+                    _source = _artifact_finalization["message"]
+                    if _source in _batch_msgs:
+                        _artifact_finalization["message"] = _batch_rows[_batch_msgs.index(_source)]
+                    _batch_kwargs["artifact_finalization"] = _artifact_finalization
                 self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
@@ -2647,6 +2656,7 @@ class AIAgent:
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                    **_batch_kwargs,
                 )
                 from agent.transcript_repair import sync_flushed_message_markers
 
@@ -3673,6 +3683,8 @@ class AIAgent:
 
         def _publish_interrupt_state() -> None:
             self._interrupt_requested = True
+            if getattr(self, '_pantheon_artifact_delivery_version', 0) == 1:
+                self._pantheon_cancelled_turn_id = getattr(self, '_current_turn_id', None)
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason
             if hard_cancel:
@@ -3823,6 +3835,14 @@ class AIAgent:
                     child.interrupt(message)
             except Exception as e:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
+        # Publish runtime cancellation before any potentially blocking DB
+        # operation. Deleted authority already fences publication; other
+        # persistence failures cannot clear the in-memory interrupt fence.
+        try:
+            from agent.pantheon_artifacts import cancel_turn
+            cancel_turn(self)
+        except Exception as exc:
+            logger.warning('Artifact cancellation persistence failed (%s)', type(exc).__name__)
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
         return True

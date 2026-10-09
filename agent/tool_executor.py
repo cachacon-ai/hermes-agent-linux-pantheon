@@ -592,6 +592,7 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    artifact_authority=None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -729,6 +730,9 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
+            if function_name == "pantheon_publish_artifact":
+                from agent.pantheon_artifacts import dispatch
+                return dispatch(agent, tool_call_id, effective_task_id, final_args, authority=artifact_authority)
             return execute(final_args)
         finally:
             _hb_stop.set()
@@ -835,6 +839,8 @@ def _run_sequential_tool_execution_middleware(
     ``<= 0``) owns that wait. Applying the generic tool deadline here would
     return ``tool_timeout`` while the prompt and worker stay active.
     """
+    from agent.pantheon_artifacts import freeze_authority
+    artifact_authority = freeze_authority(agent, effective_task_id) if function_name == "pantheon_publish_artifact" else None
     timeout_s = _resolve_sequential_tool_timeout()
     kwargs = {
         "function_name": function_name,
@@ -845,6 +851,7 @@ def _run_sequential_tool_execution_middleware(
         "scope_block": scope_block,
         "display_index": display_index,
         "middleware_trace": middleware_trace,
+        "artifact_authority": artifact_authority,
     }
     if function_name in _NEVER_PARALLEL_TOOLS:
         return _run_agent_tool_execution_middleware(agent, **kwargs)
@@ -894,7 +901,11 @@ def _run_sequential_tool_execution_middleware(
                     break
                 wait_slice = min(wait_slice, remaining)
             try:
-                return future.result(timeout=wait_slice)
+                outcome = future.result(timeout=wait_slice)
+                if function_name == "pantheon_publish_artifact":
+                    from agent.pantheon_artifacts import accept_result
+                    accept_result(agent, tool_call_id, outcome.result, authority=artifact_authority)
+                return outcome
             except concurrent.futures.TimeoutError:
                 if agent._interrupt_requested:
                     interrupted = True
@@ -906,6 +917,9 @@ def _run_sequential_tool_execution_middleware(
                         f"sequential tool running ({elapsed}s): {function_name}"
                     )
 
+        if function_name == "pantheon_publish_artifact":
+            from agent.pantheon_artifacts import accept_result
+            accept_result(agent, tool_call_id, "", abandoned=True, authority=artifact_authority)
         if interrupted:
             # Belt-and-braces: interrupt() already fans out to tracked worker
             # tids, but the worker may have registered after the fan-out ran.
@@ -1301,6 +1315,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     # Resolved before the workers are defined so the start-order gate can clamp
     # its own bound against the batch deadline it must stay under.
+    from agent.pantheon_artifacts import freeze_authority
+    artifact_authorities = {
+        _pairing_tool_call_id(parsed[0]): freeze_authority(agent,effective_task_id)
+        for parsed in parsed_calls if parsed[1] == "pantheon_publish_artifact"
+    }
     timeout_s = _resolve_concurrent_tool_timeout()
     gate_timeout_s = _start_order_gate_timeout(timeout_s)
 
@@ -1401,6 +1420,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
+                    artifact_authority=artifact_authorities.get(tool_call_id),
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1512,6 +1532,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         futures = []
         future_to_index = {}
         timed_out_indices: set[int] = set()
+        revoked_artifact_indices: set[int] = set()
+
+        def _revoke_pending_publications(pending):
+            from agent.pantheon_artifacts import accept_result
+            for future in pending:
+                index = future_to_index.get(future)
+                if index is None or parsed_calls[index][1] != "pantheon_publish_artifact":
+                    continue
+                call_id = _pairing_tool_call_id(parsed_calls[index][0])
+                accept_result(agent, call_id, "", abandoned=True, authority=artifact_authorities.get(call_id))
+                revoked_artifact_indices.add(index)
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         if runnable_calls:
             max_workers = _max_workers_for_tool_batch(runnable_calls)
@@ -1628,6 +1659,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             len(timed_out_indices),
                             ", ".join(_still_running[:5]),
                         )
+                        _revoke_pending_publications(not_done)
                         for f in not_done:
                             f.cancel()
                         # Release gate-parked workers before the interrupt
@@ -1657,6 +1689,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 f"{len(not_done)} pending concurrent tool(s)",
                                 force=True,
                             )
+                        _revoke_pending_publications(not_done)
                         for f in not_done:
                             f.cancel()
                         # Release gate-parked workers so they abort instead of
@@ -1714,6 +1747,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # deadline snapshot (timed_out_indices, taken from not_done) and this
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
+        if name == "pantheon_publish_artifact":
+            from agent.pantheon_artifacts import accept_result
+            # Snapshot publication cannot reuse the ordinary executor's late
+            # result grace: a timeout has already durably revoked its nonce.
+            if i in revoked_artifact_indices:
+                r = None
+            accept_result(agent, tool_call_id, r[2] if r is not None else "", abandoned=r is None, authority=artifact_authorities.get(tool_call_id))
         effect_disposition = None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"

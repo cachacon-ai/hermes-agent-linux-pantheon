@@ -61,6 +61,56 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
 }
 
 
+def supports_pantheon_dynamic_tools(codex_bin="codex"):
+    """Read the actual installed CLI schema; never start a provider turn.
+
+    Cache is keyed by executable identity, so an upgrade cannot retain a stale
+    negative/positive capability. Failure leaves normal text operation usable.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    executable=shutil.which(codex_bin)
+    if not executable: return False
+    try:
+        identity=Path(executable).stat()
+        key=(executable,identity.st_mtime_ns,identity.st_size)
+    except OSError:
+        return False
+    cache=getattr(supports_pantheon_dynamic_tools,"_cache",{})
+    if key in cache: return cache[key]
+    supported=False
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-codex-protocol-") as output:
+            result=subprocess.run([executable,"app-server","generate-json-schema","--experimental","--out",output],
+                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10,check=False)
+            if result.returncode==0:
+                # Exact schema fields, not the binary version label, establish
+                # that this installation knows the experimental contract.
+                import json
+                thread=False; call=False
+                for path in Path(output).rglob("*.json"):
+                    if path.stat().st_size>10*1024*1024: continue
+                    schema=json.loads(path.read_text())
+                    pending=[schema]
+                    while pending:
+                        node=pending.pop()
+                        if isinstance(node,dict):
+                            properties=node.get("properties",{})
+                            if isinstance(properties,dict):
+                                thread=thread or "dynamicTools" in properties
+                                call=call or all(field in properties for field in ("threadId","turnId","callId","tool","arguments"))
+                            pending.extend(node.values())
+                        elif isinstance(node,list): pending.extend(node)
+                supported=thread and call
+    except (OSError,ValueError,subprocess.SubprocessError):
+        supported=False
+    # Bound the cache; typically there is exactly one installed binary.
+    supports_pantheon_dynamic_tools._cache={key:supported}
+    return supported
+
+
 @dataclass
 class TurnResult:
     """Result of one user→assistant→tool turn through the codex app-server."""
@@ -282,6 +332,8 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        dynamic_tools: Optional[list[dict]] = None,
+        dynamic_tool_handler: Optional[Callable[[dict], dict]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -296,6 +348,12 @@ class CodexAppServerSession:
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
+        self._dynamic_tools = list(dynamic_tools or [])
+        self._dynamic_tool_handler = dynamic_tool_handler
+        self.artifact_delivery_available = not self._dynamic_tools or supports_pantheon_dynamic_tools(codex_bin)
+        if not self.artifact_delivery_available:
+            self._dynamic_tools = []
+            self._dynamic_tool_handler = None
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
@@ -326,6 +384,7 @@ class CodexAppServerSession:
             client_name="hermes",
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
+            **({"capabilities": {"experimentalApi": True}} if self._dynamic_tools else {}),
         )
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
@@ -343,6 +402,8 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._dynamic_tools:
+            params["dynamicTools"] = self._dynamic_tools
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -1013,7 +1074,21 @@ class CodexAppServerSession:
         rid = req.get("id")
         params = req.get("params") or {}
 
-        if method == "item/commandExecution/requestApproval":
+        if method == "item/tool/call":
+            # Unlike approval compatibility notifications, publication requires
+            # exact active parent thread/turn/call identity.
+            if (not self._dynamic_tool_handler or not self._dynamic_tools
+                    or params.get("threadId") != self._thread_id
+                    or not self._active_turn_id
+                    or params.get("turnId") != self._active_turn_id
+                    or not isinstance(params.get("callId"), str) or not params["callId"]
+                    or params.get("tool") not in {tool["name"] for tool in self._dynamic_tools}
+                    or self._interrupt_event.is_set()):
+                self._client.respond(rid, {"success":False,"contentItems":[{"type":"inputText","text":"Publication context is unavailable or mismatched"}]})
+            else:
+                result = self._dynamic_tool_handler(params)
+                self._client.respond(rid,result)
+        elif method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)
             self._client.respond(rid, {"decision": decision})
         elif method == "item/fileChange/requestApproval":

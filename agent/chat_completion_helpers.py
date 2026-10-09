@@ -3217,7 +3217,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         for msg in messages:
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
-            for internal_field in ("reasoning", "finish_reason"):
+            from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
+            for internal_field in ("reasoning", "finish_reason", *PERSISTENCE_ONLY_MESSAGE_FIELDS):
                 api_msg.pop(internal_field, None)
             # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go,
             # Mistral, Moonshot/Kimi) reject any message key outside the Chat
@@ -3252,6 +3253,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                         if _agg_slot and _agg_slot.get("model"):
                             _sanitize_model = _agg_slot["model"]
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
+            for key in list(api_msg):
+                if key.startswith("_"):
+                    api_msg.pop(key, None)
             api_messages.append(api_msg)
 
         effective_system = agent._cached_system_prompt or ""

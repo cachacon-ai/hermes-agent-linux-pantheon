@@ -108,7 +108,7 @@ def _validated_permanent_attachment_paths(
     return validated
 
 
-def _resolve_session_id(db, session_id: str) -> Optional[str]:
+def _resolve_session_id(db, session_id: str, *, allow_artifact_alias: bool = False) -> Optional[str]:
     """Resolve *session_id*, distinguishing "absent" from "unreadable".
 
     A corrupt ``state.db`` does not raise on every read. The exact-match
@@ -124,7 +124,19 @@ def _resolve_session_id(db, session_id: str) -> Optional[str]:
     what is actually wrong.
     """
     try:
-        return db.resolve_session_id(session_id)
+        # A known exact historic id takes precedence over prefix matching.
+        # Reads recover its surviving owner; ordinary DELETE remains a no-op
+        # for the removed segment and must not delete a similarly named row.
+        lookup = getattr(db, 'artifact_live_session', None)
+        if callable(lookup) and db.get_session(session_id) is None:
+            surviving = lookup(session_id)
+            if isinstance(surviving, str) and surviving:
+                return surviving if allow_artifact_alias else None
+        resolved=db.resolve_session_id(session_id)
+        if resolved is None and allow_artifact_alias:
+            surviving=lookup(session_id) if callable(lookup) else None
+            resolved=surviving if isinstance(surviving,str) else None
+        return resolved
     except sqlite3.DatabaseError as exc:
         if not is_malformed_db_error(exc):
             raise
@@ -678,7 +690,7 @@ async def get_session_stats(profile: Optional[str] = None):
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
-        sid = _resolve_session_id(db, session_id)
+        sid = _resolve_session_id(db, session_id, allow_artifact_alias=True)
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -738,7 +750,7 @@ async def get_session_messages(
     def _read():
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
-            sid = _resolve_session_id(db, session_id)
+            sid = _resolve_session_id(db, session_id, allow_artifact_alias=True)
             if not sid:
                 return None
             sid = db.resolve_resume_session_id(sid)
@@ -870,6 +882,8 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             # the bulk-delete endpoint, which already treats ghost ids as success.
             sid = _resolve_session_id(db, session_id)
             if not sid:
+                cleanup=getattr(db,'flush_artifact_cleanup',None)
+                if callable(cleanup): cleanup()
                 return {"ok": True, "already_absent": True}
             db.delete_session(sid)
             return {"ok": True}
@@ -986,7 +1000,7 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
     def _prepare_export():
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
-            sid = _resolve_session_id(db, session_id)
+            sid = _resolve_session_id(db, session_id, allow_artifact_alias=True)
             return (sid, db.get_session(sid)) if sid else None
         finally:
             db.close()
@@ -1046,3 +1060,56 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
 async def prune_sessions_endpoint(body: SessionPrune):
     """Delete ended sessions matching filters without blocking the event loop."""
     return await asyncio.to_thread(_prune_sessions, body)
+
+# Artifact routes intentionally use the same authenticated app middleware as
+# session history. Registry scope is exact; the general filesystem endpoint is
+# never used for publication content.
+@manage_router.get('/api/sessions/{session_id}/artifacts')
+async def pantheon_artifact_list(session_id: str, profile: Optional[str] = None,
+                                 cursor: Optional[str] = None, since_revision: int = 0):
+    from hermes_artifacts import ArtifactError
+    def read():
+        db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            name = _cron_profile_home(profile)[0] if profile else _cron_default_profile()
+            return db.artifact_changes(session_id, name, cursor=cursor, since_revision=since_revision)
+        except ArtifactError as exc:
+            raise HTTPException(status_code=exc.status, detail={'code':exc.code,'message':str(exc)}) from exc
+        finally:
+            db.close()
+    return await asyncio.to_thread(read)
+
+
+@manage_router.get('/api/sessions/{session_id}/artifacts/{artifact_id}/content')
+async def pantheon_artifact_content(session_id: str, artifact_id: str, profile: Optional[str] = None):
+    from hermes_artifacts import ArtifactError
+    from fastapi.responses import Response
+    def read():
+        db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            return db.artifact_content(session_id,artifact_id)
+        except ArtifactError as exc:
+            raise HTTPException(status_code=exc.status, detail={'code':exc.code,'message':str(exc)}) from exc
+        finally:
+            db.close()
+    descriptor, content = await asyncio.to_thread(read)
+    from urllib.parse import quote
+    return Response(content,media_type=descriptor['mime'],headers={
+        'Content-Disposition': "attachment; filename*=UTF-8''"+quote(descriptor['name'],safe=''),
+        'X-Content-Type-Options':'nosniff','Cache-Control':'no-store',
+        'Content-Security-Policy':"sandbox; default-src 'none'",
+        'Content-Length':str(len(content)), 'ETag':'"'+descriptor['sha256']+'"'})
+
+
+@manage_router.delete('/api/sessions/{session_id}/artifacts/{artifact_id}')
+async def pantheon_artifact_delete(session_id: str, artifact_id: str, profile: Optional[str] = None):
+    from hermes_artifacts import ArtifactError
+    def remove():
+        db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            return db.artifact_delete(session_id,artifact_id)
+        except ArtifactError as exc:
+            raise HTTPException(status_code=exc.status, detail={'code':exc.code,'message':str(exc)}) from exc
+        finally:
+            db.close()
+    return await asyncio.to_thread(remove)

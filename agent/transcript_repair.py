@@ -10,9 +10,25 @@ under the 2K invariant (#95514 / PR #95886). Provides focused helpers to:
 from __future__ import annotations
 
 import sqlite3
+import json
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.context_compressor import _DB_PERSISTED_MARKER
+from agent.message_metadata import REPLY_SOURCE_ROW_ID_KEY, valid_reply_row_id
+
+
+def _reply_metadata(raw: Any, row_id: int) -> dict:
+    """Decode the existing sidecar and seed exact legacy-row provenance."""
+    try:
+        meta = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+    except (TypeError, ValueError):
+        meta = None
+    meta = dict(meta) if isinstance(meta, dict) else {}
+    if not valid_reply_row_id(meta.get(REPLY_SOURCE_ROW_ID_KEY)):
+        meta[REPLY_SOURCE_ROW_ID_KEY] = row_id
+    return meta
 
 
 def is_content_blank(content: Any) -> bool:
@@ -55,7 +71,7 @@ def resolve_and_repair_transcript_batch(
         repaired = False
         if role == "assistant" and isinstance(existing_row_id, int):
             row = conn.execute(
-                "SELECT id, role, active, timestamp, content FROM messages "
+                "SELECT id, role, active, timestamp, content, display_metadata FROM messages "
                 "WHERE id = ? AND session_id = ?",
                 (existing_row_id, session_id),
             ).fetchone()
@@ -64,14 +80,16 @@ def resolve_and_repair_transcript_batch(
                 if int(row["active"] or 0) == 1:
                     target_row = row
                 else:
-                    # Watermark compaction soft-archived the concurrent tail
-                    # and cloned it. Find the active clone.
+                    # Compaction changes physical ids. Resolve its exact
+                    # preserved source, never a timestamp/text lookalike.
+                    source = _reply_metadata(row["display_metadata"], int(row["id"]))[REPLY_SOURCE_ROW_ID_KEY]
                     clone = conn.execute(
-                        "SELECT id, role, active, timestamp, content FROM messages "
+                        "SELECT id, role, active, timestamp, content, display_metadata FROM messages "
                         "WHERE session_id = ? AND active = 1 AND role = 'assistant' "
-                        "AND timestamp IS ? AND id != ? "
+                        "AND json_extract(CASE WHEN json_valid(display_metadata) "
+                        "THEN display_metadata ELSE '{}' END, ?) = ? AND id != ? "
                         "ORDER BY id DESC LIMIT 1",
-                        (session_id, row["timestamp"], row["id"]),
+                        (session_id, '$.' + REPLY_SOURCE_ROW_ID_KEY, source, row["id"]),
                     ).fetchone()
                     if clone is not None:
                         target_row = clone
@@ -79,6 +97,12 @@ def resolve_and_repair_transcript_batch(
                 target_id = int(target_row["id"])
                 raw_content = target_row["content"]
                 decoded = decode_content_fn(raw_content)
+                metadata = _reply_metadata(target_row["display_metadata"], target_id)
+                msg["_canonical_display_metadata"] = metadata
+                conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (json.dumps(metadata), target_id),
+                )
                 if is_content_blank(decoded):
                     encoded = encode_content_fn(msg.get("content"))
                     conn.execute(
@@ -108,5 +132,9 @@ def sync_flushed_message_markers(
         written[_DB_PERSISTED_MARKER] = True
         if isinstance(row.get("_row_id"), int):
             written["_row_id"] = row["_row_id"]
+        if isinstance(row.get("display_metadata"), dict):
+            written["display_metadata"] = dict(row["display_metadata"])
+        if isinstance(row.get("_canonical_display_metadata"), dict):
+            written["display_metadata"] = dict(row["_canonical_display_metadata"])
         if "_canonical_content" in row:
             written["content"] = row["_canonical_content"]

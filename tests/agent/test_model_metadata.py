@@ -80,6 +80,19 @@ class TestEstimateMessagesTokensRough:
             estimate_messages_tokens_rough([msg])
         )
 
+    def test_reply_identity_and_display_metadata_do_not_change_estimate(self):
+        """Display sidecars never reach the provider or create context pressure."""
+        from agent.model_metadata import _wire_message_shadow
+
+        message = {"role": "assistant", "content": "done"}
+        persisted = {
+            **message,
+            "display_kind": "async_delegation_complete",
+            "display_metadata": {"_reply_source_row_id": 123, "reactions": {"like": ["user"]}},
+        }
+        assert _wire_message_shadow(persisted) == _wire_message_shadow(message)
+        assert estimate_messages_tokens_rough([persisted]) == estimate_messages_tokens_rough([message])
+
     def test_message_with_list_content(self):
         """Vision messages with multimodal content arrays.
 

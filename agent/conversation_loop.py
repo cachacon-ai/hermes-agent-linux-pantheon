@@ -8322,8 +8322,16 @@ def run_conversation(
                 # final response path.
                 agent._mute_post_response = False
                 
+                # An admitted publication is real content. A successful empty
+                # stop commits its canonical assistant row immediately; ordinary
+                # empty/failed streams retain the existing recovery behavior.
+                from agent.pantheon_artifacts import has_accepted_publication
+                _artifact_only_terminal = (
+                    finish_reason in {"stop", "end_turn"}
+                    and has_accepted_publication(agent)
+                )
                 # Check if response only has think block with no actual content after it
-                if not agent._has_content_after_think_block(final_response):
+                if not agent._has_content_after_think_block(final_response) and not _artifact_only_terminal:
                     # ── Partial stream recovery ─────────────────────
                     # If content was already streamed to the user before
                     # the connection died, use it as the final response
@@ -9041,7 +9049,8 @@ def run_conversation(
                 # no side effect follows and _persist_session retries the write.
                 # Full incident narrative: tests/run_agent/test_81641_*.py.
                 try:
-                    agent._flush_messages_to_session_db(messages, conversation_history)
+                    from agent.pantheon_artifacts import commit_response
+                    commit_response(agent, messages, conversation_history)
                 except Exception:
                     logger.warning(
                         "final text-turn flush failed (session=%s) — reply is "
