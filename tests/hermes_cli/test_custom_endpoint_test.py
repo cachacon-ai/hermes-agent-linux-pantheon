@@ -45,6 +45,46 @@ def test_provider_test_url_dns_failure_is_blocked(monkeypatch):
     assert is_allowed_provider_endpoint_test_url("http://missing.example.test/v1") is False
 
 
+@pytest.mark.asyncio
+async def test_probe_url_allowlist_uses_asyncio_to_thread(monkeypatch):
+    calls: list[tuple] = []
+
+    async def _fake_to_thread(func, *args, **kwargs):
+        calls.append((func, args))
+        return True
+
+    monkeypatch.setattr(
+        "tools.url_safety.asyncio.to_thread",
+        _fake_to_thread,
+    )
+
+    with patch(
+        "tools.url_safety.create_provider_endpoint_test_async_client",
+        return_value=_AsyncClientNoop(),
+    ):
+        result = await _probe_custom_endpoint_connection(
+            "http://127.0.0.1:8080/v1",
+            api_key="",
+        )
+
+    assert result["ok"] is True
+    assert calls
+    assert calls[0][0].__name__ == "is_allowed_provider_endpoint_test_url"
+
+
+class _AsyncClientNoop:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def request(self, *args, **kwargs):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(is_success=True, status_code=200, json=lambda: {"data": []})
+
+
 def test_provider_endpoint_test_log_target_strips_secrets():
     target = provider_endpoint_test_log_target(
         "https://user:sekret@127.0.0.1:8080/v1?token=abc"
@@ -290,6 +330,30 @@ class TestCustomEndpointTestRoute:
             json={},
         )
         assert resp.status_code == 400
+
+    def test_base_url_with_userinfo_rejected(self, caplog):
+        secret = "hunter2"
+        with caplog.at_level("WARNING"):
+            resp = self.client.post(
+                "/api/providers/custom-endpoints/_candidate/test",
+                json={"base_url": f"http://user:{secret}@127.0.0.1:8080/v1"},
+            )
+        assert resp.status_code == 400
+        assert "embedded credentials" in resp.json()["detail"]
+        assert secret not in caplog.text
+        assert secret not in resp.text
+
+    def test_base_url_with_query_or_fragment_rejected(self, caplog):
+        token = "query-leak-token"
+        with caplog.at_level("WARNING"):
+            resp = self.client.post(
+                "/api/providers/custom-endpoints/_candidate/test",
+                json={"base_url": f"http://127.0.0.1:8080/v1?token={token}"},
+            )
+        assert resp.status_code == 400
+        assert "query string" in resp.json()["detail"]
+        assert token not in caplog.text
+        assert token not in resp.text
 
     def test_sentinel_candidate_never_uses_profile_stored_key(self, monkeypatch):
         from hermes_cli.config import save_env_value

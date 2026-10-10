@@ -8689,6 +8689,25 @@ async def _http_request_same_host_redirect(
     return response
 
 
+def _validate_custom_endpoint_test_base_url(base_url: str) -> str:
+    """Normalize and validate a probe ``base_url`` (raises HTTP 400 when unsafe)."""
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise HTTPException(status_code=400, detail="base_url required")
+    parsed = urllib.parse.urlparse(base)
+    if parsed.username or parsed.password:
+        raise HTTPException(
+            status_code=400,
+            detail="base_url must not include embedded credentials",
+        )
+    if parsed.query or parsed.fragment:
+        raise HTTPException(
+            status_code=400,
+            detail="base_url must not include a query string or URL fragment",
+        )
+    return base
+
+
 async def _probe_custom_endpoint_connection(
     base_url: str,
     *,
@@ -8700,20 +8719,23 @@ async def _probe_custom_endpoint_connection(
     import httpx
     import time
     from tools.url_safety import (
+        async_is_allowed_provider_endpoint_test_url,
         create_provider_endpoint_test_async_client,
-        is_allowed_provider_endpoint_test_url,
         provider_endpoint_test_log_target,
     )
 
-    base = (base_url or "").strip().rstrip("/")
-    if not base:
+    try:
+        base = _validate_custom_endpoint_test_base_url(base_url)
+    except HTTPException:
+        raise
+    except Exception:
         return {
             "ok": False,
             "status": None,
             "latency_ms": 0,
             "error": "base_url required",
         }
-    if not is_allowed_provider_endpoint_test_url(base):
+    if not await async_is_allowed_provider_endpoint_test_url(base):
         return {
             "ok": False,
             "status": None,
@@ -9177,6 +9199,7 @@ async def test_custom_endpoint(
 
                 model = str(entry.get("model") or "").strip()
 
+            base_url = _validate_custom_endpoint_test_base_url(base_url)
             result = await _probe_custom_endpoint_connection(
                 base_url,
                 api_key=api_key,

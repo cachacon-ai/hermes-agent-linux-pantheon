@@ -394,6 +394,11 @@ def is_allowed_provider_endpoint_test_url(url: str) -> bool:
         return False
 
 
+async def async_is_allowed_provider_endpoint_test_url(url: str) -> bool:
+    """Async wrapper — DNS validation runs in a worker thread."""
+    return await asyncio.to_thread(is_allowed_provider_endpoint_test_url, url)
+
+
 class _ProviderEndpointTestAsyncNetworkBackend:
     def __init__(self, schemes_by_origin_var: Any):
         from httpcore._backends.auto import AutoBackend
