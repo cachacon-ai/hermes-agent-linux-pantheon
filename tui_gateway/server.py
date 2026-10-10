@@ -332,6 +332,9 @@ _LONG_HANDLERS = frozenset(
         # preview; profiles.create copies skill bundles. Both are seconds-
         # scale on cold disks — keep them off the WS reader thread.
         "profiles.configure",
+        "profiles.context.get",
+        "profiles.context.limits",
+        "profiles.context.set",
         "profiles.create",
         "profiles.describe",
         "profiles.get_asset",
@@ -17933,6 +17936,9 @@ def _(rid, params: dict) -> dict:
             "profile_display_name": True,
             "provider_key_refresh": True,
             "provider_test": True,
+            "profile_context": True,
+            "profile_pins": True,
+            "profile_context_limits": True,
         },
     )
 
@@ -18865,6 +18871,7 @@ from . import (  # noqa: E402
     methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete,
     methods_config as _methods_config,
+    methods_context as _methods_context,
     methods_images as _methods_images,
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
@@ -18880,6 +18887,7 @@ for _m in (
     _methods_complete,
     _methods_tools,
     _methods_profiles,
+    _methods_context,
     _methods_images,
     _methods_bot_relay,
 ):

@@ -49,7 +49,9 @@ from agent.turn_context import (
     _review_fork_first_request_pending,
     build_turn_context,
     append_prompt_clock_to_multimodal_api_content,
+    apply_send_time_user_injections,
     compose_user_api_content,
+    strip_pinned_memory_from_api_copy,
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
@@ -2140,6 +2142,7 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _pinned_context_block = _ctx.pinned_context_block
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -2515,12 +2518,9 @@ def run_conversation(
             # into the clean transcript content.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 if isinstance(_api_content, str) and _api_content:
-                    # Stamped by the prologue from the same composition —
-                    # reuse it so the persisted sidecar and the wire cannot
-                    # drift, and so every pass this turn sends identical
-                    # bytes (composed from msg["content"], never from a
-                    # previously-injected copy).
-                    api_msg["content"] = _api_content
+                    # Sidecar carries prefetch/plugin only — pins are injected
+                    # fresh at send time and never persisted.
+                    wire = strip_pinned_memory_from_api_copy(_api_content)
                 else:
                     # Callers that bypass the prologue stamping: compose live.
                     _composed = compose_user_api_content(
@@ -2529,15 +2529,19 @@ def run_conversation(
                         _plugin_user_context,
                     )
                     if _composed is not None:
-                        api_msg["content"] = _composed
-                    elif isinstance(api_msg.get("content"), list):
+                        wire = _composed
+                    else:
+                        wire = api_msg.get("content")
+                    if isinstance(wire, list):
                         _turn_clock = getattr(agent, "_turn_prompt_clock", "") or ""
                         if _turn_clock:
-                            api_msg["content"] = (
-                                append_prompt_clock_to_multimodal_api_content(
-                                    api_msg["content"], _turn_clock
-                                )
+                            wire = append_prompt_clock_to_multimodal_api_content(
+                                wire, _turn_clock
                             )
+                api_msg["content"] = apply_send_time_user_injections(
+                    wire,
+                    pinned_context_block=_pinned_context_block,
+                )
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -2552,7 +2556,7 @@ def run_conversation(
                 # ``get_messages_as_conversation``'s sanitize_context/strip
                 # would rewrite on reload — see the capture in
                 # ``_flush_messages_to_session_db``).
-                api_msg["content"] = _api_content
+                api_msg["content"] = strip_pinned_memory_from_api_copy(_api_content)
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved

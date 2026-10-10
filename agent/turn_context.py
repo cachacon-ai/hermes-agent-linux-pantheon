@@ -40,7 +40,11 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import (
+    build_memory_context_block,
+    build_pinned_context_block,
+    canonical_injected_pinned_block_pattern,
+)
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -161,6 +165,69 @@ def compose_user_api_content(
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
+
+
+def _strip_canonical_pinned_blocks_from_text(text: str) -> str:
+    """Remove Hermes-injected pin blocks only; leave user-typed tag text intact."""
+    if "<pinned-memory>" not in text:
+        return text
+    pattern = canonical_injected_pinned_block_pattern()
+    cleaned, count = pattern.subn("", text)
+    if count == 0:
+        return text
+    return cleaned
+
+
+def strip_pinned_memory_from_api_copy(content: Any) -> Any:
+    """Remove persisted injected pin blocks from sidecar/historical API copies."""
+    if isinstance(content, str):
+        return _strip_canonical_pinned_blocks_from_text(content)
+    if isinstance(content, list):
+        filtered = []
+        for part in content:
+            if not isinstance(part, dict):
+                filtered.append(part)
+                continue
+            if part.get("type") != "text":
+                filtered.append(part)
+                continue
+            text = part.get("text")
+            if not isinstance(text, str):
+                filtered.append(part)
+                continue
+            stripped = _strip_canonical_pinned_blocks_from_text(text)
+            if stripped != text:
+                if stripped.strip():
+                    filtered.append({**part, "text": stripped})
+            else:
+                filtered.append(part)
+        return filtered
+    return content
+
+
+def append_ephemeral_injection_to_user_wire(content: Any, injection: str) -> Any:
+    """Append send-time-only context (pins) to string or multimodal user wire."""
+    if not injection or not str(injection).strip():
+        return content
+    injection = str(injection).strip()
+    if isinstance(content, str):
+        if not content:
+            return injection
+        return f"{content}\n\n{injection}"
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": injection}]
+    return content
+
+
+def apply_send_time_user_injections(
+    content: Any,
+    *,
+    pinned_context_block: str = "",
+) -> Any:
+    """Inject pinned memory at API send time (never persisted in sidecars)."""
+    if not pinned_context_block:
+        return content
+    return append_ephemeral_injection_to_user_wire(content, pinned_context_block)
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
@@ -574,6 +641,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Profile PINNED.md block injected every turn (not in system prompt).
+    pinned_context_block: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
 
@@ -1618,6 +1687,15 @@ def build_turn_context(
             except Exception:
                 pass
 
+    pinned_context_block = ""
+    try:
+        from tools.profile_context_store import entries_for_turn_injection
+
+        _pinned_entries = entries_for_turn_injection()
+        pinned_context_block = build_pinned_context_block(_pinned_entries)
+    except Exception:
+        logger.debug("pinned memory injection skipped", exc_info=True)
+
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
     # turn's user message, never into the stored content — so on the next
@@ -1643,7 +1721,9 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
@@ -1726,5 +1806,6 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        pinned_context_block=pinned_context_block,
         preflight_compression_blocked=_preflight_compression_blocked,
     )
