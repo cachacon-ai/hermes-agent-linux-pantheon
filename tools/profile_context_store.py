@@ -41,6 +41,15 @@ TARGET_PINS = "pins"
 
 _VALID_TARGETS = frozenset({TARGET_MEMORY, TARGET_USER, TARGET_PINS})
 
+_PINNED_BLOCK_OPEN = "<pinned-memory>"
+_PINNED_BLOCK_CLOSE = "</pinned-memory>"
+
+_FORBIDDEN_ENTRY_SUBSTRINGS = (
+    ENTRY_DELIMITER,
+    _PINNED_BLOCK_OPEN,
+    _PINNED_BLOCK_CLOSE,
+)
+
 
 def document_path(target: str) -> Path:
     mem_dir = get_memory_dir()
@@ -62,9 +71,16 @@ def read_document_entries(target: str) -> Tuple[List[str], bool]:
     return MemoryStore._read_entries_checked(path)
 
 
-def _normalize_entries(raw: List[str]) -> List[str]:
+def _normalize_entries(raw: List[str]) -> Tuple[List[str], Optional[str]]:
     cleaned = [e.strip() for e in raw if isinstance(e, str) and e.strip()]
-    return list(dict.fromkeys(cleaned))
+    for entry in cleaned:
+        for forbidden in _FORBIDDEN_ENTRY_SUBSTRINGS:
+            if forbidden in entry:
+                return [], (
+                    f"Entry must not contain the delimiter or pinned-memory fence "
+                    f"({forbidden!r})."
+                )
+    return list(dict.fromkeys(cleaned)), None
 
 
 def _char_count(entries: List[str]) -> int:
@@ -142,7 +158,13 @@ def write_document_entries(
         return {"applied": False, "error": f"Invalid target {target!r}."}
 
     limits = limits or get_context_limits()
-    normalized = _normalize_entries(entries)
+    normalized, norm_err = _normalize_entries(entries)
+    if norm_err:
+        return {
+            "applied": False,
+            "error": norm_err,
+            "usage": usage_payload(target, normalized, limits),
+        }
 
     scan_err = _validate_write_entries(normalized)
     if scan_err:
@@ -290,6 +312,32 @@ def update_context_limits(
     return {"applied": True, "limits": merged}
 
 
+def persist_context_limits_to_config(new_limits: Dict[str, int]) -> None:
+    """Write limit keys to config.yaml without expanding defaults or secrets."""
+    from hermes_cli.config import (
+        _CONFIG_LOCK,
+        get_config_path,
+        require_readable_config_before_write,
+    )
+    from utils import atomic_roundtrip_yaml_update
+
+    config_path = get_config_path()
+    with _CONFIG_LOCK:
+        require_readable_config_before_write(config_path)
+        atomic_roundtrip_yaml_update(
+            config_path, "memory.memory_char_limit", new_limits["memory"]
+        )
+        atomic_roundtrip_yaml_update(
+            config_path, "memory.user_char_limit", new_limits["user"]
+        )
+        atomic_roundtrip_yaml_update(
+            config_path, "memory.pins_char_limit", new_limits["pins"]
+        )
+        atomic_roundtrip_yaml_update(
+            config_path, "memory.pins_max_count", new_limits["pins_max_count"]
+        )
+
+
 def entries_for_turn_injection(
     config: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
@@ -303,6 +351,8 @@ def entries_for_turn_injection(
     selected: List[str] = []
     used = 0
     for entry in entries:
+        if _scan_memory_content(entry):
+            continue
         if len(selected) >= max_count:
             break
         extra = len(entry) if not selected else len(ENTRY_DELIMITER) + len(entry)

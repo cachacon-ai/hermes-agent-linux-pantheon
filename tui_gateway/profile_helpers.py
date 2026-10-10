@@ -29,6 +29,7 @@ def resolve_profile_rpc(name: str):
     from hermes_cli.profiles import (
         get_profile_dir,
         normalize_profile_name,
+        profile_exists,
         validate_profile_name,
     )
 
@@ -38,9 +39,9 @@ def resolve_profile_rpc(name: str):
     canon = normalize_profile_name(stripped)
     if canon != "default":
         validate_profile_name(canon)
-    profile_dir = get_profile_dir(canon)
-    if not profile_dir.is_dir():
+    if not profile_exists(canon):
         raise FileNotFoundError(f"profile '{canon}' not found")
+    profile_dir = get_profile_dir(canon)
     return canon, profile_dir
 
 

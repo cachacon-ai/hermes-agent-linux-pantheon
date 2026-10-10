@@ -132,7 +132,6 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
-    pinned_context: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
@@ -153,8 +152,6 @@ def compose_user_api_content(
     if not isinstance(content, str):
         return None
     injections = []
-    if pinned_context:
-        injections.append(pinned_context)
     if ext_prefetch_cache:
         fenced = build_memory_context_block(ext_prefetch_cache)
         if fenced:
@@ -164,6 +161,71 @@ def compose_user_api_content(
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
+
+
+_PINNED_BLOCK_RE = None
+
+
+def _pinned_block_pattern():
+    global _PINNED_BLOCK_RE
+    if _PINNED_BLOCK_RE is None:
+        import re
+
+        _PINNED_BLOCK_RE = re.compile(
+            r"(?:\n\n)?<pinned-memory>[\s\S]*?</pinned-memory>",
+            re.MULTILINE,
+        )
+    return _PINNED_BLOCK_RE
+
+
+def strip_pinned_memory_from_api_copy(content: Any) -> Any:
+    """Remove persisted or legacy pinned blocks from an API-bound user copy."""
+    if isinstance(content, str):
+        cleaned = _pinned_block_pattern().sub("", content)
+        return cleaned.rstrip()
+    if isinstance(content, list):
+        filtered = []
+        for part in content:
+            if not isinstance(part, dict):
+                filtered.append(part)
+                continue
+            if part.get("type") != "text":
+                filtered.append(part)
+                continue
+            text = part.get("text")
+            if not isinstance(text, str) or "<pinned-memory>" not in text:
+                filtered.append(part)
+                continue
+            stripped = strip_pinned_memory_from_api_copy(text)
+            if isinstance(stripped, str) and stripped.strip():
+                filtered.append({**part, "text": stripped})
+        return filtered
+    return content
+
+
+def append_ephemeral_injection_to_user_wire(content: Any, injection: str) -> Any:
+    """Append send-time-only context (pins) to string or multimodal user wire."""
+    if not injection or not str(injection).strip():
+        return content
+    injection = str(injection).strip()
+    if isinstance(content, str):
+        base = content.rstrip()
+        return f"{base}\n\n{injection}" if base else injection
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": injection}]
+    return content
+
+
+def apply_send_time_user_injections(
+    content: Any,
+    *,
+    pinned_context_block: str = "",
+) -> Any:
+    """Inject pinned memory at API send time (never persisted in sidecars)."""
+    wire = strip_pinned_memory_from_api_copy(content)
+    if pinned_context_block:
+        wire = append_ephemeral_injection_to_user_wire(wire, pinned_context_block)
+    return wire
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
@@ -1660,7 +1722,6 @@ def build_turn_context(
             _turn_user_msg.get("content", ""),
             ext_prefetch_cache,
             plugin_user_context,
-            pinned_context_block,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

@@ -183,6 +183,60 @@ def test_gateway_capabilities_flags(home):
     assert caps["profile_context_limits"] is True
 
 
+def test_limits_preserves_comments_env_refs_and_unrelated_keys(home, monkeypatch):
+    create_profile("yaml-bot")
+    profile_dir = get_profile_dir("yaml-bot")
+    config_path = profile_dir / "config.yaml"
+    raw = """# profile header comment
+custom_providers:
+  mine:
+    api_key: ${MY_SECRET}
+model:
+  default: test-model
+memory:
+  memory_char_limit: 2200
+  user_char_limit: 1375
+"""
+    config_path.write_text(raw, encoding="utf-8")
+    monkeypatch.setenv("MY_SECRET", "super-secret-plaintext")
+    before_len = len(raw)
+
+    result = _limits("yaml-bot", memory=1800, pins=1500)
+    assert result["applied"] is True
+
+    after = config_path.read_text(encoding="utf-8")
+    assert "# profile header comment" in after
+    assert "${MY_SECRET}" in after
+    assert "super-secret-plaintext" not in after
+    assert "custom_providers" in after
+    assert "test-model" in after
+    assert "1800" in after
+    assert "1500" in after
+    assert len(after) < before_len + 400
+
+
+def test_set_rejects_delimiter_inside_entry(home):
+    create_profile("delim-bot")
+    result = _set("delim-bot", target="pins", entries=["part one\n§\npart two"])
+    assert result["applied"] is False
+    assert "delimiter" in result["error"].lower()
+
+
+def test_tombstoned_profile_rejected(home):
+    create_profile("gone-bot")
+    from unittest.mock import patch
+
+    from hermes_cli.profiles import delete_profile
+
+    with patch("hermes_cli.profiles._cleanup_gateway_service"), patch(
+        "hermes_cli.profiles._stop_profile_backends"
+    ):
+        delete_profile("gone-bot", yes=True)
+    resp = srv._methods["profiles.context.get"]("g", {"name": "gone-bot"})
+    assert "error" in resp
+    assert resp["error"]["code"] == 4064
+
+
 def test_memory_tool_sees_rpc_writes_on_reload(home, monkeypatch):
     create_profile("tool-bot")
     profile_dir = get_profile_dir("tool-bot")

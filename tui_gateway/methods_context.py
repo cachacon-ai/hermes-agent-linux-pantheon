@@ -131,8 +131,10 @@ def _(rid, params: dict) -> dict:
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
-        from tools.profile_context_store import update_context_limits
-        from utils import atomic_yaml_write
+        from tools.profile_context_store import (
+            persist_context_limits_to_config,
+            update_context_limits,
+        )
 
         token = set_hermes_home_override(str(profile_dir))
         try:
@@ -141,16 +143,7 @@ def _(rid, params: dict) -> dict:
             if not outcome.get("applied"):
                 return _ok(rid, outcome)
             new_limits = outcome["limits"]
-            mem = cfg.setdefault("memory", {})
-            if not isinstance(mem, dict):
-                mem = {}
-                cfg["memory"] = mem
-            mem["memory_char_limit"] = new_limits["memory"]
-            mem["user_char_limit"] = new_limits["user"]
-            mem["pins_char_limit"] = new_limits["pins"]
-            mem["pins_max_count"] = new_limits["pins_max_count"]
-            config_path = profile_dir / "config.yaml"
-            atomic_yaml_write(config_path, cfg, sort_keys=False)
+            persist_context_limits_to_config(new_limits)
             return _ok(rid, {"applied": True, "limits": new_limits})
         finally:
             reset_hermes_home_override(token)
