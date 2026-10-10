@@ -312,30 +312,119 @@ def update_context_limits(
     return {"applied": True, "limits": merged}
 
 
-def persist_context_limits_to_config(new_limits: Dict[str, int]) -> None:
-    """Write limit keys to config.yaml without expanding defaults or secrets."""
+def persist_context_limits_to_config(
+    new_limits: Dict[str, int],
+    *,
+    previous: Optional[Dict[str, int]] = None,
+) -> None:
+    """Write changed limit keys to config.yaml in one round-trip save."""
     from hermes_cli.config import (
         _CONFIG_LOCK,
         get_config_path,
+        read_raw_config,
         require_readable_config_before_write,
     )
-    from utils import atomic_roundtrip_yaml_update
+
+    previous = previous or get_context_limits(read_raw_config())
+    key_paths = {
+        "memory": "memory.memory_char_limit",
+        "user": "memory.user_char_limit",
+        "pins": "memory.pins_char_limit",
+        "pins_max_count": "memory.pins_max_count",
+    }
+    pending = {
+        path: new_limits[key]
+        for key, path in key_paths.items()
+        if int(new_limits[key]) != int(previous.get(key, new_limits[key]))
+    }
+    if not pending:
+        return
 
     config_path = get_config_path()
     with _CONFIG_LOCK:
         require_readable_config_before_write(config_path)
-        atomic_roundtrip_yaml_update(
-            config_path, "memory.memory_char_limit", new_limits["memory"]
-        )
-        atomic_roundtrip_yaml_update(
-            config_path, "memory.user_char_limit", new_limits["user"]
-        )
-        atomic_roundtrip_yaml_update(
-            config_path, "memory.pins_char_limit", new_limits["pins"]
-        )
-        atomic_roundtrip_yaml_update(
-            config_path, "memory.pins_max_count", new_limits["pins_max_count"]
-        )
+        _atomic_roundtrip_yaml_apply_updates(config_path, pending)
+
+
+def _atomic_roundtrip_yaml_apply_updates(
+    path: Path, updates: Dict[str, Any]
+) -> None:
+    """Apply several dotted-key updates in a single ruamel round-trip write."""
+    import os
+    import tempfile
+
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap
+
+    from hermes_cli.config import _greedy_literal_match, _split_key_path
+    from utils import (
+        _preserve_file_mode,
+        _preserve_file_owner,
+        _restore_file_mode,
+        _restore_file_owner,
+        atomic_replace,
+    )
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            config = yaml_rt.load(f) or CommentedMap()
+    else:
+        config = CommentedMap()
+
+    if not isinstance(config, CommentedMap):
+        config = CommentedMap(config)
+
+    for key_path, value in updates.items():
+        current = config
+        keys = _split_key_path(key_path)
+        i = 0
+        while True:
+            remaining = keys[i:]
+            seg, consumed = remaining[0], 1
+            match = _greedy_literal_match(dict(current), remaining)
+            if match is not None:
+                seg, consumed = match
+            if i + consumed == len(keys):
+                current[seg] = value
+                break
+            next_value = current.get(seg)
+            if not isinstance(next_value, CommentedMap):
+                next_value = CommentedMap()
+                current[seg] = next_value
+            current = next_value
+            i += consumed
+
+    original_mode = _preserve_file_mode(path)
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml_rt.dump(config, f)
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        real_path_obj = Path(real_path)
+        _restore_file_owner(real_path_obj, original_owner)
+        _restore_file_mode(real_path_obj, original_mode)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def entries_for_turn_injection(

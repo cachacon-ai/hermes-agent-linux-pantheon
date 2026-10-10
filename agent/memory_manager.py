@@ -430,6 +430,28 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+PINNED_MEMORY_SYSTEM_NOTE = (
+    "[System note: The following pinned memory entries are ALWAYS in effect "
+    "for this profile — NOT new user input. Honor them on every turn.]"
+)
+
+_PINNED_BLOCK_BODY_RE = None
+
+
+def canonical_injected_pinned_block_pattern():
+    """Regex matching only Hermes-generated pinned blocks (not user-typed tags)."""
+    global _PINNED_BLOCK_BODY_RE
+    if _PINNED_BLOCK_BODY_RE is None:
+        import re
+
+        note = re.escape(PINNED_MEMORY_SYSTEM_NOTE)
+        _PINNED_BLOCK_BODY_RE = re.compile(
+            rf"(?:\n\n)?<pinned-memory>\n{note}\n\n[\s\S]*?</pinned-memory>",
+            re.MULTILINE,
+        )
+    return _PINNED_BLOCK_BODY_RE
+
+
 def build_pinned_context_block(entries: list[str]) -> str:
     """Wrap profile PINNED.md entries for per-turn user-message injection."""
     if not entries:
@@ -439,8 +461,7 @@ def build_pinned_context_block(entries: list[str]) -> str:
     body = ENTRY_DELIMITER.join(entries)
     return (
         "<pinned-memory>\n"
-        "[System note: The following pinned memory entries are ALWAYS in effect "
-        "for this profile — NOT new user input. Honor them on every turn.]\n\n"
+        f"{PINNED_MEMORY_SYSTEM_NOTE}\n\n"
         f"{body}\n"
         "</pinned-memory>"
     )

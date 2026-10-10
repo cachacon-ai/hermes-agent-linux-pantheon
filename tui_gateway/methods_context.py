@@ -132,6 +132,7 @@ def _(rid, params: dict) -> dict:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
         from tools.profile_context_store import (
+            get_context_limits,
             persist_context_limits_to_config,
             update_context_limits,
         )
@@ -139,11 +140,14 @@ def _(rid, params: dict) -> dict:
         token = set_hermes_home_override(str(profile_dir))
         try:
             cfg = load_config() or {}
+            limits_before = get_context_limits(cfg)
             outcome = update_context_limits(updates, config=cfg)
             if not outcome.get("applied"):
                 return _ok(rid, outcome)
             new_limits = outcome["limits"]
-            persist_context_limits_to_config(new_limits)
+            persist_context_limits_to_config(
+                new_limits, previous=limits_before
+            )
             return _ok(rid, {"applied": True, "limits": new_limits})
         finally:
             reset_hermes_home_override(token)

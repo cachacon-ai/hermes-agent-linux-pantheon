@@ -40,7 +40,11 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block, build_pinned_context_block
+from agent.memory_manager import (
+    build_memory_context_block,
+    build_pinned_context_block,
+    canonical_injected_pinned_block_pattern,
+)
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -163,26 +167,21 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
-_PINNED_BLOCK_RE = None
-
-
-def _pinned_block_pattern():
-    global _PINNED_BLOCK_RE
-    if _PINNED_BLOCK_RE is None:
-        import re
-
-        _PINNED_BLOCK_RE = re.compile(
-            r"(?:\n\n)?<pinned-memory>[\s\S]*?</pinned-memory>",
-            re.MULTILINE,
-        )
-    return _PINNED_BLOCK_RE
+def _strip_canonical_pinned_blocks_from_text(text: str) -> str:
+    """Remove Hermes-injected pin blocks only; leave user-typed tag text intact."""
+    if "<pinned-memory>" not in text:
+        return text
+    pattern = canonical_injected_pinned_block_pattern()
+    cleaned, count = pattern.subn("", text)
+    if count == 0:
+        return text
+    return cleaned
 
 
 def strip_pinned_memory_from_api_copy(content: Any) -> Any:
-    """Remove persisted or legacy pinned blocks from an API-bound user copy."""
+    """Remove persisted injected pin blocks from sidecar/historical API copies."""
     if isinstance(content, str):
-        cleaned = _pinned_block_pattern().sub("", content)
-        return cleaned.rstrip()
+        return _strip_canonical_pinned_blocks_from_text(content)
     if isinstance(content, list):
         filtered = []
         for part in content:
@@ -193,12 +192,15 @@ def strip_pinned_memory_from_api_copy(content: Any) -> Any:
                 filtered.append(part)
                 continue
             text = part.get("text")
-            if not isinstance(text, str) or "<pinned-memory>" not in text:
+            if not isinstance(text, str):
                 filtered.append(part)
                 continue
-            stripped = strip_pinned_memory_from_api_copy(text)
-            if isinstance(stripped, str) and stripped.strip():
-                filtered.append({**part, "text": stripped})
+            stripped = _strip_canonical_pinned_blocks_from_text(text)
+            if stripped != text:
+                if stripped.strip():
+                    filtered.append({**part, "text": stripped})
+            else:
+                filtered.append(part)
         return filtered
     return content
 
@@ -209,8 +211,9 @@ def append_ephemeral_injection_to_user_wire(content: Any, injection: str) -> Any
         return content
     injection = str(injection).strip()
     if isinstance(content, str):
-        base = content.rstrip()
-        return f"{base}\n\n{injection}" if base else injection
+        if not content:
+            return injection
+        return f"{content}\n\n{injection}"
     if isinstance(content, list):
         return [*content, {"type": "text", "text": injection}]
     return content
@@ -222,10 +225,9 @@ def apply_send_time_user_injections(
     pinned_context_block: str = "",
 ) -> Any:
     """Inject pinned memory at API send time (never persisted in sidecars)."""
-    wire = strip_pinned_memory_from_api_copy(content)
-    if pinned_context_block:
-        wire = append_ephemeral_injection_to_user_wire(wire, pinned_context_block)
-    return wire
+    if not pinned_context_block:
+        return content
+    return append_ephemeral_injection_to_user_wire(content, pinned_context_block)
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:

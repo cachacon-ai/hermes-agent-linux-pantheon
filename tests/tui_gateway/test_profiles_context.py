@@ -183,6 +183,20 @@ def test_gateway_capabilities_flags(home):
     assert caps["profile_context_limits"] is True
 
 
+def test_limits_noop_when_values_unchanged(home):
+    create_profile("noop-bot")
+    profile_dir = get_profile_dir("noop-bot")
+    config_path = profile_dir / "config.yaml"
+    config_path.write_text(
+        "memory:\n  memory_char_limit: 2200\n  user_char_limit: 1375\n",
+        encoding="utf-8",
+    )
+    before = config_path.read_text(encoding="utf-8")
+    result = _limits("noop-bot", memory=2200)
+    assert result["applied"] is True
+    assert config_path.read_text(encoding="utf-8") == before
+
+
 def test_limits_preserves_comments_env_refs_and_unrelated_keys(home, monkeypatch):
     create_profile("yaml-bot")
     profile_dir = get_profile_dir("yaml-bot")

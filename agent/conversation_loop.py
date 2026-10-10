@@ -2557,11 +2557,6 @@ def run_conversation(
                 # would rewrite on reload — see the capture in
                 # ``_flush_messages_to_session_db``).
                 api_msg["content"] = strip_pinned_memory_from_api_copy(_api_content)
-            elif (
-                _api_content is not None
-                and msg.get("role") in ("user", "assistant")
-            ):
-                api_msg["content"] = strip_pinned_memory_from_api_copy(_api_content)
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved

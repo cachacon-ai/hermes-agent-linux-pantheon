@@ -76,9 +76,8 @@ def test_pins_absent_from_cached_system_prompt_snapshot(profile_home):
 
 
 def test_stale_pins_stripped_from_historical_sidecar(profile_home):
-    old_sidecar = (
-        "hello\n\n<pinned-memory>\n[old pin]\nold fact\n</pinned-memory>"
-    )
+    legacy_block = build_pinned_context_block(["old fact"])
+    old_sidecar = f"hello\n\n{legacy_block}"
     replay = strip_pinned_memory_from_api_copy(old_sidecar)
     assert replay == "hello"
     new_block = build_pinned_context_block(["new pin only"])
@@ -86,6 +85,24 @@ def test_stale_pins_stripped_from_historical_sidecar(profile_home):
     assert "old fact" not in current
     assert "new pin only" in current
     assert current.count("<pinned-memory>") == 1
+
+
+def test_user_typed_pinned_tags_not_stripped_on_current_turn(profile_home):
+    write_document_entries("pins", ["real pin"])
+    from tools.profile_context_store import entries_for_turn_injection
+
+    block = build_pinned_context_block(entries_for_turn_injection())
+    user_text = "explain <pinned-memory>x</pinned-memory> in docs   "
+    wire = apply_send_time_user_injections(user_text, pinned_context_block=block)
+    assert "explain <pinned-memory>x</pinned-memory> in docs   " in wire
+    assert "real pin" in wire
+
+
+def test_sidecar_without_pins_preserves_trailing_whitespace(profile_home):
+    sidecar = "hello prefetch   "
+    assert strip_pinned_memory_from_api_copy(sidecar) == sidecar
+    sidecar_with_tag = "hello <pinned-memory>x</pinned-memory>  "
+    assert strip_pinned_memory_from_api_copy(sidecar_with_tag) == sidecar_with_tag
 
 
 def test_injection_skips_unsafe_pin_on_disk(profile_home, monkeypatch):
