@@ -430,6 +430,22 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+def build_pinned_context_block(entries: list[str]) -> str:
+    """Wrap profile PINNED.md entries for per-turn user-message injection."""
+    if not entries:
+        return ""
+    from tools.memory_tool import ENTRY_DELIMITER
+
+    body = ENTRY_DELIMITER.join(entries)
+    return (
+        "<pinned-memory>\n"
+        "[System note: The following pinned memory entries are ALWAYS in effect "
+        "for this profile — NOT new user input. Honor them on every turn.]\n\n"
+        f"{body}\n"
+        "</pinned-memory>"
+    )
+
+
 class MemoryManager:
     """Orchestrates the built-in provider plus at most one external provider.
 

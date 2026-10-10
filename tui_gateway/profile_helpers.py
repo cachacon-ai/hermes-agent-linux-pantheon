@@ -20,6 +20,30 @@ def profile_has_avatar(profile_dir) -> bool:
     return any((assets / f"avatar.{ext}").is_file() for ext in ("png", "jpg", "webp"))
 
 
+def resolve_profile_rpc(name: str):
+    """Validate profile ``name`` and return ``(canon, profile_dir)``.
+
+    Raises ``ValueError`` for invalid slugs and ``FileNotFoundError`` when
+    the profile directory is missing.
+    """
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        validate_profile_name,
+    )
+
+    stripped = str(name or "").strip()
+    if not stripped:
+        raise ValueError("name required")
+    canon = normalize_profile_name(stripped)
+    if canon != "default":
+        validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir():
+        raise FileNotFoundError(f"profile '{canon}' not found")
+    return canon, profile_dir
+
+
 def read_profile_ui_meta(profile_dir) -> dict:
     try:
         import yaml as _yaml
