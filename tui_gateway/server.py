@@ -7252,7 +7252,14 @@ def _agent_provider_credential_signature(agent: Any) -> tuple:
     )
 
 
-def _resolve_live_agent_runtime_credentials(session: dict, agent: Any) -> dict:
+class _LiveCredentialResolution(NamedTuple):
+    runtime: dict
+    used_fallback: bool
+
+
+def _resolve_live_agent_runtime_credentials(
+    session: dict, agent: Any
+) -> _LiveCredentialResolution:
     """Resolve provider credentials the live session should use on this turn."""
     model_override = session.get("model_override")
     if isinstance(model_override, dict) and model_override.get("model"):
@@ -7285,7 +7292,7 @@ def _resolve_live_agent_runtime_credentials(session: dict, agent: Any) -> dict:
                 runtime["api_key"] = override_api_key
             if override_api_mode:
                 runtime["api_mode"] = override_api_mode
-        return runtime
+        return _LiveCredentialResolution(runtime, resolution.used_fallback)
 
     requested_provider = getattr(agent, "provider", "") or None
     target_model = getattr(agent, "model", "") or None
@@ -7300,12 +7307,10 @@ def _resolve_live_agent_runtime_credentials(session: dict, agent: Any) -> dict:
             "target_model": target_model,
         }
     )
-    return dict(resolution.runtime)
+    return _LiveCredentialResolution(dict(resolution.runtime), resolution.used_fallback)
 
 
-def _target_provider_credential_signature(session: dict, agent: Any) -> tuple:
-    """Fingerprint of credentials config/env say this session should use."""
-    runtime = _resolve_live_agent_runtime_credentials(session, agent)
+def _provider_credential_signature_from_runtime(runtime: dict, agent: Any) -> tuple:
     return (
         (runtime.get("provider") or getattr(agent, "provider", "") or "")
         .strip()
@@ -7317,17 +7322,20 @@ def _target_provider_credential_signature(session: dict, agent: Any) -> tuple:
     )
 
 
+def _runtime_has_refreshable_api_key(runtime: dict) -> bool:
+    api_key = runtime.get("api_key")
+    if callable(api_key) and not isinstance(api_key, str):
+        return True
+    return bool(str(api_key or "").strip())
+
+
 def _apply_live_provider_credentials(
     sid: str, session: dict, agent: Any, runtime: dict
 ) -> None:
     """Rebuild the agent HTTP client with freshly resolved credentials."""
-    new_model = getattr(agent, "model", "") or ""
-    new_provider = (
-        runtime.get("provider") or getattr(agent, "provider", "") or ""
-    )
     agent.switch_model(
-        new_model=new_model,
-        new_provider=new_provider,
+        new_model=getattr(agent, "model", "") or "",
+        new_provider=getattr(agent, "provider", "") or "",
         api_key=runtime.get("api_key", ""),
         base_url=runtime.get("base_url") or getattr(agent, "base_url", "") or "",
         api_mode=runtime.get("api_mode") or getattr(agent, "api_mode", "") or "",
@@ -7347,15 +7355,38 @@ def _sync_agent_provider_credentials_with_config(sid: str, session: dict) -> Non
     if agent is None:
         return
     try:
-        target_sig = _target_provider_credential_signature(session, agent)
+        resolution = _resolve_live_agent_runtime_credentials(session, agent)
     except Exception:
         logger.warning("Could not resolve provider credentials for %s", sid)
         return
-    if target_sig == _agent_provider_credential_signature(agent):
+
+    if resolution.used_fallback:
         return
+
+    runtime = resolution.runtime
+    target_sig = _provider_credential_signature_from_runtime(runtime, agent)
+    agent_sig = _agent_provider_credential_signature(agent)
+    if target_sig == agent_sig:
+        session["provider_credential_refresh_applied"] = target_sig
+        return
+
+    applied = session.get("provider_credential_refresh_applied")
+    if target_sig == applied:
+        return
+
+    if not _runtime_has_refreshable_api_key(runtime):
+        session["provider_credential_refresh_applied"] = target_sig
+        return
+
+    resolved_provider = (runtime.get("provider") or "").strip().lower()
+    agent_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    if resolved_provider and resolved_provider != agent_provider:
+        session["provider_credential_refresh_applied"] = target_sig
+        return
+
     try:
-        runtime = _resolve_live_agent_runtime_credentials(session, agent)
         _apply_live_provider_credentials(sid, session, agent, runtime)
+        session["provider_credential_refresh_applied"] = target_sig
     except Exception:
         logger.warning("Could not refresh provider credentials for %s", sid)
 

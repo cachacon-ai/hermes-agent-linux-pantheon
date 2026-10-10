@@ -308,27 +308,188 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return False
 
 
+def _http_url_origin(url: str) -> tuple[str, str, int]:
+    """Return ``(scheme, hostname, port)`` for an HTTP(S) URL."""
+    parsed = urlparse((url or "").strip())
+    scheme = (parsed.scheme or "").strip().lower()
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, hostname, int(port)
+
+
+def _resolved_provider_endpoint_test_connect_ips(
+    host: str, port: int, scheme: str
+) -> list[str]:
+    """Resolve *host* for custom-provider connection tests (LAN allowed).
+
+    Unlike the global SSRF resolver, private/loopback addresses are
+    permitted. Cloud metadata endpoints remain blocked. DNS failures fail
+    closed.
+    """
+    hostname = (host or "").strip().lower().rstrip(".")
+    if not hostname:
+        raise SSRFConnectionBlocked("Blocked request with empty hostname")
+
+    if hostname in _BLOCKED_HOSTNAMES:
+        raise SSRFConnectionBlocked(f"Blocked request to internal hostname: {hostname}")
+
+    try:
+        addr_info = socket.getaddrinfo(
+            hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+    except socket.gaierror as exc:
+        raise SSRFConnectionBlocked(
+            f"Blocked request - DNS resolution failed for: {hostname}"
+        ) from exc
+
+    safe_ips: list[str] = []
+    seen: set[str] = set()
+    for _family, _, _, _, sockaddr in addr_info:
+        ip_str = sockaddr[0]
+        if "%" in ip_str:
+            ip_str = ip_str.split("%")[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError as exc:
+            raise SSRFConnectionBlocked(
+                f"Blocked request - unparseable IP address {sockaddr[0]!r} for hostname {hostname}"
+            ) from exc
+
+        if ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS):
+            raise SSRFConnectionBlocked(
+                "Blocked request to cloud metadata address during provider test connect: "
+                f"{hostname} -> {ip_str}"
+            )
+
+        if ip_str not in seen and len(safe_ips) < _MAX_SSRF_CONNECT_IPS:
+            safe_ips.append(ip_str)
+            seen.add(ip_str)
+
+    if not safe_ips:
+        raise SSRFConnectionBlocked(f"Blocked request - DNS returned no results for: {hostname}")
+    return safe_ips
+
+
 def is_allowed_provider_endpoint_test_url(url: str) -> bool:
     """Return True when a custom-provider *connection test* may target *url*.
 
-    Narrower than the global SSRF policy: loopback, RFC1918, and LAN hosts
-    are allowed so operators can probe local llama-server instances. The
-    non-negotiable metadata floor (``is_always_blocked_url``) still applies,
-    and only ``http``/``https`` schemes are permitted.
+    Resolves DNS once and validates every answer (metadata blocked, LAN
+    allowed). DNS failures fail closed.
     """
     try:
-        parsed = urlparse(url)
+        scheme, hostname, port = _http_url_origin(url)
+        if scheme not in {"http", "https"}:
+            return False
+        if not hostname:
+            return False
+        if is_always_blocked_url(url):
+            return False
+        _resolved_provider_endpoint_test_connect_ips(hostname, port, scheme)
+        return True
+    except SSRFConnectionBlocked:
+        return False
     except Exception:
         return False
-    scheme = (parsed.scheme or "").strip().lower()
-    if scheme not in {"http", "https"}:
-        return False
-    hostname = (parsed.hostname or "").strip()
+
+
+class _ProviderEndpointTestAsyncNetworkBackend:
+    def __init__(self, schemes_by_origin_var: Any):
+        from httpcore._backends.auto import AutoBackend
+
+        self._backend = AutoBackend()
+        self._schemes_by_origin_var = schemes_by_origin_var
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> Any:
+        import httpcore
+
+        schemes_by_origin = self._schemes_by_origin_var.get({})
+        scheme = _safe_connect_scheme(host, port, schemes_by_origin)
+        ips = await asyncio.to_thread(
+            _resolved_provider_endpoint_test_connect_ips, host, port, scheme
+        )
+
+        last_exc: Exception | None = None
+        for ip in ips:
+            try:
+                return await self._backend.connect_tcp(
+                    ip,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
+        raise SSRFConnectionBlocked(f"Blocked request - DNS returned no usable IPs for: {host}")
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> Any:
+        raise SSRFConnectionBlocked("Blocked Unix socket connection in provider test transport")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
+def provider_endpoint_test_async_http_transport(**kwargs: Any) -> Any:
+    """httpx async transport for custom-provider probes (LAN ok, pinned IPs)."""
+    import contextvars
+    import httpx
+
+    schemes_by_origin_var = contextvars.ContextVar(
+        "hermes_provider_test_async_origin_schemes"
+    )
+
+    class _Transport(httpx.AsyncHTTPTransport):
+        def __init__(self, **transport_kwargs: Any):
+            super().__init__(**transport_kwargs)
+            self._pool._network_backend = _ProviderEndpointTestAsyncNetworkBackend(  # type: ignore[attr-defined]
+                schemes_by_origin_var
+            )
+
+        async def handle_async_request(self, request: Any) -> Any:
+            token = schemes_by_origin_var.set(_origin_scheme_context(request))
+            try:
+                return await super().handle_async_request(request)
+            finally:
+                schemes_by_origin_var.reset(token)
+
+    return _Transport(**kwargs)
+
+
+def create_provider_endpoint_test_async_client(**kwargs: Any) -> Any:
+    """Async httpx client for custom-provider connection tests."""
+    import httpx
+
+    transport = kwargs.pop("transport", None)
+    if transport is None:
+        transport = provider_endpoint_test_async_http_transport()
+    return httpx.AsyncClient(transport=transport, **kwargs)
+
+
+def provider_endpoint_test_log_target(url: str) -> str:
+    """Log-safe ``scheme://host[:port]`` for provider test URLs (no secrets)."""
+    scheme, hostname, port = _http_url_origin(url)
     if not hostname:
-        return False
-    if is_always_blocked_url(url):
-        return False
-    return True
+        return "<invalid-url>"
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        return f"{scheme}://{hostname}"
+    return f"{scheme}://{hostname}:{port}"
 
 
 def is_always_blocked_url(url: str) -> bool:

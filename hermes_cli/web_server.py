@@ -8647,6 +8647,12 @@ def _resolve_custom_endpoint_secret(entry: Dict[str, Any]) -> str:
     return ""
 
 
+def _http_redirect_origin(url: str) -> tuple[str, str, int]:
+    from tools.url_safety import _http_url_origin
+
+    return _http_url_origin(url)
+
+
 async def _http_request_same_host_redirect(
     client: "Any",
     method: str,
@@ -8655,13 +8661,15 @@ async def _http_request_same_host_redirect(
     max_hops: int = 5,
     **kwargs: Any,
 ) -> "Any":
-    """Follow redirects only when the target host matches the original URL."""
-    import httpx
-    from urllib.parse import urljoin, urlparse
+    """Follow redirects only within the same scheme/host/port as the original."""
+    from urllib.parse import urljoin
 
-    original_host = (urlparse(url).netloc or "").lower()
+    original_origin = _http_redirect_origin(url)
     current_url = url
-    response = await client.request(method, current_url, follow_redirects=False, **kwargs)
+    request_kwargs = dict(kwargs)
+    response = await client.request(
+        method, current_url, follow_redirects=False, **request_kwargs
+    )
     hops = 0
     while (
         response.status_code in (301, 302, 303, 307, 308)
@@ -8671,11 +8679,11 @@ async def _http_request_same_host_redirect(
         if not location:
             break
         next_url = urljoin(str(response.url), location)
-        if (urlparse(next_url).netloc or "").lower() != original_host:
+        if _http_redirect_origin(next_url) != original_origin:
             break
         current_url = next_url
         response = await client.request(
-            method, current_url, follow_redirects=False, **kwargs
+            method, current_url, follow_redirects=False, **request_kwargs
         )
         hops += 1
     return response
@@ -8691,7 +8699,11 @@ async def _probe_custom_endpoint_connection(
     """Minimal OpenAI-compatible connectivity probe for custom providers."""
     import httpx
     import time
-    from tools.url_safety import is_allowed_provider_endpoint_test_url
+    from tools.url_safety import (
+        create_provider_endpoint_test_async_client,
+        is_allowed_provider_endpoint_test_url,
+        provider_endpoint_test_log_target,
+    )
 
     base = (base_url or "").strip().rstrip("/")
     if not base:
@@ -8717,7 +8729,9 @@ async def _probe_custom_endpoint_connection(
     models_url = f"{base}/models"
     started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+        async with create_provider_endpoint_test_async_client(
+            timeout=httpx.Timeout(timeout_seconds)
+        ) as client:
             resp = await _http_request_same_host_redirect(
                 client, "GET", models_url, headers=headers
             )
@@ -8774,7 +8788,10 @@ async def _probe_custom_endpoint_connection(
             "error": "Connection timed out",
         }
     except Exception:
-        _log.warning("Custom endpoint probe failed for %s", base)
+        _log.warning(
+            "Custom endpoint probe failed for %s",
+            provider_endpoint_test_log_target(base),
+        )
         return {
             "ok": False,
             "status": None,
@@ -9124,12 +9141,18 @@ async def test_custom_endpoint(
             if entry is None:
                 raise HTTPException(status_code=404, detail="custom endpoint not found")
 
-            base_url = (body.base_url or entry.get("base_url") or "").strip().rstrip("/")
+            stored_base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+            base_url = (body.base_url or stored_base_url).strip().rstrip("/")
             if not base_url:
                 raise HTTPException(status_code=400, detail="base_url required")
 
             if body.api_key is None:
-                api_key = _resolve_custom_endpoint_secret(entry)
+                if body.base_url and _http_redirect_origin(
+                    base_url
+                ) != _http_redirect_origin(stored_base_url):
+                    api_key = ""
+                else:
+                    api_key = _resolve_custom_endpoint_secret(entry)
             else:
                 api_key = body.api_key.strip()
 
