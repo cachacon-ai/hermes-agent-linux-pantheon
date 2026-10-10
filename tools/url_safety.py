@@ -308,6 +308,29 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return False
 
 
+def is_allowed_provider_endpoint_test_url(url: str) -> bool:
+    """Return True when a custom-provider *connection test* may target *url*.
+
+    Narrower than the global SSRF policy: loopback, RFC1918, and LAN hosts
+    are allowed so operators can probe local llama-server instances. The
+    non-negotiable metadata floor (``is_always_blocked_url``) still applies,
+    and only ``http``/``https`` schemes are permitted.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    scheme = (parsed.scheme or "").strip().lower()
+    if scheme not in {"http", "https"}:
+        return False
+    hostname = (parsed.hostname or "").strip()
+    if not hostname:
+        return False
+    if is_always_blocked_url(url):
+        return False
+    return True
+
+
 def is_always_blocked_url(url: str) -> bool:
     """Return True when the URL targets an always-blocked endpoint.
 

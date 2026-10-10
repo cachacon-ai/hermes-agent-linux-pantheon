@@ -1833,6 +1833,7 @@ from hermes_cli.web_models import (  # noqa: F401
     MemoryProviderConfigUpdate,
     MemoryProviderSetupRequest,
     CustomEndpointUpdate,
+    CustomEndpointTestBody,
     MessagingPlatformUpdate,
     TelegramOnboardingStart,
     TelegramOnboardingApply,
@@ -8632,6 +8633,156 @@ def _models_from_custom_endpoint_entry(entry: Dict[str, Any]) -> List[str]:
     return [model for model in models if model and not (model in seen or seen.add(model))]
 
 
+def _resolve_custom_endpoint_secret(entry: Dict[str, Any]) -> str:
+    """Return the stored API key for a custom endpoint entry (never logged)."""
+    plaintext = str(entry.get("api_key") or "").strip()
+    if plaintext and not re.search(r"\$\{[^}]+\}", plaintext):
+        return plaintext
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if key_env:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(key_env)
+        return str(value or "").strip()
+    return ""
+
+
+async def _http_request_same_host_redirect(
+    client: "Any",
+    method: str,
+    url: str,
+    *,
+    max_hops: int = 5,
+    **kwargs: Any,
+) -> "Any":
+    """Follow redirects only when the target host matches the original URL."""
+    import httpx
+    from urllib.parse import urljoin, urlparse
+
+    original_host = (urlparse(url).netloc or "").lower()
+    current_url = url
+    response = await client.request(method, current_url, follow_redirects=False, **kwargs)
+    hops = 0
+    while (
+        response.status_code in (301, 302, 303, 307, 308)
+        and hops < max_hops
+    ):
+        location = response.headers.get("location") or response.headers.get("Location")
+        if not location:
+            break
+        next_url = urljoin(str(response.url), location)
+        if (urlparse(next_url).netloc or "").lower() != original_host:
+            break
+        current_url = next_url
+        response = await client.request(
+            method, current_url, follow_redirects=False, **kwargs
+        )
+        hops += 1
+    return response
+
+
+async def _probe_custom_endpoint_connection(
+    base_url: str,
+    *,
+    api_key: str = "",
+    model: str = "",
+    timeout_seconds: float = 8.0,
+) -> Dict[str, Any]:
+    """Minimal OpenAI-compatible connectivity probe for custom providers."""
+    import httpx
+    import time
+    from tools.url_safety import is_allowed_provider_endpoint_test_url
+
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return {
+            "ok": False,
+            "status": None,
+            "latency_ms": 0,
+            "error": "base_url required",
+        }
+    if not is_allowed_provider_endpoint_test_url(base):
+        return {
+            "ok": False,
+            "status": None,
+            "latency_ms": 0,
+            "error": "URL not allowed",
+        }
+
+    headers: Dict[str, str] = {"Accept": "application/json"}
+    key_material = (api_key or "").strip()
+    if key_material:
+        headers["Authorization"] = f"Bearer {key_material}"
+
+    models_url = f"{base}/models"
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+            resp = await _http_request_same_host_redirect(
+                client, "GET", models_url, headers=headers
+            )
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            if resp.is_success:
+                model_ids = _parse_model_ids(resp)
+                return {
+                    "ok": True,
+                    "status": resp.status_code,
+                    "latency_ms": latency_ms,
+                    "model_count": len(model_ids),
+                }
+            if resp.status_code not in (404, 405):
+                return {
+                    "ok": False,
+                    "status": resp.status_code,
+                    "latency_ms": latency_ms,
+                    "error": f"Endpoint returned HTTP {resp.status_code}",
+                }
+
+            chat_url = f"{base}/chat/completions"
+            probe_model = (model or "").strip() or "default"
+            payload = {
+                "model": probe_model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }
+            chat_started = time.perf_counter()
+            chat_resp = await _http_request_same_host_redirect(
+                client,
+                "POST",
+                chat_url,
+                headers={**headers, "Content-Type": "application/json"},
+                json=payload,
+            )
+            latency_ms = int((time.perf_counter() - chat_started) * 1000)
+            if chat_resp.is_success:
+                return {
+                    "ok": True,
+                    "status": chat_resp.status_code,
+                    "latency_ms": latency_ms,
+                }
+            return {
+                "ok": False,
+                "status": chat_resp.status_code,
+                "latency_ms": latency_ms,
+                "error": f"Endpoint returned HTTP {chat_resp.status_code}",
+            }
+    except httpx.TimeoutException:
+        return {
+            "ok": False,
+            "status": None,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "error": "Connection timed out",
+        }
+    except Exception:
+        _log.warning("Custom endpoint probe failed for %s", base)
+        return {
+            "ok": False,
+            "status": None,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "error": "Could not reach endpoint",
+        }
+
+
 def _api_key_display(entry: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """Return ``(has_api_key, preview)`` for a provider or model config block.
 
@@ -8953,6 +9104,49 @@ def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
     except Exception:
         _log.exception("DELETE /api/providers/custom-endpoints/%s failed", endpoint_id)
         raise HTTPException(status_code=500, detail="Failed to delete custom endpoint")
+
+
+@app.post("/api/providers/custom-endpoints/{endpoint_id}/test")
+async def test_custom_endpoint(
+    endpoint_id: str,
+    request: Request,
+    body: CustomEndpointTestBody | None = None,
+    profile: Optional[str] = None,
+):
+    """Live-probe a configured (or candidate) custom OpenAI-compatible endpoint."""
+    _require_token(request)
+    body = body or CustomEndpointTestBody()
+    provider_key = _custom_endpoint_id(endpoint_id)
+    try:
+        with _config_profile_scope(profile):
+            cfg = load_config()
+            _stored, entry = find_provider_entry(cfg.get("providers"), provider_key)
+            if entry is None:
+                raise HTTPException(status_code=404, detail="custom endpoint not found")
+
+            base_url = (body.base_url or entry.get("base_url") or "").strip().rstrip("/")
+            if not base_url:
+                raise HTTPException(status_code=400, detail="base_url required")
+
+            if body.api_key is None:
+                api_key = _resolve_custom_endpoint_secret(entry)
+            else:
+                api_key = body.api_key.strip()
+
+            model = str(entry.get("model") or "").strip()
+            result = await _probe_custom_endpoint_connection(
+                base_url,
+                api_key=api_key,
+                model=model,
+            )
+        return result
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception(
+            "POST /api/providers/custom-endpoints/%s/test failed", endpoint_id
+        )
+        raise HTTPException(status_code=500, detail="Failed to test custom endpoint")
 
 
 @app.post("/api/providers/custom-endpoints/validate")
