@@ -62,6 +62,13 @@ class CustomEndpointUpdate(BaseModel):
     models: Optional[List[str]] = None
 
 
+class CustomEndpointTestBody(BaseModel):
+    """Optional unsaved candidate for ``POST .../custom-endpoints/{id}/test``."""
+
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+
+
 class MessagingPlatformUpdate(BaseModel):
     enabled: Optional[bool] = None
     env: Dict[str, str] = {}

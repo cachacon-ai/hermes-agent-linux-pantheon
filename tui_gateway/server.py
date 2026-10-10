@@ -7235,6 +7235,165 @@ def _sync_agent_compression_with_config(sid: str, session: dict) -> None:
         )
 
 
+def _hash_provider_credential(api_key: Any) -> tuple:
+    """Log-safe fingerprint of a resolved provider credential (never the key)."""
+    if callable(api_key) and not isinstance(api_key, str):
+        return ("callable",)
+    material = str(api_key or "")
+    if not material:
+        return ("empty",)
+    digest = hashlib.sha256(("hermes-provider:" + material).encode("utf-8")).hexdigest()
+    return ("sha256", digest[:32])
+
+
+def _agent_provider_credential_signature(agent: Any) -> tuple:
+    """Fingerprint of the credentials currently wired on a live agent."""
+    return (
+        (getattr(agent, "provider", "") or "").strip().lower(),
+        (getattr(agent, "base_url", "") or "").strip().rstrip("/"),
+        _hash_provider_credential(getattr(agent, "api_key", "")),
+    )
+
+
+class _LiveCredentialResolution(NamedTuple):
+    runtime: dict
+    used_fallback: bool
+
+
+def _resolve_live_agent_runtime_credentials(
+    session: dict, agent: Any
+) -> _LiveCredentialResolution:
+    """Resolve provider credentials the live session should use on this turn."""
+    model_override = session.get("model_override")
+    if isinstance(model_override, dict) and model_override.get("model"):
+        model = str(model_override.get("model") or "")
+        requested_provider = model_override.get("provider") or None
+        override_base_url = model_override.get("base_url")
+        override_api_key = model_override.get("api_key")
+        override_api_mode = model_override.get("api_mode")
+        resolve_kwargs: dict[str, Any] = {
+            "requested": requested_provider,
+            "target_model": model or None,
+        }
+        if str(requested_provider or "").strip().lower() == "custom":
+            from hermes_cli.runtime_provider import canonical_custom_identity
+
+            recovered = canonical_custom_identity(
+                base_url=override_base_url or None, model=model or None
+            )
+            if recovered:
+                requested_provider = recovered
+                resolve_kwargs["requested"] = recovered
+            if override_base_url:
+                resolve_kwargs["explicit_base_url"] = override_base_url
+        resolution = _resolve_runtime_with_fallback(resolve_kwargs)
+        runtime = dict(resolution.runtime)
+        if not resolution.used_fallback:
+            if override_base_url:
+                runtime["base_url"] = override_base_url
+            if override_api_key:
+                runtime["api_key"] = override_api_key
+            if override_api_mode:
+                runtime["api_mode"] = override_api_mode
+        return _LiveCredentialResolution(runtime, resolution.used_fallback)
+
+    requested_provider = getattr(agent, "provider", "") or None
+    target_model = getattr(agent, "model", "") or None
+    cfg_model, cfg_provider = _config_model_target()
+    if cfg_provider and not session.get("model_override"):
+        requested_provider = cfg_provider or requested_provider
+    if cfg_model and not session.get("model_override"):
+        target_model = cfg_model or target_model
+    resolution = _resolve_runtime_with_fallback(
+        {
+            "requested": requested_provider,
+            "target_model": target_model,
+        }
+    )
+    return _LiveCredentialResolution(dict(resolution.runtime), resolution.used_fallback)
+
+
+def _provider_credential_signature_from_runtime(runtime: dict, agent: Any) -> tuple:
+    return (
+        (runtime.get("provider") or getattr(agent, "provider", "") or "")
+        .strip()
+        .lower(),
+        (runtime.get("base_url") or getattr(agent, "base_url", "") or "")
+        .strip()
+        .rstrip("/"),
+        _hash_provider_credential(runtime.get("api_key")),
+    )
+
+
+def _runtime_has_refreshable_api_key(runtime: dict) -> bool:
+    api_key = runtime.get("api_key")
+    if callable(api_key) and not isinstance(api_key, str):
+        return True
+    return bool(str(api_key or "").strip())
+
+
+def _apply_live_provider_credentials(
+    sid: str, session: dict, agent: Any, runtime: dict
+) -> None:
+    """Rebuild the agent HTTP client with freshly resolved credentials."""
+    agent.switch_model(
+        new_model=getattr(agent, "model", "") or "",
+        new_provider=getattr(agent, "provider", "") or "",
+        api_key=runtime.get("api_key", ""),
+        base_url=runtime.get("base_url") or getattr(agent, "base_url", "") or "",
+        api_mode=runtime.get("api_mode") or getattr(agent, "api_mode", "") or "",
+        capabilities=getattr(agent, "runtime_capabilities", None),
+    )
+    _restart_slash_worker(sid, session)
+    _persist_live_session_runtime(session)
+
+
+def _sync_agent_provider_credentials_with_config(sid: str, session: dict) -> None:
+    """Adopt rotated provider keys / base URLs at turn start (#PAN-14 slice 6).
+
+    Runs on the turn thread before the first model call of the turn, matching
+    ``_sync_agent_model_with_config`` / ``_sync_agent_compression_with_config``.
+    """
+    agent = session.get("agent")
+    if agent is None:
+        return
+    try:
+        resolution = _resolve_live_agent_runtime_credentials(session, agent)
+    except Exception:
+        logger.warning("Could not resolve provider credentials for %s", sid)
+        return
+
+    if resolution.used_fallback:
+        return
+
+    runtime = resolution.runtime
+    target_sig = _provider_credential_signature_from_runtime(runtime, agent)
+    agent_sig = _agent_provider_credential_signature(agent)
+    if target_sig == agent_sig:
+        session["provider_credential_refresh_applied"] = target_sig
+        return
+
+    applied = session.get("provider_credential_refresh_applied")
+    if target_sig == applied:
+        return
+
+    if not _runtime_has_refreshable_api_key(runtime):
+        session["provider_credential_refresh_applied"] = target_sig
+        return
+
+    resolved_provider = (runtime.get("provider") or "").strip().lower()
+    agent_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    if resolved_provider and resolved_provider != agent_provider:
+        session["provider_credential_refresh_applied"] = target_sig
+        return
+
+    try:
+        _apply_live_provider_credentials(sid, session, agent, runtime)
+        session["provider_credential_refresh_applied"] = target_sig
+    except Exception:
+        logger.warning("Could not refresh provider credentials for %s", sid)
+
+
 def _apply_pending_model_switch(sid: str, session: dict) -> None:
     """Apply a model switch queued while a turn was running.
 
@@ -13528,6 +13687,7 @@ def _run_prompt_submit(
                 _apply_pending_model_switch(sid, session)
                 _sync_agent_model_with_config(sid, session)
                 _sync_agent_compression_with_config(sid, session)
+                _sync_agent_provider_credentials_with_config(sid, session)
             # Bot Chat capability sync — adopt Settings→Capabilities edits
             # (skills/toolsets/MCP/SOUL) into the eternal bot session before
             # the turn runs. No-op for every other session shape.
@@ -17774,6 +17934,8 @@ def _(rid, params: dict) -> dict:
         {
             "per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT),
             "profile_display_name": True,
+            "provider_key_refresh": True,
+            "provider_test": True,
             "profile_context": True,
             "profile_pins": True,
             "profile_context_limits": True,
