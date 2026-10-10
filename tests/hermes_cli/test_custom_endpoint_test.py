@@ -237,6 +237,93 @@ class TestCustomEndpointTestRoute:
         )
         assert resp.status_code == 400
 
+    def test_sentinel_candidate_id_tests_unsaved_endpoint(self, monkeypatch):
+        seen: dict[str, str] = {}
+
+        async def _fake_probe(base_url, *, api_key="", model="", timeout_seconds=8.0):
+            seen["base_url"] = base_url
+            seen["api_key"] = api_key
+            return {"ok": True, "status": 200, "latency_ms": 2}
+
+        monkeypatch.setattr(
+            "hermes_cli.web_server._probe_custom_endpoint_connection",
+            _fake_probe,
+        )
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints/_candidate/test",
+            json={
+                "base_url": "http://192.168.0.9:8080/v1",
+                "api_key": "draft-key",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["ok"] is True
+        assert seen["base_url"] == "http://192.168.0.9:8080/v1"
+        assert seen["api_key"] == "draft-key"
+
+    def test_unknown_id_with_candidate_base_url_in_body(self, monkeypatch):
+        async def _fake_probe(base_url, *, api_key="", model="", timeout_seconds=8.0):
+            return {"ok": True, "status": 200, "latency_ms": 1}
+
+        monkeypatch.setattr(
+            "hermes_cli.web_server._probe_custom_endpoint_connection",
+            _fake_probe,
+        )
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints/not-saved-yet/test",
+            json={"base_url": "http://127.0.0.1:9999/v1"},
+        )
+        assert resp.status_code == 200
+
+    def test_unknown_id_without_body_base_url_is_404(self):
+        resp = self.client.post(
+            "/api/providers/custom-endpoints/not-saved-yet/test",
+            json={},
+        )
+        assert resp.status_code == 404
+
+    def test_sentinel_candidate_requires_base_url(self):
+        resp = self.client.post(
+            "/api/providers/custom-endpoints/_candidate/test",
+            json={},
+        )
+        assert resp.status_code == 400
+
+    def test_sentinel_candidate_never_uses_profile_stored_key(self, monkeypatch):
+        from hermes_cli.config import save_env_value
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "local": {
+                "name": "Local",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "qwen",
+                "key_env": custom_endpoint_key_env("local"),
+            }
+        }
+        save_config(cfg)
+        save_env_value(custom_endpoint_key_env("local"), "profile-secret")
+
+        seen: dict[str, str] = {}
+
+        async def _fake_probe(base_url, *, api_key="", model="", timeout_seconds=8.0):
+            seen["api_key"] = api_key
+            return {"ok": True, "status": 200, "latency_ms": 1}
+
+        monkeypatch.setattr(
+            "hermes_cli.web_server._probe_custom_endpoint_connection",
+            _fake_probe,
+        )
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints/_candidate/test",
+            json={"base_url": "http://192.168.0.9:8080/v1"},
+        )
+        assert resp.status_code == 200
+        assert seen.get("api_key") == ""
+
     def test_candidate_base_url_without_api_key_omits_stored_secret(self, monkeypatch):
         from hermes_cli.config import save_env_value
 

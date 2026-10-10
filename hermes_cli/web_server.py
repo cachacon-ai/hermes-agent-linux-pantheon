@@ -9123,6 +9123,13 @@ def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Failed to delete custom endpoint")
 
 
+_CUSTOM_ENDPOINT_CANDIDATE_ID = "_candidate"
+
+
+def _candidate_test_base_url(body: CustomEndpointTestBody) -> str:
+    return (body.base_url or "").strip().rstrip("/")
+
+
 @app.post("/api/providers/custom-endpoints/{endpoint_id}/test")
 async def test_custom_endpoint(
     endpoint_id: str,
@@ -9133,30 +9140,43 @@ async def test_custom_endpoint(
     """Live-probe a configured (or candidate) custom OpenAI-compatible endpoint."""
     _require_token(request)
     body = body or CustomEndpointTestBody()
+    sentinel_candidate = endpoint_id.strip() == _CUSTOM_ENDPOINT_CANDIDATE_ID
     provider_key = _custom_endpoint_id(endpoint_id)
     try:
         with _config_profile_scope(profile):
             cfg = load_config()
-            _stored, entry = find_provider_entry(cfg.get("providers"), provider_key)
-            if entry is None:
-                raise HTTPException(status_code=404, detail="custom endpoint not found")
+            entry = None
+            if not sentinel_candidate:
+                _stored, entry = find_provider_entry(cfg.get("providers"), provider_key)
 
-            stored_base_url = str(entry.get("base_url") or "").strip().rstrip("/")
-            base_url = (body.base_url or stored_base_url).strip().rstrip("/")
-            if not base_url:
-                raise HTTPException(status_code=400, detail="base_url required")
+            candidate_base_url = _candidate_test_base_url(body)
 
-            if body.api_key is None:
-                if body.base_url and _http_redirect_origin(
-                    base_url
-                ) != _http_redirect_origin(stored_base_url):
-                    api_key = ""
-                else:
-                    api_key = _resolve_custom_endpoint_secret(entry)
+            if sentinel_candidate or entry is None:
+                if not candidate_base_url:
+                    if sentinel_candidate:
+                        raise HTTPException(status_code=400, detail="base_url required")
+                    raise HTTPException(status_code=404, detail="custom endpoint not found")
+                base_url = candidate_base_url
+                api_key = "" if body.api_key is None else body.api_key.strip()
+                model = ""
             else:
-                api_key = body.api_key.strip()
+                stored_base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+                base_url = (body.base_url or stored_base_url).strip().rstrip("/")
+                if not base_url:
+                    raise HTTPException(status_code=400, detail="base_url required")
 
-            model = str(entry.get("model") or "").strip()
+                if body.api_key is None:
+                    if body.base_url and _http_redirect_origin(
+                        base_url
+                    ) != _http_redirect_origin(stored_base_url):
+                        api_key = ""
+                    else:
+                        api_key = _resolve_custom_endpoint_secret(entry)
+                else:
+                    api_key = body.api_key.strip()
+
+                model = str(entry.get("model") or "").strip()
+
             result = await _probe_custom_endpoint_connection(
                 base_url,
                 api_key=api_key,
