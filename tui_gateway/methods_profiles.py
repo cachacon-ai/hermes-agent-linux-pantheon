@@ -326,12 +326,9 @@ def _(rid, params: dict) -> dict:
             # Cheap existence flag so roster UIs know to profiles.get_asset
             # without a probe call per profile per paint.
             try:
-                from pathlib import Path as _Path
+                from tui_gateway.profile_helpers import profile_has_avatar
 
-                assets = _Path(str(p.path)) / "assets"
-                row["has_avatar"] = any(
-                    (assets / f"avatar.{ext}").is_file() for ext in ("png", "jpg", "webp")
-                )
+                row["has_avatar"] = profile_has_avatar(p.path)
             except Exception:
                 row["has_avatar"] = False
             out.append(row)
@@ -417,7 +414,9 @@ def _(rid, params: dict) -> dict:
     soul_written = False
     if isinstance(soul, str) and soul.strip():
         try:
-            (path / "SOUL.md").write_text(soul, encoding="utf-8")
+            from tui_gateway.profile_helpers import atomic_write_profile_soul
+
+            atomic_write_profile_soul(path, soul)
             soul_written = True
         except Exception:
             pass
@@ -739,18 +738,29 @@ def _(rid, params: dict) -> dict:
             model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
 
             description = ""
+            display_name = ""
             try:
                 from hermes_cli.profiles import read_profile_meta
 
-                description = str(read_profile_meta(profile_dir).get("description") or "")
+                meta = read_profile_meta(profile_dir)
+                description = str(meta.get("description") or "")
+                display_name = str(meta.get("display_name") or "")
             except Exception:
                 pass
+
+            from tui_gateway.profile_helpers import profile_has_avatar, read_profile_ui_meta
+
+            ui_meta = read_profile_ui_meta(profile_dir)
+            has_avatar = profile_has_avatar(profile_dir)
 
             return _ok(
                 rid,
                 {
                     "name": name,
                     "description": description,
+                    "display_name": display_name,
+                    "has_avatar": has_avatar,
+                    "ui_meta": ui_meta,
                     "soul": soul,
                     "model": {
                         "provider": str(model_cfg.get("provider") or ""),
@@ -773,6 +783,7 @@ def _(rid, params: dict) -> dict:
     """Apply configuration changes to a profile (editor Save).
 
     Params: ``name`` (required) plus any of:
+    ``display_name`` (str, trimmed, max 64; empty clears — slug unchanged),
     ``description`` (str), ``soul`` (str, full SOUL.md replacement),
     ``model`` + ``provider`` (both required together),
     ``disabled_skills`` (list[str], replace semantics),
@@ -884,9 +895,29 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 applied["ui_meta"] = False
 
+        stored_display_name = None
+        if "display_name" in params:
+            raw_dn = params.get("display_name")
+            if raw_dn is not None and not isinstance(raw_dn, str):
+                applied["display_name"] = False
+            else:
+                try:
+                    from hermes_cli.profiles import set_profile_display_name
+
+                    stored_display_name = set_profile_display_name(
+                        name, raw_dn if isinstance(raw_dn, str) else ""
+                    )
+                    applied["display_name"] = True
+                except (ValueError, FileNotFoundError):
+                    applied["display_name"] = False
+                except Exception:
+                    applied["display_name"] = False
+
         if isinstance(params.get("soul"), str):
             try:
-                (profile_dir / "SOUL.md").write_text(params["soul"], encoding="utf-8")
+                from tui_gateway.profile_helpers import atomic_write_profile_soul
+
+                atomic_write_profile_soul(profile_dir, params["soul"])
                 applied["soul"] = True
             except Exception:
                 applied["soul"] = False
@@ -1030,6 +1061,8 @@ def _(rid, params: dict) -> dict:
                 reset_hermes_home_override(token)
 
         result = {"ok": all(applied.values()) if applied else True, "applied": applied}
+        if stored_display_name is not None and applied.get("display_name"):
+            result["display_name"] = stored_display_name
         if confirm_message is not None:
             # Model write pending user confirmation — same shape config.set
             # returns, so clients reuse one confirm handler for both surfaces.

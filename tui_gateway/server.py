@@ -17766,7 +17766,13 @@ def _(rid, params: dict) -> dict:
     """
     from hermes_cli.active_sessions import PER_SESSION_EXCLUSIVE_SUBMIT
 
-    return _ok(rid, {"per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT)})
+    return _ok(
+        rid,
+        {
+            "per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT),
+            "profile_display_name": True,
+        },
+    )
 
 
 @method("ping")

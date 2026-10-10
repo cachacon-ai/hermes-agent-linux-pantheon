@@ -1069,6 +1069,84 @@ def set_profile_display_name(profile_name: str, display_name: str) -> str:
     return cleaned
 
 
+def migrate_ui_meta_display_names_to_profile_yaml(*, dry_run: bool = False) -> dict:
+    """Copy legacy ``ui_meta.display_name`` into ``profile.yaml`` ``display_name``.
+
+    Pantheon historically stored rosters names under ``ui_meta.display_name``;
+    ``profiles.list`` reads the top-level ``display_name`` field instead. This
+    helper backfills the canonical field once, idempotently — profiles that
+    already have a top-level name are skipped. The ``ui_meta`` key is left in
+    place.
+
+    Not run automatically; invoke manually when upgrading Pantheon clients::
+
+        python -c "from hermes_cli.profiles import migrate_ui_meta_display_names_to_profile_yaml; print(migrate_ui_meta_display_names_to_profile_yaml())"
+
+    Pass ``dry_run=True`` to report what would change without writing.
+    """
+    migrated: list[str] = []
+    skipped: list[str] = []
+    errors: list[dict] = []
+
+    def _process(profile_dir: Path, profile_id: str) -> None:
+        path = _profile_yaml_path(profile_dir)
+        if not path.is_file():
+            skipped.append(profile_id)
+            return
+        try:
+            import yaml
+
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as exc:
+            errors.append({"profile": profile_id, "error": str(exc)})
+            return
+        if not isinstance(data, dict):
+            skipped.append(profile_id)
+            return
+        if str(data.get("display_name") or "").strip():
+            skipped.append(profile_id)
+            return
+        ui_meta = data.get("ui_meta")
+        if not isinstance(ui_meta, dict):
+            skipped.append(profile_id)
+            return
+        legacy = str(ui_meta.get("display_name") or "").strip()
+        if not legacy:
+            skipped.append(profile_id)
+            return
+        if dry_run:
+            migrated.append(profile_id)
+            return
+        try:
+            set_profile_display_name(profile_id, legacy)
+            migrated.append(profile_id)
+        except Exception as exc:
+            errors.append({"profile": profile_id, "error": str(exc)})
+
+    default_home = _get_default_hermes_home()
+    if default_home.is_dir():
+        _process(default_home, "default")
+
+    profiles_root = _get_profiles_root()
+    if profiles_root.is_dir():
+        for entry in sorted(profiles_root.iterdir()):
+            if not entry.is_dir() or entry.name == "default":
+                continue
+            if not _PROFILE_ID_RE.match(entry.name):
+                continue
+            if named_profile_is_deleted(entry):
+                continue
+            _process(entry, entry.name)
+
+    return {
+        "dry_run": bool(dry_run),
+        "migrated": migrated,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
 # ---------------------------------------------------------------------------
 # CRUD operations
 # ---------------------------------------------------------------------------
