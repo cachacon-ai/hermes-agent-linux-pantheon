@@ -2121,6 +2121,8 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        "pins_char_limit": 2000,     # total chars across PINNED.md entries
+        "pins_max_count": 20,        # max number of pinned entries
         # Periodic built-in memory review. External providers with automatic
         # turn/session extraction can set this to 0 and keep the small local
         # store reserved for explicit high-frequency operational facts.
