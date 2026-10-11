@@ -6254,15 +6254,19 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     # CLI_CONFIG instead, purely to avoid a redundant read).
     if not explicit:
         try:
-            from agent.coding_context import coding_selection
+            from hermes_cli.tools_config import _profile_toolset_pin
+            from hermes_cli.config import load_config
 
-            selection = coding_selection(platform=session_platform)
-            if selection is not None:
-                # Fold in the client-surface toolsets here too: the focus-mode
-                # coding posture returns before the fallback path that normally
-                # adds them — without this the desktop loses its pane/project
-                # tools exactly when sitting in a repo (see below).
-                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
+            if _profile_toolset_pin(load_config()) is None:
+                from agent.coding_context import coding_selection
+
+                selection = coding_selection(platform=session_platform)
+                if selection is not None:
+                    # Fold in the client-surface toolsets here too: the focus-mode
+                    # coding posture returns before the fallback path that normally
+                    # adds them — without this the desktop loses its pane/project
+                    # tools exactly when sitting in a repo (see below).
+                    return sorted({*selection, *_gui_surface_toolsets(session_platform)})
         except Exception:
             pass
 
