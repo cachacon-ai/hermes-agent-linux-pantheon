@@ -6236,8 +6236,13 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     return surfaces
 
 
-def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
-    session_platform = platform or _resolve_session_platform()
+def _pantheon_chat_session(source: str | None) -> bool:
+    """True when this tui_gateway session is Pantheon's chat surface."""
+    return (source or "").strip().lower() == "pantheon"
+
+
+def _load_enabled_toolsets(session_source: str | None = None) -> list[str] | None:
+    session_source = session_source or _resolve_session_platform()
     explicit = [
         item.strip()
         for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",")
@@ -6246,27 +6251,40 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     cfg = None
     fallback_notice = None
 
+    def _session_config():
+        nonlocal cfg
+        if cfg is None:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+        return cfg
+
+    pantheon_pin_active = False
+    if not explicit and _pantheon_chat_session(session_source):
+        try:
+            from hermes_cli.tools_config import _profile_toolset_pin
+
+            pantheon_pin_active = _profile_toolset_pin(_session_config()) is not None
+        except Exception:
+            pantheon_pin_active = False
+
     # Coding posture (base Hermes): with no explicit pin, collapse to the
     # coding toolset (+ enabled MCP servers) when sitting in a code workspace.
     # The desktop app and `hermes --tui` both land here. See
     # agent/coding_context.py. No config is loaded yet at this point, so we let
     # coding_selection() load it lazily (cli.py passes its already-resolved
     # CLI_CONFIG instead, purely to avoid a redundant read).
-    if not explicit:
+    if not explicit and not pantheon_pin_active:
         try:
-            from hermes_cli.tools_config import _profile_toolset_pin
-            from hermes_cli.config import load_config
+            from agent.coding_context import coding_selection
 
-            if _profile_toolset_pin(load_config()) is None:
-                from agent.coding_context import coding_selection
-
-                selection = coding_selection(platform=session_platform)
-                if selection is not None:
-                    # Fold in the client-surface toolsets here too: the focus-mode
-                    # coding posture returns before the fallback path that normally
-                    # adds them — without this the desktop loses its pane/project
-                    # tools exactly when sitting in a repo (see below).
-                    return sorted({*selection, *_gui_surface_toolsets(session_platform)})
+            selection = coding_selection(platform=session_source)
+            if selection is not None:
+                # Fold in the client-surface toolsets here too: the focus-mode
+                # coding posture returns before the fallback path that normally
+                # adds them — without this the desktop loses its pane/project
+                # tools exactly when sitting in a repo (see below).
+                return sorted({*selection, *_gui_surface_toolsets(session_source)})
         except Exception:
             pass
 
@@ -6361,10 +6379,24 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         )
 
     try:
-        from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+            _profile_toolset_pin,
+            resolve_pantheon_profile_toolsets,
+        )
 
-        cfg = cfg if cfg is not None else load_config()
+        cfg = _session_config()
+
+        # Pantheon profile editor pin: only for ``source: pantheon`` chat
+        # sessions at agent build time — never for messaging/cron/API callers
+        # of ``_get_platform_tools``.
+        if _pantheon_chat_session(session_source):
+            pinned = _profile_toolset_pin(cfg)
+            if pinned is not None:
+                enabled = resolve_pantheon_profile_toolsets(
+                    cfg, "cli", pinned, include_default_mcp_servers=True
+                )
+                return sorted(enabled | _gui_surface_toolsets(session_source))
 
         # Runtime toolset resolution must include default MCP servers so the
         # agent can actually call them. Passing ``False`` here is the
@@ -6383,7 +6415,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
         # folding them in here is the gate that exposes them on exactly the
         # surface that can answer them.
-        return sorted(enabled | _gui_surface_toolsets(session_platform))
+        return sorted(enabled | _gui_surface_toolsets(session_source))
     except Exception:
         if fallback_notice is not None:
             print(
