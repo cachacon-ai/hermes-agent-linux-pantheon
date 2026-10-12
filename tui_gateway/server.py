@@ -1316,7 +1316,7 @@ def _interrupt_session_turn(
         if not run_thread_alive:
             with session["history_lock"]:
                 if session.get("running"):
-                    session["running"] = False
+                    _set_session_not_running(session, sid)
                     _clear_inflight_turn(session)
 
     _clear_pending(sid)
@@ -2889,7 +2889,7 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
                 )
             except Exception:
                 pass
-        session["running"] = False
+        _set_session_not_running(session, sid)
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
         session.pop("_compute_host_pending_clarify", None)
@@ -3499,40 +3499,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {
-                    "session_db": session_db,
-                    "context_cwd_is_launch_artifact": (
-                        _context_cwd_is_launch_artifact(current)
-                    ),
-                }
+                kw = _live_session_make_agent_kwargs(
+                    sid,
+                    current,
+                    session_db=session_db,
+                )
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
-                kw["platform_override"] = _session_source(current)
-                resume_overrides = current.get("resume_runtime_overrides")
-                if (
-                    isinstance(resume_overrides, dict)
-                    and resume_overrides
-                    and _overrides_have_routable_provider(resume_overrides)
-                ):
-                    # Cold deferred resume: restore the full persisted runtime
-                    # identity (model/provider/base_url/api_mode/reasoning/tier)
-                    # exactly as the eager resume path's _stored_session_runtime_
-                    # overrides splat did, so a deferred build can't drop the
-                    # provider and fail with "No LLM provider configured".
-                    kw.update(resume_overrides)
-                else:
-                    # No stored runtime, or the stored provider no longer
-                    # resolves (renamed/removed since the row was written) —
-                    # never let that sink agent init with "Unknown provider".
-                    # Fall back to the model/effort/fast the desktop picked
-                    # for THIS session, else the configured default.
-                    if override := current.get("model_override"):
-                        kw["model_override"] = override
-                    if (reasoning := current.get("create_reasoning_override")) is not None:
-                        kw["reasoning_config_override"] = reasoning
-                    if (tier := current.get("create_service_tier_override")) is not None:
-                        kw["service_tier_override"] = tier
-                kw["artifact_delivery_version"] = current.get("artifact_delivery_version", 0)
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -3661,6 +3634,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     with contextlib.suppress(Exception):
                         session_db.close()
             ready.set()
+            _flush_pending_client_surface_rebuild(sid, current)
 
     build_thread = threading.Thread(target=_build, daemon=True)
     # Handle for _wait_agent_for_prompt: a dead build thread with agent_ready
@@ -4110,10 +4084,97 @@ def _bind_client_surface(session: dict, explicit_source: str | None) -> bool:
     return previous != resolved
 
 
-def _maybe_rebuild_agent_for_client_surface(sid: str, session: dict) -> None:
-    """Swap the live agent when the client surface changes tool posture."""
-    if session.get("lazy") or session.get("running"):
-        session["_pending_client_surface_rebuild"] = True
+def _live_session_make_agent_kwargs(
+    sid: str,
+    session: dict,
+    *,
+    session_db=None,
+    platform_override: str | None = None,
+    artifact_delivery_version: int | None = None,
+    context_cwd_is_launch_artifact: bool | None = None,
+) -> dict:
+    """Shared _make_agent kwargs for resume, deferred build, and surface rebuild."""
+    key = str(session.get("session_key") or sid)
+    kw: dict = {
+        "session_id": session.get("resume_session_id") or key,
+        "platform_override": platform_override or _session_source(session),
+        "context_cwd_is_launch_artifact": (
+            context_cwd_is_launch_artifact
+            if context_cwd_is_launch_artifact is not None
+            else _context_cwd_is_launch_artifact(session)
+        ),
+        "artifact_delivery_version": int(
+            artifact_delivery_version
+            if artifact_delivery_version is not None
+            else session.get("artifact_delivery_version", 0)
+            or 0
+        ),
+    }
+    if session_db is not None:
+        kw["session_db"] = session_db
+    else:
+        agent = session.get("agent")
+        if agent is not None:
+            existing_db = getattr(agent, "_session_db", None)
+            if existing_db is not None:
+                kw["session_db"] = existing_db
+
+    resume_overrides = session.get("resume_runtime_overrides")
+    if (
+        isinstance(resume_overrides, dict)
+        and resume_overrides
+        and _overrides_have_routable_provider(resume_overrides)
+    ):
+        kw.update(resume_overrides)
+    else:
+        if override := session.get("model_override"):
+            kw["model_override"] = override
+        if (reasoning := session.get("create_reasoning_override")) is not None:
+            kw["reasoning_config_override"] = reasoning
+        if (tier := session.get("create_service_tier_override")) is not None:
+            kw["service_tier_override"] = tier
+    return kw
+
+
+def _rebuild_agent_for_client_surface(sid: str, session: dict) -> bool:
+    """Swap the live agent for the session's current client surface."""
+    agent = session.get("agent")
+    if agent is None:
+        return False
+    ready = session.get("agent_ready")
+    if ready is not None and not ready.is_set():
+        return False
+    key = str(session.get("session_key") or sid)
+    try:
+        tokens = _set_session_context(key)
+        try:
+            with _session_profile_runtime_scope(session):
+                new_agent = _make_agent(
+                    sid,
+                    key,
+                    **_live_session_make_agent_kwargs(sid, session),
+                )
+        finally:
+            _clear_session_context(tokens)
+        session["agent"] = new_agent
+        try:
+            if hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        logger.warning(
+            "client-surface agent rebuild failed for %s", sid, exc_info=True
+        )
+        return False
+
+
+def _flush_pending_client_surface_rebuild(sid: str, session: dict) -> None:
+    """Apply a deferred client-surface rebuild once the session can swap agents."""
+    if not session.get("_pending_client_surface_rebuild"):
+        return
+    if session.get("running") or session.get("lazy"):
         return
     agent = session.get("agent")
     if agent is None:
@@ -4121,40 +4182,24 @@ def _maybe_rebuild_agent_for_client_surface(sid: str, session: dict) -> None:
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set():
         return
-    key = str(session.get("session_key") or sid)
-    try:
-        tokens = _set_session_context(key)
-        try:
-            kw: dict = {
-                "session_id": session.get("resume_session_id") or key,
-                "platform_override": _session_source(session),
-                "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(
-                    session
-                ),
-            }
-            resume_overrides = session.get("resume_runtime_overrides")
-            if (
-                isinstance(resume_overrides, dict)
-                and resume_overrides
-                and _overrides_have_routable_provider(resume_overrides)
-            ):
-                kw.update(resume_overrides)
-            elif override := session.get("model_override"):
-                kw["model_override"] = override
-            new_agent = _make_agent(sid, key, **kw)
-        finally:
-            _clear_session_context(tokens)
-        session["agent"] = new_agent
+    session.pop("_pending_client_surface_rebuild", None)
+    if not _rebuild_agent_for_client_surface(sid, session):
+        session["_pending_client_surface_rebuild"] = True
+
+
+def _set_session_not_running(session: dict, sid: str) -> None:
+    """Clear ``running`` and flush any deferred client-surface agent rebuild."""
+    session["running"] = False
+    _flush_pending_client_surface_rebuild(sid, session)
+
+
+def _maybe_rebuild_agent_for_client_surface(sid: str, session: dict) -> None:
+    """Swap the live agent when the client surface changes tool posture."""
+    if session.get("lazy") or session.get("running"):
+        session["_pending_client_surface_rebuild"] = True
+        return
+    if _rebuild_agent_for_client_surface(sid, session):
         session.pop("_pending_client_surface_rebuild", None)
-        try:
-            if hasattr(agent, "close"):
-                agent.close()
-        except Exception:
-            pass
-    except Exception:
-        logger.warning(
-            "client-surface agent rebuild failed for %s", sid, exc_info=True
-        )
 
 
 def _register_session_cwd(session: dict | None) -> None:
@@ -9324,7 +9369,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     session["edit_snapshots"] = {}
     session["image_counter"] = 0
-    session["running"] = False
+    _set_session_not_running(session, sid)
     session["show_reasoning"] = _load_show_reasoning()
     session["tool_progress_mode"] = _load_tool_progress_mode()
     session["tool_started_at"] = {}
@@ -10765,7 +10810,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 session_key,
             )
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_not_running(session, sid)
                 session["_auto_continue_scheduled"] = False
             return
         with session["history_lock"]:
@@ -10792,7 +10837,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 file=sys.stderr,
             )
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_not_running(session, sid)
 
     threading.Thread(target=kickoff, daemon=True).start()
     logger.info(
@@ -11103,7 +11148,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session["queued_prompts"] = rest
             else:
                 session.pop("queued_prompts", None)
-            session["running"] = False
+            _set_session_not_running(session, sid)
             return True
     dispatch_failed = False
     try:
@@ -11124,7 +11169,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
-                    session["running"] = False
+                    _set_session_not_running(session, sid)
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
@@ -11153,7 +11198,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             file=sys.stderr,
         )
         with session["history_lock"]:
-            session["running"] = False
+            _set_session_not_running(session, sid)
         dispatch_failed = True
     if dispatch_failed:
         with session["history_lock"]:
@@ -12837,7 +12882,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     wakeup = mgr.fire_tick()
     if not wakeup:
         with session["history_lock"]:
-            session["running"] = False
+            _set_session_not_running(session, sid)
         return
 
     tick_no = mgr.state.ticks_fired if mgr.state else "?"
@@ -12852,7 +12897,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             # Slash-command loop: route through the slash pipeline instead of
             # the model. No model reply to evaluate — complete immediately.
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_not_running(session, sid)
             try:
                 parts = wakeup.lstrip()[1:].split(None, 1)
                 resp = _methods["command.dispatch"](
@@ -12894,7 +12939,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             file=sys.stderr,
         )
         with session["history_lock"]:
-            session["running"] = False
+            _set_session_not_running(session, sid)
         try:
             mgr.abandon_tick()
         except Exception:
@@ -13132,7 +13177,7 @@ def _notification_poller_loop(
                             file=sys.stderr,
                         )
                         with session["history_lock"]:
-                            session["running"] = False
+                            _set_session_not_running(session, sid)
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -13230,7 +13275,7 @@ def _notification_poller_loop(
                 file=sys.stderr,
             )
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_not_running(session, sid)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -13308,7 +13353,7 @@ def _notification_poller_loop(
                 file=sys.stderr,
             )
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_not_running(session, sid)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -13652,18 +13697,18 @@ def _run_prompt_submit(
             getattr(ownership_refusal, "reason", None) or "refused",
         )
         with session["history_lock"]:
-            session["running"] = False
+            _set_session_not_running(session, sid)
         _emit("error", sid, {"message": str(ownership_refusal)})
         return False
     with session["history_lock"]:
         if session.get("_closing"):
-            session["running"] = False
+            _set_session_not_running(session, sid)
             return False
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
-            session["running"] = False
+            _set_session_not_running(session, sid)
             return False
         if image_paths is None:
             images = list(session.get("attached_images", []))
@@ -14595,7 +14640,7 @@ def _run_prompt_submit(
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_not_running(session, sid)
                 session["last_active"] = time.time()
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
@@ -14677,7 +14722,7 @@ def _run_prompt_submit(
                     file=sys.stderr,
                 )
                 with session["history_lock"]:
-                    session["running"] = False
+                    _set_session_not_running(session, sid)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -14725,7 +14770,7 @@ def _run_prompt_submit(
                         file=sys.stderr,
                     )
                     with session["history_lock"]:
-                        session["running"] = False
+                        _set_session_not_running(session, sid)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -14745,7 +14790,7 @@ def _run_prompt_submit(
             run_thread.start()
     if not can_start:
         with session["history_lock"]:
-            session["running"] = False
+            _set_session_not_running(session, sid)
     return can_start
 
 

@@ -561,3 +561,401 @@ def test_tui_persisted_session_resume_ignores_profile_pin(tmp_path, monkeypatch)
                 }
             )
         reset_hermes_home_override(home_token)
+
+
+def test_pantheon_resume_while_running_rebuilds_after_turn(
+    tmp_path, monkeypatch, pin_config
+):
+    """Fast-path Pantheon resume during a turn defers rebuild until running clears."""
+    import os
+
+    import yaml
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    cfg = dict(pin_config)
+    cfg.update(
+        {
+            "model": {"default": "test-model-live", "provider": "custom:test"},
+            "custom_providers": [
+                {
+                    "name": "test",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key": "sk-test-not-real",
+                    "api_mode": "chat_completions",
+                }
+            ],
+        }
+    )
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    home_token = set_hermes_home_override(str(home))
+    for var in list(os.environ):
+        if var.endswith("_API_KEY") or var in ("OPENROUTER_KEY", "NOUS_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
+    monkeypatch.setattr(server, "_db", None, raising=False)
+    monkeypatch.setattr(server, "_hermes_home", str(home), raising=False)
+
+    stored = "stored-desktop-mid-turn"
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session(
+        stored,
+        source="desktop",
+        model="test-model-live",
+        model_config={
+            "model": "test-model-live",
+            "provider": "custom:test",
+            "base_url": "https://example.invalid/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    db.close()
+
+    agents_built: list[set[str]] = []
+
+    def _fake_agent(**kwargs):
+        toolsets = set(kwargs.get("enabled_toolsets") or [])
+        agents_built.append(toolsets)
+        return types.SimpleNamespace(
+            enabled_toolsets=list(toolsets),
+            model=kwargs.get("model"),
+            provider=kwargs.get("provider"),
+            session_id=kwargs.get("session_id"),
+            _session_db=kwargs.get("session_db"),
+            _memory_manager=MagicMock(),
+            _last_flushed_db_idx=0,
+            close=lambda: None,
+        )
+
+    server._sessions.clear()
+    with (
+        patch("hermes_cli.mcp_startup.wait_for_mcp_discovery"),
+        patch("tui_gateway.entry.wait_for_mcp_discovery"),
+        patch("run_agent.AIAgent", side_effect=_fake_agent),
+    ):
+        first = server.handle_request(
+            {
+                "id": "resume-desktop-busy",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stored,
+                    "source": "desktop",
+                    "eager_build": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+        assert "error" not in first, first.get("error")
+        live_sid = first["result"]["session_id"]
+        live = server._sessions[live_sid]
+        live["running"] = True
+
+        second = server.handle_request(
+            {
+                "id": "resume-pantheon-busy",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stored,
+                    "source": "pantheon",
+                    "eager_build": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+        assert "error" not in second, second.get("error")
+        assert live.get("_pending_client_surface_rebuild") is True
+        assert "browser" in set(getattr(live["agent"], "enabled_toolsets", []) or [])
+
+        with live["history_lock"]:
+            server._set_session_not_running(live, live_sid)
+
+    try:
+        enabled = set(getattr(live["agent"], "enabled_toolsets", []) or [])
+        assert "file" in enabled
+        assert "browser" not in enabled
+        assert live.get("_pending_client_surface_rebuild") is not True
+        assert len(agents_built) >= 2
+    finally:
+        server.handle_request(
+            {
+                "id": "close-busy",
+                "method": "session.close",
+                "params": {"session_id": live_sid},
+            }
+        )
+        reset_hermes_home_override(home_token)
+
+
+def test_client_surface_rebuild_uses_profile_home_db(tmp_path, monkeypatch, pin_config):
+    """Deferred surface rebuild binds profile HERMES_HOME and reuses the profile db."""
+    import os
+    from pathlib import Path
+
+    import yaml
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    launch = tmp_path / "launch"
+    profile = tmp_path / "profiles" / "coder"
+    for path in (launch, profile):
+        path.mkdir(parents=True)
+    cfg = dict(pin_config)
+    cfg.update(
+        {
+            "model": {"default": "test-model-live", "provider": "custom:test"},
+            "custom_providers": [
+                {
+                    "name": "test",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key": "sk-test-not-real",
+                    "api_mode": "chat_completions",
+                }
+            ],
+        }
+    )
+    (profile / "config.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    launch_token = set_hermes_home_override(str(launch))
+    for var in list(os.environ):
+        if var.endswith("_API_KEY") or var in ("OPENROUTER_KEY", "NOUS_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", launch / "state.db")
+    monkeypatch.setattr(server, "_db", None, raising=False)
+    monkeypatch.setattr(server, "_hermes_home", str(launch), raising=False)
+
+    stored = "profile-scoped-chat"
+    profile_db = SessionDB(db_path=profile / "state.db")
+    profile_db.create_session(
+        stored,
+        source="desktop",
+        model="test-model-live",
+        model_config={
+            "model": "test-model-live",
+            "provider": "custom:test",
+            "base_url": "https://example.invalid/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    profile_db.close()
+
+    build_log: list[dict] = []
+    profile_home_overrides: list[str] = []
+    real_set_home = server.set_hermes_home_override
+
+    def _track_home(home):
+        profile_home_overrides.append(str(home))
+        return real_set_home(home)
+
+    monkeypatch.setattr(server, "set_hermes_home_override", _track_home)
+
+    def _fake_agent(**kwargs):
+        db_path = str(getattr(kwargs.get("session_db"), "db_path", ""))
+        toolsets = set(kwargs.get("enabled_toolsets") or [])
+        build_log.append({"session_db_path": db_path, "toolsets": toolsets})
+        return types.SimpleNamespace(
+            enabled_toolsets=list(toolsets),
+            session_id=kwargs.get("session_id"),
+            _session_db=kwargs.get("session_db"),
+            _memory_manager=MagicMock(),
+            _last_flushed_db_idx=0,
+            close=lambda: None,
+        )
+
+    server._sessions.clear()
+    with (
+        patch("hermes_cli.mcp_startup.wait_for_mcp_discovery"),
+        patch("tui_gateway.entry.wait_for_mcp_discovery"),
+        patch("run_agent.AIAgent", side_effect=_fake_agent),
+        patch.object(server, "_profile_home", lambda name: profile if name == "coder" else None),
+    ):
+        first = server.handle_request(
+            {
+                "id": "resume-profile-desktop",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stored,
+                    "profile": "coder",
+                    "source": "desktop",
+                    "eager_build": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+        assert "error" not in first, first.get("error")
+        live_sid = first["result"]["session_id"]
+        live = server._sessions[live_sid]
+        live["running"] = True
+
+        server.handle_request(
+            {
+                "id": "resume-profile-pantheon",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stored,
+                    "profile": "coder",
+                    "source": "pantheon",
+                    "eager_build": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+        with live["history_lock"]:
+            server._set_session_not_running(live, live_sid)
+
+    try:
+        assert str(live.get("profile_home")) == str(profile)
+        assert len(build_log) >= 2
+        for entry in build_log:
+            assert Path(entry["session_db_path"]).resolve() == (
+                profile / "state.db"
+            ).resolve()
+        assert any(str(profile) in call for call in profile_home_overrides)
+        enabled = set(getattr(live["agent"], "enabled_toolsets", []) or [])
+        assert "file" in enabled
+        assert "browser" not in enabled
+    finally:
+        server.handle_request(
+            {
+                "id": "close-profile",
+                "method": "session.close",
+                "params": {"session_id": live_sid},
+            }
+        )
+        reset_hermes_home_override(launch_token)
+
+
+def test_lazy_resume_pantheon_pending_rebuild_after_build(
+    tmp_path, monkeypatch, pin_config
+):
+    """Lazy watch resume while busy rebuilds pinned toolsets once the agent exists."""
+    import os
+
+    import yaml
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    cfg = dict(pin_config)
+    cfg.update(
+        {
+            "model": {"default": "test-model-live", "provider": "custom:test"},
+            "custom_providers": [
+                {
+                    "name": "test",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key": "sk-test-not-real",
+                    "api_mode": "chat_completions",
+                }
+            ],
+        }
+    )
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    home_token = set_hermes_home_override(str(home))
+    for var in list(os.environ):
+        if var.endswith("_API_KEY") or var in ("OPENROUTER_KEY", "NOUS_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
+    monkeypatch.setattr(server, "_db", None, raising=False)
+    monkeypatch.setattr(server, "_hermes_home", str(home), raising=False)
+
+    stored = "lazy-desktop-chat"
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session(
+        stored,
+        source="desktop",
+        model="test-model-live",
+        model_config={
+            "model": "test-model-live",
+            "provider": "custom:test",
+            "base_url": "https://example.invalid/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    db.close()
+
+    agents_built: list[set[str]] = []
+
+    def _fake_agent(**kwargs):
+        toolsets = set(kwargs.get("enabled_toolsets") or [])
+        agents_built.append(toolsets)
+        return types.SimpleNamespace(
+            enabled_toolsets=list(toolsets),
+            session_id=kwargs.get("session_id"),
+            _session_db=kwargs.get("session_db"),
+            _memory_manager=MagicMock(),
+            _last_flushed_db_idx=0,
+            close=lambda: None,
+        )
+
+    server._sessions.clear()
+    with (
+        patch("hermes_cli.mcp_startup.wait_for_mcp_discovery"),
+        patch("tui_gateway.entry.wait_for_mcp_discovery"),
+        patch("run_agent.AIAgent", side_effect=_fake_agent),
+    ):
+        lazy = server.handle_request(
+            {
+                "id": "resume-lazy-desktop",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stored,
+                    "source": "desktop",
+                    "lazy": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+        assert "error" not in lazy, lazy.get("error")
+        live_sid = lazy["result"]["session_id"]
+        live = server._sessions[live_sid]
+        assert live.get("lazy") is True
+        assert live.get("agent") is None
+
+        server.handle_request(
+            {
+                "id": "resume-lazy-pantheon",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stored,
+                    "source": "pantheon",
+                    "lazy": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+        assert live.get("_pending_client_surface_rebuild") is True
+
+        server._start_agent_build(live_sid, live)
+        ready = live.get("agent_ready")
+        assert ready is not None
+        ready.wait(timeout=10.0)
+
+    try:
+        enabled = set(getattr(live["agent"], "enabled_toolsets", []) or [])
+        assert "file" in enabled
+        assert "browser" not in enabled
+        assert live.get("_pending_client_surface_rebuild") is not True
+        assert agents_built and "browser" not in agents_built[-1]
+    finally:
+        server.handle_request(
+            {
+                "id": "close-lazy",
+                "method": "session.close",
+                "params": {"session_id": live_sid},
+            }
+        )
+        reset_hermes_home_override(home_token)

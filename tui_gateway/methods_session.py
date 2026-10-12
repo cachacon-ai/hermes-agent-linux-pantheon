@@ -1120,21 +1120,26 @@ def _(rid, params: dict) -> dict:
                 # global model another chat last selected.
                 stored_runtime_overrides = _stored_session_runtime_overrides(found)
                 resume_seed = {
+                    "session_key": target,
+                    "resume_session_id": target,
+                    "client_source": resume_client_surface,
                     "resume_runtime_overrides": stored_runtime_overrides or None,
                 }
                 _sync_create_reasoning_override_from_resume_overrides(resume_seed)
                 agent = _make_agent(
                     sid,
                     target,
-                    session_id=target,
-                    session_db=db,
-                    platform_override=resume_client_surface,
-                    artifact_delivery_version=_publication_version,
-                    context_cwd_is_launch_artifact=(
-                        resume_client_surface in _LAUNCH_CWD_NOT_A_WORKSPACE
-                        and not profile_resume_cwd
+                    **_live_session_make_agent_kwargs(
+                        sid,
+                        resume_seed,
+                        session_db=db,
+                        platform_override=resume_client_surface,
+                        artifact_delivery_version=_publication_version,
+                        context_cwd_is_launch_artifact=(
+                            resume_client_surface in _LAUNCH_CWD_NOT_A_WORKSPACE
+                            and not profile_resume_cwd
+                        ),
                     ),
-                    **stored_runtime_overrides,
                 )
                 eager_create_reasoning = resume_seed.get("create_reasoning_override")
             finally:

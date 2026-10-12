@@ -572,7 +572,7 @@ class ComputeHost:
                 session = server._sessions.get(sid)
                 if session is not None:
                     with session.get("history_lock", threading.Lock()):
-                        session["running"] = False
+                        server._set_session_not_running(session, sid)
                         server._clear_inflight_turn(session)
             except Exception:
                 pass

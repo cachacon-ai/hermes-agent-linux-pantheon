@@ -991,7 +991,7 @@ def _(rid, params: dict) -> dict:
         from hermes_state import is_disk_full_error
 
         with session["history_lock"]:
-            session["running"] = False
+            _set_session_not_running(session, sid)
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
         if is_disk_full_error(exc):
@@ -1039,13 +1039,13 @@ def _(rid, params: dict) -> dict:
                 error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
             )
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_not_running(session, sid)
                 session["last_active"] = time.time()
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
-                session["running"] = False
+                _set_session_not_running(session, sid)
                 _clear_inflight_turn(session)
                 # Surface the cancellation to the client. Without this emit the
                 # turn vanishes silently — the Desktop sees `prompt.submit`
