@@ -3854,7 +3854,11 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     monkeypatch.setattr(server, "_session_info", lambda agent, *a: {"model": agent.model, "provider": agent.provider})
 
     def fake_init_session(sid, key, agent, history, cols=80, **_kwargs):
-        server._sessions[sid] = {"agent": agent, "session_key": key}
+        server._sessions[sid] = {
+            "agent": agent,
+            "session_key": key,
+            "model_override": _kwargs.get("model_override"),
+        }
 
     monkeypatch.setattr(server, "_init_session", fake_init_session)
 
