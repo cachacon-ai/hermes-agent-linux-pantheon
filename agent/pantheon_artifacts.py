@@ -441,7 +441,7 @@ def capability_details(profile_home=None):
         reset_hermes_home_override,
         set_hermes_home_override,
     )
-    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config import get_active_config_parse_failure, load_config_readonly
 
     def unavailable(code, reason):
         return {"artifact_delivery_version": 0,
@@ -453,10 +453,20 @@ def capability_details(profile_home=None):
             _home_token = set_hermes_home_override(str(home))
             try:
                 cfg = load_config_readonly() or {}
+                if get_active_config_parse_failure():
+                    return unavailable(
+                        "invalid_configuration",
+                        "The producing profile configuration is invalid.",
+                    )
             finally:
                 reset_hermes_home_override(_home_token)
         else:
             cfg = load_config_readonly() or {}
+            if get_active_config_parse_failure():
+                return unavailable(
+                    "invalid_configuration",
+                    "The producing profile configuration is invalid.",
+                )
         if not isinstance(cfg,dict):
             return unavailable('invalid_configuration','The producing profile configuration is invalid.')
         if os.name!='posix' or not hasattr(os,'O_NOFOLLOW'):
