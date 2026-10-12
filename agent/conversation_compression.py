@@ -1040,21 +1040,33 @@ _CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS = 5.0
 def _cancelled_worker_teardown_grace_seconds(ceiling: float) -> float:
     """Bounded join window for fence-cancelled workers (#97488).
 
-    Override via ``HERMES_COMPRESSION_CANCELLED_WORKER_GRACE_SECONDS`` for
-    slow CI runners where the default can be tighter than ``min(5, ceiling)``.
+    Default grace is ``min(5s, total_ceiling)`` so a short ceiling-bound
+    attempt does not wait longer on join than it waited on progress.
+
+    When ``HERMES_COMPRESSION_CANCELLED_WORKER_GRACE_SECONDS`` is set
+    explicitly (tests, slow CI), that value controls the join window even
+    if it exceeds ``ceiling``. The total ceiling only bounds how long the
+    host waits for progress before cancelling; post-cancel join is separate.
+    Safety when the worker outlives grace is unchanged: the poison fence
+    discards late results and, on the total-ceiling path, the durable lease
+    stays retained until the orphan exits (``_retain_cancelled_lock_until_worker_done``).
     """
     raw = os.environ.get("HERMES_COMPRESSION_CANCELLED_WORKER_GRACE_SECONDS")
-    if raw is not None and str(raw).strip() != "":
+    explicit_override = raw is not None and str(raw).strip() != ""
+    if explicit_override:
         try:
             configured = max(float(raw), 0.0)
         except (TypeError, ValueError):
+            explicit_override = False
             configured = _CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS
     else:
         configured = _CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS
+    if explicit_override:
+        return configured
     try:
         cap = max(float(ceiling), 0.0)
     except (TypeError, ValueError):
-        cap = configured
+        return configured
     return min(configured, cap) if cap > 0 else configured
 
 

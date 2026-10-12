@@ -27,6 +27,9 @@ from tools.fal_common import (
 def fake_fal_client(monkeypatch):
     module = types.ModuleType("fal_client")
     monkeypatch.setitem(sys.modules, "fal_client", module)
+    from tests.tools.fal_client_stub import monkeypatch_preserve_fal_client_stub
+
+    monkeypatch_preserve_fal_client_stub(monkeypatch)
     return module
 
 
