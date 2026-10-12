@@ -2643,6 +2643,97 @@ def _enable_recently_shipped_toolsets(
         enabled_toolsets.add(ts_key)
 
 
+def _normalize_profile_toolset_pin(raw: object) -> list[str] | None:
+    """Normalize ``tools.enabled_toolsets`` from config into a de-duplicated list."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        logger.warning(
+            "tools.enabled_toolsets is a string; treating as a one-item list: %r",
+            raw,
+        )
+        raw = [raw]
+    if not isinstance(raw, list):
+        logger.warning(
+            "tools.enabled_toolsets has invalid type %s; ignoring profile pin",
+            type(raw).__name__,
+        )
+        return None
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for item in raw:
+        ts = str(item).strip()
+        if not ts or ts in seen:
+            continue
+        seen.add(ts)
+        normalized.append(ts)
+    return normalized or None
+
+
+def _profile_toolset_pin(config: dict) -> list[str] | None:
+    """Return the profile's explicit ``tools.enabled_toolsets`` pin, if any."""
+    tools_section = config.get("tools")
+    if not isinstance(tools_section, dict):
+        return None
+    return _normalize_profile_toolset_pin(tools_section.get("enabled_toolsets"))
+
+
+def resolve_pantheon_profile_toolsets(
+    config: dict,
+    platform: str,
+    pinned: list[str],
+    *,
+    include_default_mcp_servers: bool = True,
+) -> Set[str]:
+    """Resolve Pantheon chat toolsets from ``tools.enabled_toolsets``.
+
+    Unknown names are dropped with a warning. When every pinned name is unknown
+    or platform-filtered, the built-in toolset portion is empty (never falls
+    back to ``hermes-cli``); enabled MCP servers are still merged on top.
+    """
+    from toolsets import validate_toolset
+
+    enabled_toolsets: Set[str] = set()
+    unknown: list[str] = []
+    for ts in pinned:
+        if not validate_toolset(ts):
+            unknown.append(ts)
+            continue
+        if _toolset_allowed_for_platform(ts, platform):
+            enabled_toolsets.add(ts)
+
+    if unknown:
+        logger.warning(
+            "tools.enabled_toolsets: ignoring unknown toolset(s): %s",
+            ", ".join(sorted(unknown)),
+        )
+
+    if pinned and not enabled_toolsets:
+        logger.warning(
+            "tools.enabled_toolsets: pin resolved to zero toolsets (%s); "
+            "using minimal session toolsets only",
+            ", ".join(pinned),
+        )
+
+    enabled_mcp_servers = enabled_mcp_server_names(config)
+    if include_default_mcp_servers:
+        enabled_toolsets.update(enabled_mcp_servers)
+
+    agent_cfg = config.get("agent") or {}
+    disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
+    if disabled_toolsets:
+        from agent.skill_utils import parse_config_string_list
+
+        disabled_set = {
+            name.strip()
+            for name in parse_config_string_list(disabled_toolsets)
+            if name.strip()
+        }
+        enabled_toolsets -= disabled_set
+
+    return enabled_toolsets
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,
