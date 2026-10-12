@@ -116,6 +116,7 @@ def _(rid, params: dict) -> dict:
             "conversation_root_id": key,
             "show_reasoning": _load_show_reasoning(),
             "source": source,
+            "client_source": source,
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
@@ -481,6 +482,9 @@ def _(rid, params: dict) -> dict:
     # route in parallel. Suppress the duplicate WebSocket transcript only when
     # the caller explicitly requests it; other clients keep upstream behavior.
     omit_messages = is_truthy_value(params.get("omit_messages", False))
+    resume_client_surface = _resolve_session_source(
+        str(params.get("source") or "").strip() or None
+    )
 
     # In a profile scope this opens a DEDICATED handle we own until the agent
     # takes it (see the ownership transfer at _init_session below); every path
@@ -556,6 +560,8 @@ def _(rid, params: dict) -> dict:
                         with contextlib.suppress(Exception):
                             from hermes_state import release_or_close
                             release_or_close(db)
+                    if _bind_client_surface(live, resume_client_surface):
+                        _maybe_rebuild_agent_for_client_surface(live_sid, live)
                     live["last_active"] = time.time()
                     # This resume reattaches the live record. A lazy session
                     # (no state.db row yet — every fresh Bot Chat) that was
@@ -790,6 +796,8 @@ def _(rid, params: dict) -> dict:
                 # but only when a transport is passed; cancel unconditionally
                 # here so the fast path can never race the reap Timer).
                 _cancel_ws_orphan_reap(sid)
+                if _bind_client_surface(session, resume_client_surface):
+                    _maybe_rebuild_agent_for_client_surface(sid, session)
                 return _ok(rid, _reuse_live_payload(sid, session))
 
         # Fast path: if the session is already live IN THIS PROFILE, reuse it
@@ -809,7 +817,7 @@ def _(rid, params: dict) -> dict:
         # (resume_session_id keeps the upgrade on the stored conversation).
         if is_truthy_value(params.get("lazy", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+            source = resume_client_surface
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             try:
                 db.reopen_session(target)
@@ -839,6 +847,9 @@ def _(rid, params: dict) -> dict:
                 lazy=True,
                 todo_state=_todo_state_from_history(history),
                 explicit_cwd=bool(profile_resume_cwd),
+            )
+            record["source"] = _persisted_session_creation_source(
+                found, fallback=resume_client_surface
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -893,7 +904,7 @@ def _(rid, params: dict) -> dict:
         # governs the response shape of the non-deferred paths.
         if defer_history and not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+            source = resume_client_surface
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             _enable_gateway_prompts()
             overrides = _stored_session_runtime_overrides(found) or {}
@@ -911,6 +922,9 @@ def _(rid, params: dict) -> dict:
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
                 explicit_cwd=bool(profile_resume_cwd),
+            )
+            record["source"] = _persisted_session_creation_source(
+                found, fallback=resume_client_surface
             )
             record.update(_publication_capability)
             record["conversation_root_id"] = _publication_root
@@ -968,7 +982,7 @@ def _(rid, params: dict) -> dict:
         # session's persisted runtime identity, and is a real (upgradable) session.
         if not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+            source = resume_client_surface
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             # Interactive resume routes approvals/clarify through gateway prompts;
             # the deferred build wires the remaining per-session callbacks.
@@ -1017,6 +1031,9 @@ def _(rid, params: dict) -> dict:
                 todo_state=_todo_state_from_history(history),
                 explicit_cwd=bool(profile_resume_cwd),
             )
+            record["source"] = _persisted_session_creation_source(
+                found, fallback=resume_client_surface
+            )
             record.update(_publication_capability)
             record["conversation_root_id"] = _publication_root
             record["artifact_profile"] = _response_profile_name(profile)
@@ -1056,7 +1073,10 @@ def _(rid, params: dict) -> dict:
         # _session_resume_lock across it would stall session.close on the main
         # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
         sid = uuid.uuid4().hex[:8]
-        source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+        source = resume_client_surface
+        creation_source = _persisted_session_creation_source(
+            found, fallback=resume_client_surface
+        )
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         _enable_gateway_prompts()
         home_token = (
@@ -1108,10 +1128,10 @@ def _(rid, params: dict) -> dict:
                     target,
                     session_id=target,
                     session_db=db,
-                    platform_override=source,
+                    platform_override=resume_client_surface,
                     artifact_delivery_version=_publication_version,
                     context_cwd_is_launch_artifact=(
-                        source in _LAUNCH_CWD_NOT_A_WORKSPACE
+                        resume_client_surface in _LAUNCH_CWD_NOT_A_WORKSPACE
                         and not profile_resume_cwd
                     ),
                     **stored_runtime_overrides,
@@ -1163,7 +1183,8 @@ def _(rid, params: dict) -> dict:
                         cols=cols,
                         cwd=profile_resume_cwd,
                         session_db=db,
-                        source=source,
+                        source=creation_source,
+                        client_source=resume_client_surface,
                         explicit_cwd=bool(profile_resume_cwd),
                         profile_home=str(profile_home) if profile_home else None,
                         create_reasoning_override=eager_create_reasoning,

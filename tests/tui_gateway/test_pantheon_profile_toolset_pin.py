@@ -233,6 +233,233 @@ def test_pantheon_persisted_session_resume_eager_build_honors_pin(tmp_path, monk
         reset_hermes_home_override(home_token)
 
 
+def test_tui_db_session_resume_pantheon_honors_pin(tmp_path, monkeypatch):
+    """Desktop/TUI-born row; Pantheon resume must apply profile pin for this turn."""
+    import os
+    import uuid
+
+    import yaml
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    cfg = {
+        "model": {"default": "test-model-live", "provider": "custom:test"},
+        "custom_providers": [
+            {
+                "name": "test",
+                "base_url": "https://example.invalid/v1",
+                "api_key": "sk-test-not-real",
+                "api_mode": "chat_completions",
+            }
+        ],
+        "platform_toolsets": {"cli": ["hermes-cli"]},
+        "tools": {"enabled_toolsets": ["file", "terminal", "memory", "web"]},
+    }
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    home_token = set_hermes_home_override(str(home))
+    for var in list(os.environ):
+        if var.endswith("_API_KEY") or var in ("OPENROUTER_KEY", "NOUS_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
+    monkeypatch.setattr(server, "_db", None, raising=False)
+    monkeypatch.setattr(server, "_hermes_home", str(home), raising=False)
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+
+    sid = uuid.uuid4().hex[:12]
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session(
+        sid,
+        source="desktop",
+        model="test-model-live",
+        model_config={
+            "model": "test-model-live",
+            "provider": "custom:test",
+            "base_url": "https://example.invalid/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    db.close()
+
+    def _fake_agent(**kwargs):
+        return types.SimpleNamespace(
+            enabled_toolsets=kwargs.get("enabled_toolsets"),
+            model=kwargs.get("model"),
+            provider=kwargs.get("provider"),
+            session_id=kwargs.get("session_id"),
+            _memory_manager=MagicMock(),
+            _last_flushed_db_idx=0,
+            close=lambda: None,
+        )
+
+    server._sessions.clear()
+    with (
+        patch("hermes_cli.mcp_startup.wait_for_mcp_discovery"),
+        patch("tui_gateway.entry.wait_for_mcp_discovery"),
+        patch("run_agent.AIAgent", side_effect=_fake_agent),
+    ):
+        resp = server.handle_request(
+            {
+                "id": "resume-tui-as-pantheon",
+                "method": "session.resume",
+                "params": {
+                    "session_id": sid,
+                    "source": "pantheon",
+                    "eager_build": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+    try:
+        assert "error" not in resp, resp.get("error")
+        live_sid = resp["result"]["session_id"]
+        live = server._sessions[live_sid]
+        assert live.get("source") == "desktop"
+        assert live.get("client_source") == "pantheon"
+        enabled = set(getattr(live["agent"], "enabled_toolsets", []) or [])
+        assert "file" in enabled
+        assert "browser" not in enabled
+    finally:
+        live_sid = (resp.get("result") or {}).get("session_id")
+        if live_sid:
+            server.handle_request(
+                {
+                    "id": "close-cross",
+                    "method": "session.close",
+                    "params": {"session_id": live_sid},
+                }
+            )
+        reset_hermes_home_override(home_token)
+
+
+def test_live_desktop_session_resume_pantheon_rebuilds_pin(tmp_path, monkeypatch, pin_config):
+    """Fast-path reuse: Pantheon resume rebinds client surface and toolsets."""
+    import os
+
+    import yaml
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    cfg = dict(pin_config)
+    cfg.update(
+        {
+            "model": {"default": "test-model-live", "provider": "custom:test"},
+            "custom_providers": [
+                {
+                    "name": "test",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key": "sk-test-not-real",
+                    "api_mode": "chat_completions",
+                }
+            ],
+        }
+    )
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    home_token = set_hermes_home_override(str(home))
+    for var in list(os.environ):
+        if var.endswith("_API_KEY") or var in ("OPENROUTER_KEY", "NOUS_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
+    monkeypatch.setattr(server, "_db", None, raising=False)
+    monkeypatch.setattr(server, "_hermes_home", str(home), raising=False)
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+
+    stored = "stored-desktop-chat"
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session(
+        stored,
+        source="desktop",
+        model="test-model-live",
+        model_config={
+            "model": "test-model-live",
+            "provider": "custom:test",
+            "base_url": "https://example.invalid/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    db.close()
+
+    agents_built: list[set[str]] = []
+
+    def _fake_agent(**kwargs):
+        toolsets = set(kwargs.get("enabled_toolsets") or [])
+        agents_built.append(toolsets)
+        return types.SimpleNamespace(
+            enabled_toolsets=list(toolsets),
+            model=kwargs.get("model"),
+            provider=kwargs.get("provider"),
+            session_id=kwargs.get("session_id"),
+            _memory_manager=MagicMock(),
+            _last_flushed_db_idx=0,
+            close=lambda: None,
+        )
+
+    server._sessions.clear()
+    with (
+        patch("hermes_cli.mcp_startup.wait_for_mcp_discovery"),
+        patch("tui_gateway.entry.wait_for_mcp_discovery"),
+        patch("run_agent.AIAgent", side_effect=_fake_agent),
+    ):
+        first = server.handle_request(
+            {
+                "id": "resume-desktop",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stored,
+                    "source": "desktop",
+                    "eager_build": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+        assert "error" not in first, first.get("error")
+        live_sid = first["result"]["session_id"]
+        assert agents_built
+        assert "browser" in agents_built[0] or len(agents_built[0]) > 5
+
+        second = server.handle_request(
+            {
+                "id": "resume-pantheon-fast",
+                "method": "session.resume",
+                "params": {
+                    "session_id": stored,
+                    "source": "pantheon",
+                    "eager_build": True,
+                    "omit_messages": True,
+                },
+            }
+        )
+    try:
+        assert "error" not in second, second.get("error")
+        assert second["result"]["session_id"] == live_sid
+        live = server._sessions[live_sid]
+        assert live.get("client_source") == "pantheon"
+        enabled = set(getattr(live["agent"], "enabled_toolsets", []) or [])
+        assert "file" in enabled
+        assert "browser" not in enabled
+        assert len(agents_built) >= 2
+    finally:
+        server.handle_request(
+            {
+                "id": "close-fast",
+                "method": "session.close",
+                "params": {"session_id": live_sid},
+            }
+        )
+        reset_hermes_home_override(home_token)
+
+
 def test_tui_persisted_session_resume_ignores_profile_pin(tmp_path, monkeypatch):
     """Same profile pin in config; non-pantheon resume keeps platform toolsets."""
     import os
