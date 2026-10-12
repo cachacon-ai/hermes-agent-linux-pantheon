@@ -68,6 +68,16 @@ def _messages():
 
 
 class TestWorkerTeardownOnCeiling:
+    def test_grace_env_override_controls_join_not_ceiling_cap(self):
+        from agent.conversation_compression import _cancelled_worker_teardown_grace_seconds
+
+        assert _cancelled_worker_teardown_grace_seconds(0.2) == 0.2
+        with patch.dict(
+            os.environ,
+            {"HERMES_COMPRESSION_CANCELLED_WORKER_GRACE_SECONDS": "2.5"},
+        ):
+            assert _cancelled_worker_teardown_grace_seconds(0.2) == 2.5
+
     def test_cooperative_worker_joined_within_grace(self):
         """A worker that exits promptly after cancel is joined on the
         total-ceiling path; the lease is released normally (no retention) —
@@ -96,15 +106,21 @@ class TestWorkerTeardownOnCeiling:
             return (original, "late")
 
         fence = CompressionCommitFence()
-        msgs, prompt = run_compress_context_with_progress_timeout(
-            worker=cooperative_worker,
-            messages=original,
-            system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.1,
-            total_ceiling_seconds=0.2,
-            fence=fence,
-            stall_fallback=False,
-        )
+        # Ceiling is intentionally tiny; explicit grace must exceed it so the
+        # cooperative worker's post-cancel unwind (0.08s) is joined reliably.
+        with patch.dict(
+            os.environ,
+            {"HERMES_COMPRESSION_CANCELLED_WORKER_GRACE_SECONDS": "5"},
+        ):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=cooperative_worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.1,
+                total_ceiling_seconds=0.2,
+                fence=fence,
+                stall_fallback=False,
+            )
         # The bounded-grace join must have reaped the cooperative worker
         # BEFORE the host returned.
         assert worker_done.is_set(), (

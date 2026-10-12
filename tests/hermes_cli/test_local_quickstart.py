@@ -152,6 +152,27 @@ def test_quickstart_skips_satisfied_legs(client, monkeypatch):
     assert calls == ["assign"] or calls[-1] == "assign"
 
 
+@pytest.fixture(autouse=True)
+def _quickstart_catalog_preflight(monkeypatch, request):
+    """Keep quickstart POST tests hardware-agnostic unless they assert preflight failure."""
+    if request.node.name == "test_quickstart_refuses_when_nothing_fits":
+        return
+    from hermes_cli.local_runtime.catalog import VariantChoice
+
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.catalog.select_variant",
+        lambda entry, budget: VariantChoice(
+            variant=entry.variants[0],
+            zero_spill=True,
+            reason_key="best-fits",
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.web_routers.local_models._engine_too_old",
+        lambda min_engine: False,
+    )
+
+
 @pytest.fixture
 def quickstart_ready(monkeypatch):
     """Preflight passes without hardware or network: the runtime reads as

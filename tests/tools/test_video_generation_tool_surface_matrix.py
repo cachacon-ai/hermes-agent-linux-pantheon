@@ -59,6 +59,9 @@ def matrix_env(tmp_path, monkeypatch):
     fake_fal.submit = _submit  # type: ignore
 
     monkeypatch.setitem(__import__("sys").modules, "fal_client", fake_fal)
+    from tests.tools.fal_client_stub import monkeypatch_preserve_fal_client_stub
+
+    monkeypatch_preserve_fal_client_stub(monkeypatch)
 
     # httpx stub for xAI
     import httpx
