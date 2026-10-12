@@ -41,13 +41,6 @@ def import_fal_client() -> Any:
 
     Raises :class:`ImportError` if the package is genuinely unavailable.
     """
-    import sys
-
-    # Preserve a test stub across lazy_deps.ensure(), which may import the
-    # real package and clobber sys.modules["fal_client"].
-    stub = sys.modules.get("fal_client")
-    if stub is not None and hasattr(stub, "submit"):
-        return stub
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("image.fal", prompt=False)
@@ -55,9 +48,6 @@ def import_fal_client() -> Any:
         pass
     except Exception as exc:  # noqa: BLE001 — lazy_deps surfaces install hints
         raise ImportError(str(exc))
-    stub = sys.modules.get("fal_client")
-    if stub is not None and hasattr(stub, "submit"):
-        return stub
     import fal_client  # type: ignore  # noqa: WPS433 — intentionally lazy
     return fal_client
 
