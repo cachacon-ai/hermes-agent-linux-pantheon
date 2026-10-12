@@ -21,8 +21,10 @@ jobs:
     # 96 cores clear the floor that the slowest single test file sets (about
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
-    runs-on: ubuntu-latest-96-core
-    timeout-minutes: 30
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # Upstream uses a 96-core runner (~2 min). On ubuntu-latest (4 vCPU) the
+    # suite needs more wall time; override with vars.CI_TEST_TIMEOUT_MINUTES.
+    timeout-minutes: ${{ vars.CI_TEST_TIMEOUT_MINUTES != '' && fromJSON(vars.CI_TEST_TIMEOUT_MINUTES) || 120 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -119,7 +121,9 @@ jobs:
           # across a 6x range. The suite has sufficient concurrency at this
           # size. The remaining time is the slowest files plus the setup.
           # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          # Upstream sets vars.CI_TEST_WORKERS=96 on the large runner; forks
+          # default to 4 parallel test files on standard hosted runners.
+          HERMES_TEST_WORKERS: ${{ vars.CI_TEST_WORKERS || '4' }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
