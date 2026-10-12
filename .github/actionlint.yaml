@@ -1,6 +1,9 @@
 # actionlint knows only GitHub-hosted runner labels. An org admin names the
 # larger runners. Each one therefore reads as "unknown runner label" and hides
 # the real findings, unless this file declares it.
+#
+# Workflows also use vars.CI_LINUX_RUNNER / CI_WINDOWS_RUNNER with a
+# ubuntu-latest / windows-latest fallback; actionlint accepts those defaults.
 self-hosted-runner:
   labels:
     - ubuntu-latest-96-core
