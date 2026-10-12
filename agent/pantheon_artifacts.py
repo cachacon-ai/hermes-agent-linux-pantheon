@@ -445,7 +445,7 @@ def capability_details(profile_home=None):
     home=Path(profile_home or get_hermes_home())
     path=home/'config.yaml'
     try:
-        cfg=yaml.safe_load(path.read_text()) if path.exists() else {}
+        cfg=yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
         cfg=cfg or {}
         if not isinstance(cfg,dict):
             return unavailable('invalid_configuration','The producing profile configuration is invalid.')

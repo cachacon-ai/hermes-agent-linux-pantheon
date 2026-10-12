@@ -92,7 +92,7 @@ def supports_pantheon_dynamic_tools(codex_bin="codex"):
                 thread=False; call=False
                 for path in Path(output).rglob("*.json"):
                     if path.stat().st_size>10*1024*1024: continue
-                    schema=json.loads(path.read_text())
+                    schema=json.loads(path.read_text(encoding="utf-8"))
                     pending=[schema]
                     while pending:
                         node=pending.pop()
