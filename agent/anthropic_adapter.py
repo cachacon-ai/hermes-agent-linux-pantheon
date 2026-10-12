@@ -739,19 +739,20 @@ def build_anthropic_client(
 
     Returns an anthropic.Anthropic instance.
     """
+    # Callable api_key → Entra ID bearer provider path. Route before the SDK
+    # import gate so environments without anthropic installed can still exercise
+    # the bearer-hook wiring in unit tests.
+    if callable(api_key) and not isinstance(api_key, str):
+        return _build_anthropic_client_with_bearer_hook(
+            api_key, base_url, timeout,
+            drop_context_1m_beta=drop_context_1m_beta,
+        )
+
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(
             "The 'anthropic' package is required for the Anthropic provider. "
             "Install it with: pip install 'anthropic>=0.39.0'"
-        )
-
-    # Callable api_key → Entra ID bearer provider path. Delegated to a
-    # helper so the existing static-key code below stays unchanged.
-    if callable(api_key) and not isinstance(api_key, str):
-        return _build_anthropic_client_with_bearer_hook(
-            api_key, base_url, timeout,
-            drop_context_1m_beta=drop_context_1m_beta,
         )
 
     normalize_proxy_env_vars()

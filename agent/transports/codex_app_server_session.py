@@ -83,8 +83,14 @@ def supports_pantheon_dynamic_tools(codex_bin="codex"):
     supported=False
     try:
         with tempfile.TemporaryDirectory(prefix="hermes-codex-protocol-") as output:
-            result=subprocess.run([executable,"app-server","generate-json-schema","--experimental","--out",output],
-                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10,check=False)
+            result=subprocess.run(
+                [executable, "app-server", "generate-json-schema", "--experimental", "--out", output],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
             if result.returncode==0:
                 # Exact schema fields, not the binary version label, establish
                 # that this installation knows the experimental contract.
