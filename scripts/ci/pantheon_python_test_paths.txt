@@ -11,6 +11,9 @@ hermes_cli/web_server.py
 hermes_cli/web_routers/
 agent/conversation_compression.py
 run_agent.py
+scripts/ci/
+tests/acp/test_session.py
+tests/ci/test_classify_changes.py
 tests/tui_gateway/test_pantheon_profile_toolset_pin.py
 tests/tui_gateway/test_pantheon_profile_resume_fixes.py
 tests/agent/test_pantheon_artifacts.py

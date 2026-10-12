@@ -223,11 +223,17 @@ def _in_pantheon_scope(path: str) -> bool:
 
 
 def pantheon_python_scope(files: list[str]) -> bool:
-    """True when every Python-relevant change is inside the Pantheon path set."""
-    relevant = [f.strip() for f in files if f.strip() and not _py_irrelevant(f.strip())]
-    if not relevant:
+    """True when every changed path is inside the Pantheon CI scope set.
+
+    Unlike the ``python`` lane (denylist / fail-open), this is a strict
+    allowlist: docs-only, frontend-only, and shared-core edits outside the
+    Pantheon slice must return ``False`` so CI widens to the full pytest
+    suite. An empty diff stays ``True`` (fail-open with the rest of classify).
+    """
+    paths = [f.strip() for f in files if f.strip()]
+    if not paths:
         return True
-    return all(_in_pantheon_scope(p) for p in relevant)
+    return all(_in_pantheon_scope(p) for p in paths)
 
 
 def _is_ci_review(p: str) -> bool:

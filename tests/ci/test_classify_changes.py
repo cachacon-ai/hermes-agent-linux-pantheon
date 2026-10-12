@@ -45,10 +45,11 @@ DEFAULT = {
     "rust": True,
     "mcp_catalog": False,
     "ci_review": True,
+    "pantheon_python_scope": True,
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, pantheon_python_scope=False) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -74,12 +75,16 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "rust": rust,
         "mcp_catalog": mcp_catalog,
         "ci_review": ci_review,
+        "pantheon_python_scope": pantheon_python_scope,
     }
 
 
 CASES = {
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
-    "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
+    "python source → python": (
+        ["run_agent.py"],
+        _lanes(python=True, scan=True, pantheon_python_scope=True),
+    ),
     # pyproject.toml declares the pytest markers the OS lanes select on, so it
     # also re-arms the desktop_updater integration tests (fail-open).
     "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True)),
@@ -144,7 +149,10 @@ CASES = {
         ["scripts/tests/test-install-ps1-longpath.ps1"],
         _lanes(python=True, installer=True),
     ),
-    "python source alone → no installer lane": (["run_agent.py"], _lanes(python=True, scan=True)),
+    "python source alone → no installer lane": (
+        ["run_agent.py"],
+        _lanes(python=True, scan=True, pantheon_python_scope=True),
+    ),
     # The Windows desktop-update hand-off is a PowerShell integration surface:
     # its tests spawn the real script and poll its loopback server. They run
     # when the script, the Electron side that launches it, or their own test
@@ -161,7 +169,10 @@ CASES = {
         ["apps/desktop/electron/updater-process.ts"],
         _lanes(frontend=True, desktop_updater=True),
     ),
-    "python source alone → no desktop_updater lane": (["hermes_state.py"], _lanes(python=True, scan=True)),
+    "python source alone → no desktop_updater lane": (
+        ["hermes_state.py"],
+        _lanes(python=True, scan=True, pantheon_python_scope=True),
+    ),
     # `.rs` lives under apps/, so it matches `frontend` too. That lane builds
     # TypeScript and cannot notice a Rust error — before `rust` existed it was
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
@@ -266,6 +277,26 @@ CASES = {
     "action change → all": ([".github/actions/detect-changes/action.yml"], DEFAULT),
     "empty diff → all": ([], DEFAULT),
     "blank lines → all": (["", "  "], DEFAULT),
+    "pantheon test file only → pantheon scope": (
+        ["tests/agent/test_pantheon_artifacts.py"],
+        _lanes(python=True, python_prod=False, scan=True, pantheon_python_scope=True),
+    ),
+    "pantheon CI classifier → pantheon scope": (
+        ["scripts/ci/classify_changes.py"],
+        _lanes(python=True, scan=True, pantheon_python_scope=True),
+    ),
+    "pantheon compression test → pantheon scope": (
+        ["tests/agent/test_compression_concurrent_fork.py"],
+        _lanes(python=True, python_prod=False, scan=True, pantheon_python_scope=True),
+    ),
+    "acp session test → pantheon scope": (
+        ["tests/acp/test_session.py"],
+        _lanes(python=True, python_prod=False, scan=True, pantheon_python_scope=True),
+    ),
+    "pantheon product + test mix → pantheon scope": (
+        ["agent/pantheon_artifacts.py", "tests/agent/test_pantheon_artifacts.py"],
+        _lanes(python=True, scan=True, pantheon_python_scope=True),
+    ),
 }
 
 
