@@ -4067,12 +4067,94 @@ def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
     _emit("session.info", sid, _session_info(agent, session))
 
 
-def _session_source(session: dict | None) -> str:
+def _session_creation_source(session: dict | None) -> str:
+    """Immutable creation label persisted to state.db on first row write."""
     if session:
         source = str(session.get("source") or "").strip()
         if source:
             return source
     return _resolve_session_platform()
+
+
+def _persisted_session_creation_source(
+    row: dict | None, *, fallback: str
+) -> str:
+    if row:
+        created = str(row.get("source") or "").strip()
+        if created:
+            return created
+    return fallback
+
+
+def _session_source(session: dict | None) -> str:
+    """Client surface for agent/tooling resolution (may differ from DB source)."""
+    if session:
+        client = str(session.get("client_source") or "").strip()
+        if client:
+            return client
+    return _session_creation_source(session)
+
+
+def _bind_client_surface(session: dict, explicit_source: str | None) -> bool:
+    """Record the declaring client's surface for this live runtime.
+
+    ``source`` on the session dict stays the creation label; ``client_source``
+    tracks the most recent ``session.create`` / ``session.resume`` surface
+    so a Pantheon reopen of a desktop-born chat still honors the profile pin.
+    """
+    resolved = _resolve_session_source(
+        str(explicit_source or "").strip() or None
+    )
+    previous = _session_source(session)
+    session["client_source"] = resolved
+    return previous != resolved
+
+
+def _maybe_rebuild_agent_for_client_surface(sid: str, session: dict) -> None:
+    """Swap the live agent when the client surface changes tool posture."""
+    if session.get("lazy") or session.get("running"):
+        session["_pending_client_surface_rebuild"] = True
+        return
+    agent = session.get("agent")
+    if agent is None:
+        return
+    ready = session.get("agent_ready")
+    if ready is not None and not ready.is_set():
+        return
+    key = str(session.get("session_key") or sid)
+    try:
+        tokens = _set_session_context(key)
+        try:
+            kw: dict = {
+                "session_id": session.get("resume_session_id") or key,
+                "platform_override": _session_source(session),
+                "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(
+                    session
+                ),
+            }
+            resume_overrides = session.get("resume_runtime_overrides")
+            if (
+                isinstance(resume_overrides, dict)
+                and resume_overrides
+                and _overrides_have_routable_provider(resume_overrides)
+            ):
+                kw.update(resume_overrides)
+            elif override := session.get("model_override"):
+                kw["model_override"] = override
+            new_agent = _make_agent(sid, key, **kw)
+        finally:
+            _clear_session_context(tokens)
+        session["agent"] = new_agent
+        session.pop("_pending_client_surface_rebuild", None)
+        try:
+            if hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+    except Exception:
+        logger.warning(
+            "client-surface agent rebuild failed for %s", sid, exc_info=True
+        )
 
 
 def _register_session_cwd(session: dict | None) -> None:
@@ -4224,7 +4306,7 @@ def _ensure_session_db_row(session: dict) -> bool:
     try:
         db.create_session(
             key,
-            source=_session_source(session),
+            source=_session_creation_source(session),
             model=row_model,
             model_config=model_config or None,
             parent_session_id=parent_session_id,
@@ -9626,6 +9708,7 @@ def _init_session(
     cwd: str | None = None,
     session_db=None,
     source: str | None = None,
+    client_source: str | None = None,
     profile_home: str | None = None,
     explicit_cwd: bool = False,
     *,
@@ -9654,6 +9737,9 @@ def _init_session(
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
             "source": _resolve_session_source(source),
+            "client_source": _resolve_session_source(
+                client_source if client_source is not None else source
+            ),
             "tool_progress_mode": _load_tool_progress_mode(),
             "edit_snapshots": {},
             "tool_started_at": {},
@@ -11297,6 +11383,7 @@ def _deferred_session_record(
         "show_reasoning": _load_show_reasoning(),
         "slash_worker": None,
         "source": source,
+        "client_source": source,
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
         "todo_state": todo_state,
