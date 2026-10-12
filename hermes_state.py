@@ -7304,9 +7304,18 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
                     )
                     if existing_cfg:
                         merged = dict(existing_cfg)
+                        reset_lineage = "_reset_from" in existing_cfg
                         for key, value in model_config.items():
                             if value is None:
                                 continue
+                            if reset_lineage:
+                                # Gateway reset rows start marker-only; the first
+                                # agent upsert enriches them, but bare retries
+                                # must not clobber established keys (#PAN-44).
+                                if key == "_reset_from":
+                                    continue
+                                if key in merged:
+                                    continue
                             merged[key] = value
                         effective_model_config = merged
             conn.execute(

@@ -12,8 +12,33 @@ Upstream Hermes CI assumes Nous Research org-hosted **larger runners** (`ubuntu-
 | `CI_TEST_WORKERS` | `4` | `4` (matches standard 4 vCPU Linux runner) | `96` on the 96-core test runner |
 | `CI_TEST_TIMEOUT_MINUTES` | `120` | `120` or higher if the suite is still tight | `30` on the 96-core runner |
 | `CI_PRIMARY_REPOSITORY` | automation **off** | Set to `owner/repo` only when you want publish/deploy/skills automation on that repo | `NousResearch/hermes-agent` |
+| `CI_PYTHON_MODE` | PRs: `pantheon`; push: `full` (see below) | `pantheon` | `full` (or unset — upstream runs the whole suite) |
+| `CI_PYTHON_TEST_PATHS` | ignored unless `CI_PYTHON_MODE=paths` | Newline or comma-separated roots/files for `scripts/run_tests.sh` | — |
+| `CI_PYTHON_EXTRA_ARGS` | ignored | Optional extra args forwarded to `run_tests.sh` (e.g. `-k pantheon`) | — |
+| `CI_PYTHON_FULL_CRON` | `0 6 * * *` in workflow | Document only — edit `.github/workflows/tests.yml` `schedule` to match | — |
 
 Set variables under **Settings → Secrets and variables → Actions → Variables**.
+
+## Python test scope (`CI_PYTHON_MODE`)
+
+The main pytest job (`.github/workflows/tests.yml`) invokes `scripts/ci/run_python_tests_ci.sh`, which reads `CI_PYTHON_MODE`:
+
+| Mode | Behavior |
+|------|----------|
+| `full` | `scripts/run_tests.sh` with no path filter (entire suite). |
+| `pantheon` | Only paths under `tests/` listed in `scripts/ci/pantheon_python_test_paths.txt`. |
+| `paths` | Uses `CI_PYTHON_TEST_PATHS` (comma- or newline-separated). |
+
+**Defaults when `CI_PYTHON_MODE` is unset:**
+
+- `pull_request` events → `pantheon` (fast fork PRs).
+- Other events (e.g. `push` to `main`) → `full`.
+
+**Scheduled and manual full runs:** `tests.yml` also defines a daily `schedule` (06:00 UTC) and `workflow_dispatch` with `python_mode` defaulting to `full`. Both run the same job definition as CI PRs, with `CI_PYTHON_MODE=full`.
+
+**Classifier widening:** `scripts/ci/classify_changes.py` exposes `pantheon_python_scope`. When a PR changes Python files *outside* the product + test prefixes in `pantheon_python_test_paths.txt`, the orchestrator passes `python_mode: full` into the tests workflow so shared-core edits are not validated by the Pantheon slice alone.
+
+PRs that touch only `website/` (and other `_PY_SKIP` trees) already skip the Python lane via the existing `python` classifier gate.
 
 ## Python test job timing
 

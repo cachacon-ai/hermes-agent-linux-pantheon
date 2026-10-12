@@ -63,6 +63,11 @@ outputs:
   ci_review_files:
     description: JSON list of CI-sensitive files changed by the pull request.
     value: ${{ steps.classify.outputs.ci_review_files }}
+  pantheon_python_scope:
+    description: >-
+      True when every Python-relevant changed file is inside the Pantheon CI
+      path set (scripts/ci/pantheon_python_test_paths.txt).
+    value: ${{ steps.classify.outputs.pantheon_python_scope }}
 
 runs:
   using: composite

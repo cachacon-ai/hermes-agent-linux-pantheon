@@ -35,6 +35,9 @@ Lanes:
   lives under ``apps/``, so without this lane a Rust change matched ``frontend``
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
+* ``pantheon_python_scope`` — every Python-relevant changed path sits inside
+  ``scripts/ci/pantheon_python_test_paths.txt`` (used to widen PR pytest to
+  full when a change touches shared core outside the Pantheon slice).
 
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
@@ -65,6 +68,8 @@ import json
 import os
 import subprocess
 import sys
+from functools import lru_cache
+from pathlib import Path
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
@@ -196,6 +201,35 @@ def _is_rust(p: str) -> bool:
     )
 
 
+@lru_cache(maxsize=1)
+def _pantheon_scope_prefixes() -> tuple[str, ...]:
+    path = Path(__file__).resolve().parent / "pantheon_python_test_paths.txt"
+    prefixes: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            prefixes.append(line)
+    return tuple(prefixes)
+
+
+def _in_pantheon_scope(path: str) -> bool:
+    for prefix in _pantheon_scope_prefixes():
+        if prefix.endswith("/"):
+            if path == prefix.rstrip("/") or path.startswith(prefix):
+                return True
+        elif path == prefix or path.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
+def pantheon_python_scope(files: list[str]) -> bool:
+    """True when every Python-relevant change is inside the Pantheon path set."""
+    relevant = [f.strip() for f in files if f.strip() and not _py_irrelevant(f.strip())]
+    if not relevant:
+        return True
+    return all(_in_pantheon_scope(p) for p in relevant)
+
+
 def _is_ci_review(p: str) -> bool:
     if p in _CI_REVIEW_FILES or p.startswith(_CI_REVIEW_PATHS):
         return True
@@ -235,7 +269,8 @@ def classify(files: list[str]) -> dict[str, bool]:
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
-        "nix": python_prod or frontend or any(_is_nix(f) for f in files)
+        "nix": python_prod or frontend or any(_is_nix(f) for f in files),
+        "pantheon_python_scope": pantheon_python_scope(files),
     }
     if not files or any(f.startswith(".github/") for f in files):
         ret["python"] = True
@@ -253,6 +288,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["rust"] = True
         ret["nix"] = True
         ret["ci_review"] = True
+        ret["pantheon_python_scope"] = True
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return ret

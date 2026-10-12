@@ -2,6 +2,28 @@ name: Tests
 
 on:
   workflow_call:
+    inputs:
+      python_mode:
+        description: >-
+          Override CI_PYTHON_MODE for this run (full, pantheon, paths). Empty
+          uses repository variables and PR defaults.
+        required: false
+        type: string
+        default: ""
+  schedule:
+    # Overridable via repository variable CI_PYTHON_FULL_CRON (default 06:00 UTC).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      python_mode:
+        description: Python test mode (full, pantheon, paths)
+        required: false
+        default: full
+        type: choice
+        options:
+          - full
+          - pantheon
+          - paths
 
 permissions:
   contents: read
@@ -95,11 +117,24 @@ jobs:
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
         #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
+        # CI_PYTHON_MODE (repository variable): full | pantheon | paths.
+        # Pantheon path list: scripts/ci/pantheon_python_test_paths.txt.
+        # Scheduled and workflow_dispatch runs default to full; PRs default to
+        # pantheon when the variable is unset (see scripts/ci/run_python_tests_ci.sh).
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          if [[ -n "${{ inputs.python_mode }}" ]]; then
+            export CI_PYTHON_MODE="${{ inputs.python_mode }}"
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            export CI_PYTHON_MODE=full
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            export CI_PYTHON_MODE="${{ github.event.inputs.python_mode || 'full' }}"
+          elif [[ -n "${{ vars.CI_PYTHON_MODE }}" ]]; then
+            export CI_PYTHON_MODE="${{ vars.CI_PYTHON_MODE }}"
+          fi
+          export CI_PYTHON_TEST_PATHS="${{ vars.CI_PYTHON_TEST_PATHS }}"
+          export CI_PYTHON_EXTRA_ARGS="${{ vars.CI_PYTHON_EXTRA_ARGS }}"
+          scripts/ci/run_python_tests_ci.sh
         env:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file

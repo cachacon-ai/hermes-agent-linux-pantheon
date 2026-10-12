@@ -4998,6 +4998,24 @@ def compress_context(
                     # transcript back instead of leaving the failed attempt's
                     # compacted snapshot in place.
                     old_session_id = agent.session_id
+                    _rotation_parent_model_config_snapshot = None
+                    try:
+                        _parent_cfg_row = (
+                            agent._session_db.get_session(old_session_id) or {}
+                        )
+                        _raw_parent_cfg = _parent_cfg_row.get("model_config")
+                        if isinstance(_raw_parent_cfg, str) and _raw_parent_cfg.strip():
+                            _parsed_parent_cfg = json.loads(_raw_parent_cfg)
+                            if isinstance(_parsed_parent_cfg, dict):
+                                _rotation_parent_model_config_snapshot = dict(
+                                    _parsed_parent_cfg
+                                )
+                        elif isinstance(_raw_parent_cfg, dict):
+                            _rotation_parent_model_config_snapshot = dict(
+                                _raw_parent_cfg
+                            )
+                    except Exception:
+                        _rotation_parent_model_config_snapshot = None
                     current_idx = getattr(agent, "_persist_user_message_idx", None)
                     persisted_history = (
                         messages[:current_idx]
@@ -5378,6 +5396,21 @@ def compress_context(
                                 "_proactive_prune_rearm_tokens"
                             ]
                         )
+                    _cfg_snapshot = locals().get(
+                        "_rotation_parent_model_config_snapshot"
+                    )
+                    if _cfg_snapshot is not None:
+                        try:
+                            agent._session_db.update_session_meta(
+                                agent.session_id,
+                                json.dumps(_cfg_snapshot),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "could not restore parent model_config after "
+                                "failed compression publish",
+                                exc_info=True,
+                            )
                 elif (
                     in_place
                     and split_status != "in_place_committed"
