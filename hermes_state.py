@@ -6533,6 +6533,13 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         :func:`refuse_deleted_wal_generation` on open, where we must see
         *foreign* deleted holders before ``sqlite3.connect`` mints a new WAL.
         """
+        if not self._wal_active:
+            # DELETE/truncate containment: no live WAL generation on this
+            # handle. Stale ``_db_sidecar_identity`` from an earlier WAL
+            # open must not trip generation-loss halts after
+            # ``PRAGMA journal_mode=DELETE`` (FTS projection tests and field
+            # delete-mode deployments).
+            return False
         recorded = self._db_sidecar_identity or {}
         base = os.fspath(self.db_path)
         if recorded:
@@ -6540,12 +6547,6 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
                 current = _stat_db_file_identity(Path(base + suffix))
                 if current is None or current != recorded_ident:
                     return True
-            return False
-        if not self._wal_active:
-            # No WAL on this handle (journal_mode=delete/truncate fallback):
-            # there is no sidecar generation to lose, and probing every write
-            # would put a /proc walk on the hot path of exactly the
-            # delete-mode deployments the field report used as containment.
             return False
         if sys.platform.startswith("linux"):
             watched = _watched_sqlite_sidecar_paths(self.db_path)
