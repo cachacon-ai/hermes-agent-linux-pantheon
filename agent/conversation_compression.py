@@ -1643,6 +1643,7 @@ def run_compress_context_with_progress_timeout(
             except concurrent.futures.TimeoutError:
                 waited = time.monotonic() - wait_started
                 since_progress = fence.seconds_since_progress()
+                remaining_ceiling = ceiling - waited
                 if (
                     not fence.deadline_exceeded
                     and since_progress < idle
@@ -1656,6 +1657,20 @@ def run_compress_context_with_progress_timeout(
                         since_progress,
                         ceiling,
                     )
+                    continue
+                # #97488 / #76354 S3: on ceiling-tight attempts (ceiling not
+                # much larger than idle), a streaming worker must not take
+                # the idle-stall path while the total ceiling is still
+                # binding — scheduler starvation can look like one idle
+                # window of silence (slice 6/8). Long-ceiling attempts
+                # (silence after early progress) still idle out normally.
+                ceiling_tight = idle > 0 and (ceiling / idle) <= 5.0
+                if (
+                    fence.progress_observed
+                    and waited < ceiling
+                    and since_progress >= idle
+                    and ceiling_tight
+                ):
                     continue
                 break
 
@@ -1764,22 +1779,20 @@ def run_compress_context_with_progress_timeout(
         # so a NEW compressor can acquire the lock immediately (no ABA: the
         # DB release is holder-scoped).
         handled_exit = True
-        # #97488 teardown: give the cancelled worker a bounded grace to exit
-        # before this host moves on. The worker checks the poison fence between
-        # provider phases, so a cooperative worker exits quickly; an
-        # uninterruptible provider call is orphaned after the grace elapses.
-        #
-        # Total-ceiling path: use the full configured grace (override via
-        # HERMES_COMPRESSION_CANCELLED_WORKER_GRACE_SECONDS on slow CI).
-        #
-        # Idle-stall path: cap join so stall-fallback retry stays prompt
-        # (#76354 S3), but still reap cooperative workers when the idle
-        # budget expired only because the worker thread was starved (false
-        # idle before the total ceiling — Pantheon CI slice 6/8).
-        grace = _cancelled_worker_teardown_grace_seconds(ceiling)
-        join_grace = grace if total_exhausted else min(grace, float(idle) + 0.15)
-        worker_exited = _join_cancelled_worker(future, join_grace)
+        # #97488 teardown (total-ceiling path only): give the cancelled worker
+        # a bounded grace to actually exit before this host moves on. The
+        # worker checks the poison fence between provider phases, so a
+        # cooperative worker exits quickly; an uninterruptible provider call
+        # is orphaned behind the fence after the grace elapses. The
+        # idle-stall path intentionally skips the join: its worker is by
+        # definition silent/hung, the stall-fallback retry below needs a
+        # prompt host return (pinned by the #76354 S3 latency contract), and
+        # the fence poison + attempt-generation supersession already protect
+        # state against its late unwind. Ceiling-bound false-idles are
+        # prevented in the wait loop above (remaining_ceiling <= idle).
         if total_exhausted:
+            grace = _cancelled_worker_teardown_grace_seconds(ceiling)
+            worker_exited = _join_cancelled_worker(future, grace)
             if worker_exited:
                 # The worker provably exited: no in-flight provider call can
                 # outlive this attempt, so the total-ceiling lease retention
@@ -1792,7 +1805,7 @@ def run_compress_context_with_progress_timeout(
                     "result will be discarded); retaining the session "
                     "compression lease until it exits so no new attempt "
                     "overlaps it",
-                    join_grace,
+                    grace,
                 )
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started

@@ -135,18 +135,18 @@ class TestWorkerTeardownOnCeiling:
         # Teardown proved quiescence, so the lease must NOT stay retained.
         assert fence._retain_cancelled_lock_until_worker_done is False
 
-    def test_cooperative_worker_joined_when_idle_fires_before_ceiling(self):
-        """A loaded CI runner can expire the idle budget before the total
-        ceiling even though the worker is cooperative (#97488). The host must
-        still join the cancelled worker (with a capped grace), not return
-        while it is unwinding."""
+    def test_cooperative_worker_joined_when_scheduler_blips_before_ceiling(self):
+        """Scheduler starvation can look like idle stall while the total
+        ceiling is still binding (#97488). The host must wait for the ceiling,
+        join on the total-ceiling path, and not return before the worker
+        unwinds."""
         original = [{"role": "user", "content": "keep"}]
         worker_done = threading.Event()
 
         def cooperative_worker(fence: CompressionCommitFence):
             fence.touch_progress()
             # Scheduler starvation: no progress touch until after the idle
-            # budget would have fired if the host only watched ceiling.
+            # budget would have fired if the host treated this as idle-stall.
             time.sleep(0.12)
             while True:
                 if fence.is_cancelled:
@@ -172,8 +172,8 @@ class TestWorkerTeardownOnCeiling:
                 stall_fallback=False,
             )
         assert worker_done.is_set(), (
-            "idle-stall path must still join cooperative cancelled workers "
-            "(scheduler false-idle before ceiling — #97488)"
+            "ceiling-bound false-idle must still join cooperative workers "
+            "(#97488 / #76354 S3)"
         )
         assert msgs == [{"role": "user", "content": "keep"}]
         assert prompt in ("fallback", "late")
