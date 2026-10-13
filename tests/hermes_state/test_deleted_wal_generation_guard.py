@@ -86,6 +86,28 @@ def test_clean_open_and_second_open_still_work(tmp_path, force_wal):
         reopened.close()
 
 
+def test_delete_journal_same_handle_after_wal_phase(tmp_path, force_wal):
+    """DELETE on an open WAL handle must not trip stale sidecar identity (#PAN-92)."""
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    try:
+        applied = db._conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower()
+        if applied != "wal":
+            pytest.skip("WAL unavailable on this SQLite build")
+        db._wal_active = True
+        db.create_session("s1", "cli")
+        db.append_message("s1", role="user", content="wal-phase")
+        _require_wal(db)
+        assert db._db_sidecar_identity, "WAL phase should record sidecar identity"
+        db._conn.execute("PRAGMA journal_mode=DELETE")
+        db._wal_active = False
+        db.append_message("s1", role="user", content="delete-phase")
+        rows = db.get_messages("s1")
+        assert any(m["content"] == "delete-phase" for m in rows)
+    finally:
+        db.close()
+
+
 def test_delete_journal_two_writers_still_work(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes_state, "resolve_journal_mode", lambda: "delete")
     monkeypatch.setattr(
