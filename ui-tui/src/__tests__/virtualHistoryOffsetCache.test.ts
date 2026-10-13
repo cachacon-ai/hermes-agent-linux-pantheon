@@ -539,7 +539,10 @@ describe('useVirtualHistory offset cache reuse', () => {
 
       staleHeights.set(items[0]!.key, 1)
       instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      await delay(40)
+      await vi.waitUntil(
+        () => adjustScrollTop.mock.calls.length === 1 && scroll.getScrollTop() === 6,
+        { interval: 5, timeout: 2_000 }
+      )
 
       expect(adjustScrollTop).toHaveBeenCalledOnce()
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
