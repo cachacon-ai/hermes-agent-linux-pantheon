@@ -623,6 +623,13 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
+from fastapi.exceptions import RequestValidationError  # noqa: E402
+from hermes_cli.web_validation_errors import (  # noqa: E402
+    handle_request_validation_error,
+)
+
+app.add_exception_handler(RequestValidationError, handle_request_validation_error)
+
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
