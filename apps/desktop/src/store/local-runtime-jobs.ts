@@ -116,6 +116,17 @@ export function watchLocalRuntimeJobs() {
   void poll()
 }
 
+/** @internal — vitest isolation: module-level poller state must not leak across cases. */
+export function _resetLocalRuntimeJobWatcherForTests(): void {
+  if (timer !== null) {
+    window.clearTimeout(timer)
+    timer = null
+  }
+
+  polling = false
+  settledNotified.clear()
+}
+
 // Selector: the running download job for a catalog model id, if any.
 export function runningDownloadFor(jobs: readonly LocalRuntimeJob[], modelId: string): LocalRuntimeJob | null {
   return jobs.find(j => j.kind === 'model-download' && j.status === 'running' && j.model_id === modelId) ?? null

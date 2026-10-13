@@ -3,7 +3,7 @@ import { MemoryRouter, useLocation } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
-import { $localRuntimeJobs } from '@/store/local-runtime-jobs'
+import { $localRuntimeJobs, _resetLocalRuntimeJobWatcherForTests } from '@/store/local-runtime-jobs'
 import type { LocalCatalogModel, LocalHardware, LocalModelsStatus, LocalRuntimeJob } from '@/types/hermes'
 
 import { LocalModelsSettings } from './local-models-settings'
@@ -124,15 +124,17 @@ async function renderFullPane() {
 }
 
 beforeEach(() => {
+  _resetLocalRuntimeJobWatcherForTests()
   mocked.getLocalModelsStatus.mockResolvedValue(BASE_STATUS)
   mocked.getLocalHardware.mockResolvedValue(BASE_HARDWARE)
   mocked.getLocalCatalog.mockResolvedValue({ models: [FITTING_MODEL, SPILLED_MODEL, REFUSED_MODEL] })
-  mocked.getLocalModelsJobs.mockResolvedValue({ jobs: [] })
+  mocked.getLocalModelsJobs.mockImplementation(async () => ({ jobs: [...$localRuntimeJobs.get()] }))
   $localRuntimeJobs.set([])
 })
 
 afterEach(() => {
   cleanup()
+  _resetLocalRuntimeJobWatcherForTests()
   vi.clearAllMocks()
 })
 
