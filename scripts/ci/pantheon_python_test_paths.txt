@@ -1,0 +1,28 @@
+# Pantheon CI scope: product + test path prefixes (one per line).
+# Lines under tests/ are passed to scripts/run_tests.sh in pantheon mode.
+# All non-comment lines define the pantheon scope for classify_changes.py.
+tui_gateway/
+agent/pantheon_artifacts.py
+agent/transports/codex_app_server_session.py
+tools/pantheon_tool.py
+hermes_state.py
+gateway/
+hermes_cli/web_server.py
+hermes_cli/web_routers/
+agent/conversation_compression.py
+run_agent.py
+scripts/ci/
+tests/acp/test_session.py
+tests/ci/test_classify_changes.py
+tests/tui_gateway/test_pantheon_profile_toolset_pin.py
+tests/tui_gateway/test_pantheon_profile_resume_fixes.py
+tests/agent/test_pantheon_artifacts.py
+tests/agent/test_pantheon_artifact_executor.py
+tests/agent/test_pantheon_artifact_housekeeping.py
+tests/agent/test_pantheon_artifact_retention.py
+tests/agent/transports/test_pantheon_codex_dynamic.py
+tests/test_tui_gateway_server.py
+tests/gateway/test_resume_command.py
+tests/hermes_cli/test_config_read_guard.py
+tests/tools/test_subprocess_stdin_guard.py
+tests/agent/test_compression_concurrent_fork.py

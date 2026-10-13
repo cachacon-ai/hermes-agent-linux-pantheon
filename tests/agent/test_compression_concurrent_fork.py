@@ -1002,8 +1002,10 @@ def test_rotation_publish_failure_restores_proactive_prune_runway(
     assert agent.context_compressor._proactive_prune_rearm_tokens == 120_000
     assert db.get_messages_as_conversation(parent_sid) == durable_before
     stored_cfg = json.loads(db.get_session(parent_sid)["model_config"])
-    assert stored_cfg["keep"] == "value"
-    assert stored_cfg["_proactive_prune_rearm_tokens"] == 120_000
+    assert stored_cfg == {
+        "keep": "value",
+        "_proactive_prune_rearm_tokens": 120_000,
+    }
 
 
 def test_full_in_place_compression_atomically_clears_durable_prune_runway(

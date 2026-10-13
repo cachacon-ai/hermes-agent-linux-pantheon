@@ -436,17 +436,37 @@ def has_accepted_publication(agent):
 
 def capability_details(profile_home=None):
     """Preflight the actual producer and native protocol without a model call."""
-    from hermes_constants import get_hermes_home
-    import yaml
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from hermes_cli.config import get_active_config_parse_failure, load_config_readonly
+
     def unavailable(code, reason):
         return {"artifact_delivery_version": 0,
                 "artifact_delivery_unavailable_code": code,
                 "artifact_delivery_unavailable_reason": reason}
     home=Path(profile_home or get_hermes_home())
-    path=home/'config.yaml'
     try:
-        cfg=yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-        cfg=cfg or {}
+        if profile_home is not None:
+            _home_token = set_hermes_home_override(str(home))
+            try:
+                cfg = load_config_readonly() or {}
+                if get_active_config_parse_failure():
+                    return unavailable(
+                        "invalid_configuration",
+                        "The producing profile configuration is invalid.",
+                    )
+            finally:
+                reset_hermes_home_override(_home_token)
+        else:
+            cfg = load_config_readonly() or {}
+            if get_active_config_parse_failure():
+                return unavailable(
+                    "invalid_configuration",
+                    "The producing profile configuration is invalid.",
+                )
         if not isinstance(cfg,dict):
             return unavailable('invalid_configuration','The producing profile configuration is invalid.')
         if os.name!='posix' or not hasattr(os,'O_NOFOLLOW'):
@@ -466,7 +486,7 @@ def capability_details(profile_home=None):
             if backend!='local':
                 return unavailable('unsupported_source','The producing terminal backend has no safe file-capture adapter.')
         return {"artifact_delivery_version": 1}
-    except (OSError,ValueError,yaml.YAMLError):
+    except (OSError, ValueError):
         return unavailable('invalid_configuration','The producing profile configuration could not be read.')
 
 
