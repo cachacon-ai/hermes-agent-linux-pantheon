@@ -61,6 +61,12 @@ class TestSpeechInterruptedLatch:
         monkeypatch.setattr(ts.time, "monotonic", lambda: at + ts._INTERRUPT_TTL_S + 1)
         assert ts.take_speech_interrupted() is False
 
+    def test_session_scoped_barge_is_not_consumed_by_another_session(self):
+        ts.mark_speech_interrupted("session-a")
+        assert ts.take_speech_interrupted("session-b") is False
+        assert ts.take_speech_interrupted("session-a") is True
+        assert ts.take_speech_interrupted("session-a") is False
+
 
 # ── Registry + resolver ──────────────────────────────────────────────────
 
@@ -329,6 +335,98 @@ def test_streamer_path_survives_portaudio_write_error(monkeypatch):
     assert done.is_set(), "done event must fire even after PortAudio error"
 
 
+def test_cancelled_portaudio_write_aborts_without_reinitializing(monkeypatch):
+    """A scoped Stop must abort an in-flight direct PCM write and never restart it."""
+    from tools import tts_tool
+    from tools import voice_mode
+
+    class _Fake(ts.StreamingTTSProvider):
+        sample_rate = 24000
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            yield b"\x01\x00" * 50
+
+    sd, out = _sd_mock()
+    q = _drain_queue(["A sentence that is interrupted during playback."])
+    stop, done = threading.Event(), threading.Event()
+    # Exercise the mocked PortAudio branch even on macOS, where production
+    # deliberately selects afplay to avoid triggering the media-library TCC
+    # prompt. No real audio device is opened here.
+    monkeypatch.setattr(tts_tool.platform, "system", lambda: "Linux")
+
+    def _cancel_blocked_write(_pcm):
+        stop.set()
+        voice_mode.stop_playback(stop_event=stop)
+        raise OSError("PortAudio write aborted")
+
+    out.write.side_effect = _cancel_blocked_write
+    with patch("tools.tts_streaming.resolve_streaming_provider", return_value=_Fake({}, {})), \
+         patch.object(tts_tool, "_import_sounddevice", return_value=sd):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    assert out.abort.called, "scoped Stop must abort the registered output stream"
+    assert sd.OutputStream.call_count == 1, "cancelled playback must not reinitialize"
+    assert done.is_set(), "done event must fire after the aborted write"
+
+
+def test_stop_during_portaudio_teardown_aborts_before_unregistering(monkeypatch):
+    """Stop must still reach a stream while normal teardown drains buffered PCM."""
+    from tools import tts_tool
+    from tools import voice_mode
+
+    class _Fake(ts.StreamingTTSProvider):
+        sample_rate = 24000
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            yield b"\x01\x00" * 50
+
+    sd, out = _sd_mock()
+    q = _drain_queue(["A sentence that finishes before teardown begins."])
+    stop, done = threading.Event(), threading.Event()
+    stop_entered, finish_stop = threading.Event(), threading.Event()
+    errors = []
+    monkeypatch.setattr(tts_tool.platform, "system", lambda: "Linux")
+
+    def _blocking_stop():
+        stop_entered.set()
+        finish_stop.wait(timeout=3)
+
+    out.stop.side_effect = _blocking_stop
+    out.abort.side_effect = finish_stop.set
+
+    def _run():
+        try:
+            tts_tool.stream_tts_to_speaker(q, stop, done)
+        except Exception as exc:  # surface worker-thread failures in the test
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    with patch("tools.tts_streaming.resolve_streaming_provider", return_value=_Fake({}, {})), \
+         patch.object(tts_tool, "_import_sounddevice", return_value=sd):
+        worker.start()
+        assert stop_entered.wait(timeout=3), "expected normal stream teardown to begin"
+        stop.set()
+        voice_mode.stop_playback(stop_event=stop)
+        worker.join(timeout=3)
+        # Avoid leaving a blocked daemon behind if the regression is present.
+        finish_stop.set()
+
+    assert not worker.is_alive(), "TTS teardown should finish after the scoped abort"
+    assert not errors, f"TTS worker failed during teardown: {errors}"
+    assert out.abort.called, "Stop must abort the stream before teardown unregisters it"
+    assert done.is_set(), "done event must fire after teardown completes"
+    with voice_mode._playback_lock:
+        assert id(out) not in voice_mode._active_output_stream_owners
+
+
 @pytest.mark.skipif(
     sys.platform == "darwin",
     reason="macOS deliberately skips the sounddevice OutputStream path (PR #62601)",
@@ -420,7 +518,7 @@ def test_streamer_tempfile_fallback_after_reinit_exhausted(monkeypatch):
     # try to play audio — just count that it was called.
     play_calls: list[str] = []
 
-    def _fake_play(path):
+    def _fake_play(path, **_kwargs):
         play_calls.append(path)
 
     q = _drain_queue([
@@ -873,7 +971,7 @@ def _timed_sync_run(monkeypatch, sentences, *, synth_s=0.12, play_s=0.12,
         with lock:
             events.append(("synth", text, t0, time.monotonic() - origin))
 
-    def fake_play(path):
+    def fake_play(path, **_kwargs):
         t0 = time.monotonic() - origin
         time.sleep(play_s)
         with lock:

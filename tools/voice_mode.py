@@ -1558,29 +1558,114 @@ def _split_wav_for_transcription(wav_path: str, *, max_file_size: int) -> List[s
 
 # Global reference to the active playback process so it can be interrupted.
 _active_playback: Optional[subprocess.Popen] = None
+_active_playback_stop_event: Optional[threading.Event] = None
+_active_playback_owners: dict[int, tuple[subprocess.Popen, Optional[threading.Event]]] = {}
+_active_output_stream_owners: dict[int, tuple[Any, Optional[threading.Event]]] = {}
+_active_sounddevice_stop_event: Optional[threading.Event] = None
 _playback_lock = threading.Lock()
+_playback_generation = 0
 
 
-def stop_playback() -> None:
-    """Interrupt the currently playing audio (if any)."""
-    global _active_playback
+def register_audio_output_stream(
+    stream: Any, stop_event: Optional[threading.Event]
+) -> bool:
+    """Register a direct audio stream so its owner can abort a blocking write.
+
+    Returns False when cancellation already won. In that case the stream is
+    aborted before the caller can begin writing to it.
+    """
     with _playback_lock:
-        proc = _active_playback
-        _active_playback = None
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate()
-            logger.info("Audio playback interrupted")
-        except Exception:
-            pass
-    # Also stop sounddevice playback if active
+        cancelled = stop_event is not None and stop_event.is_set()
+        if not cancelled:
+            _active_output_stream_owners[id(stream)] = (stream, stop_event)
+    if cancelled:
+        _abort_audio_output_stream(stream)
+        return False
+    return True
+
+
+def unregister_audio_output_stream(stream: Any) -> None:
+    """Remove a direct audio stream from the interrupt registry."""
+    with _playback_lock:
+        _active_output_stream_owners.pop(id(stream), None)
+
+
+def _abort_audio_output_stream(stream: Any) -> None:
+    """Abort a direct stream without waiting for a potentially blocked writer."""
     try:
-        sd, _ = _import_audio()
-        sd.stop()
-    except Exception:
-        pass
+        stream.abort()
+        return
+    except Exception as exc:
+        logger.debug("Audio output stream abort failed: %s", exc)
+    try:
+        stream.stop()
+    except Exception as exc:
+        logger.debug("Audio output stream stop failed after abort: %s", exc)
 
 
+def stop_playback(*, stop_event: Optional[threading.Event] = None) -> None:
+    """Interrupt current playback, optionally limited to one owner event."""
+    global _active_playback, _active_playback_stop_event
+    global _active_sounddevice_stop_event, _playback_generation
+    with _playback_lock:
+        if stop_event is None:
+            owned = list(_active_playback_owners.values())
+        else:
+            owned = [
+                item
+                for item in _active_playback_owners.values()
+                if item[1] is stop_event
+            ]
+        # Retain support for callers/tests that still set the old singleton
+        # reference directly instead of registering through play_audio_file.
+        if (
+            _active_playback is not None
+            and id(_active_playback) not in _active_playback_owners
+            and (stop_event is None or _active_playback_stop_event is stop_event)
+        ):
+            owned.append((_active_playback, _active_playback_stop_event))
+        if stop_event is None:
+            output_streams = [
+                item[0] for item in _active_output_stream_owners.values()
+            ]
+        else:
+            output_streams = [
+                stream
+                for stream, owner in _active_output_stream_owners.values()
+                if owner is stop_event
+            ]
+        # Abort while holding the registry lock. A teardown thread must not
+        # unregister a stream in the gap before abort takes effect; abort
+        # wakes its blocking writer, which can unwind after this lock releases.
+        for stream in output_streams:
+            _abort_audio_output_stream(stream)
+            _active_output_stream_owners.pop(id(stream), None)
+        for proc, _owner in owned:
+            _active_playback_owners.pop(id(proc), None)
+            if _active_playback is proc:
+                _active_playback = None
+                _active_playback_stop_event = None
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    logger.info("Audio playback interrupted")
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+        stop_sounddevice = (
+            stop_event is None or _active_sounddevice_stop_event is stop_event
+        )
+        if stop_sounddevice:
+            _playback_generation += 1
+            _active_sounddevice_stop_event = None
+            try:
+                sd, _ = _import_audio()
+                sd.stop()
+            except Exception:
+                pass
 def _is_wsl() -> bool:
     """True when running inside Windows Subsystem for Linux."""
     try:
@@ -1620,7 +1705,9 @@ def _wsl_powershell_tts_available() -> bool:
     )
 
 
-def play_audio_file(file_path: str) -> bool:
+def play_audio_file(
+    file_path: str, *, stop_event: Optional[threading.Event] = None
+) -> bool:
     """Play an audio file through the default output device.
 
     Strategy:
@@ -1635,15 +1722,22 @@ def play_audio_file(file_path: str) -> bool:
     """
     # Ref-count real speaker output for the whole call so the thinking-sound
     # loop (and any other ambient cue) knows audio is flowing right now.
+    if stop_event is not None and stop_event.is_set():
+        return False
     mark_audio_output_active(True)
     try:
-        return _play_audio_file_impl(file_path)
+        if stop_event is None:
+            return _play_audio_file_impl(file_path)
+        return _play_audio_file_impl(file_path, stop_event=stop_event)
     finally:
         mark_audio_output_active(False)
 
 
-def _play_audio_file_impl(file_path: str) -> bool:
-    global _active_playback
+def _play_audio_file_impl(
+    file_path: str, *, stop_event: Optional[threading.Event] = None
+) -> bool:
+    global _active_playback, _active_playback_stop_event
+    global _active_sounddevice_stop_event, _playback_generation
 
     if not os.path.isfile(file_path):
         logger.warning("Audio file not found: %s", file_path)
@@ -1654,6 +1748,7 @@ def _play_audio_file_impl(file_path: str) -> bool:
     # though playback needs no media-library access. afplay (added to the
     # system-player list below) handles all formats natively instead.
     if file_path.endswith(".wav") and _sounddevice_output_allowed():
+        playback_generation = None
         try:
             sd, np = _import_audio()
             with wave.open(file_path, "rb") as wf:
@@ -1681,18 +1776,38 @@ def _play_audio_file_impl(file_path: str) -> bool:
             else:
                 blocksize = 0  # default (auto)
 
-            sd.play(audio_data, samplerate=sample_rate, blocksize=blocksize)
+            with _playback_lock:
+                if stop_event is not None and stop_event.is_set():
+                    return False
+                _playback_generation += 1
+                playback_generation = _playback_generation
+                _active_sounddevice_stop_event = stop_event
+                sd.play(audio_data, samplerate=sample_rate, blocksize=blocksize)
             # sd.wait() calls Event.wait() without timeout — hangs forever if
             # the audio device stalls.  Poll with a ceiling and force-stop.
             duration_secs = len(audio_data) / sample_rate
             deadline = time.monotonic() + duration_secs + 2.0
-            while sd.get_stream() and sd.get_stream().active and time.monotonic() < deadline:
+            while (
+                sd.get_stream()
+                and sd.get_stream().active
+                and time.monotonic() < deadline
+                and (stop_event is None or not stop_event.is_set())
+            ):
                 time.sleep(0.01)
-            sd.stop()
-            return True
+            with _playback_lock:
+                if playback_generation == _playback_generation:
+                    sd.stop()
+                    _active_sounddevice_stop_event = None
+            return not (stop_event is not None and stop_event.is_set())
         except (ImportError, OSError):
+            with _playback_lock:
+                if playback_generation == _playback_generation:
+                    _active_sounddevice_stop_event = None
             pass  # audio libs not available, fall through to system players
         except Exception as e:
+            with _playback_lock:
+                if playback_generation == _playback_generation:
+                    _active_sounddevice_stop_event = None
             logger.debug("sounddevice playback failed: %s", e)
 
     # Fall back to system audio players (using Popen for interruptability)
@@ -1762,24 +1877,34 @@ def _play_audio_file_impl(file_path: str) -> bool:
     for cmd in players:
         exe = shutil.which(cmd[0])
         if exe:
+            proc = None
             try:
                 # Sibling of TTS/STT credential scrub (#70342 / #56332): system
                 # audio players must not inherit gateway tokens / API keys.
                 from tools.environments.local import hermes_subprocess_env
 
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    env=hermes_subprocess_env(inherit_credentials=False),
-                )
                 with _playback_lock:
+                    if stop_event is not None and stop_event.is_set():
+                        return False
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
+                        env=hermes_subprocess_env(inherit_credentials=False),
+                    )
                     _active_playback = proc
+                    _active_playback_stop_event = stop_event
+                    _active_playback_owners[id(proc)] = (proc, stop_event)
                 proc.wait(timeout=300)
                 rc = proc.returncode
                 with _playback_lock:
-                    _active_playback = None
+                    _active_playback_owners.pop(id(proc), None)
+                    if _active_playback is proc:
+                        _active_playback = None
+                        _active_playback_stop_event = None
+                if stop_event is not None and stop_event.is_set():
+                    return False
                 if rc == 0:
                     return True
                 # Non-zero exit: player failed (e.g. WSL ffplay/aplay with no
@@ -1787,15 +1912,23 @@ def _play_audio_file_impl(file_path: str) -> bool:
                 # step failing). Fall through to the next player in the list.
                 logger.debug("System player %s exited with code %d, trying next", cmd[0], rc)
             except subprocess.TimeoutExpired:
-                logger.warning("System player %s timed out, killing process", cmd[0])
-                proc.kill()
-                proc.wait()
-                with _playback_lock:
-                    _active_playback = None
+                if proc is not None:
+                    logger.warning("System player %s timed out, killing process", cmd[0])
+                    proc.kill()
+                    proc.wait()
+                    with _playback_lock:
+                        _active_playback_owners.pop(id(proc), None)
+                        if _active_playback is proc:
+                            _active_playback = None
+                            _active_playback_stop_event = None
             except Exception as e:
                 logger.debug("System player %s failed: %s", cmd[0], e)
-                with _playback_lock:
-                    _active_playback = None
+                if proc is not None:
+                    with _playback_lock:
+                        _active_playback_owners.pop(id(proc), None)
+                        if _active_playback is proc:
+                            _active_playback = None
+                            _active_playback_stop_event = None
 
     logger.warning("No audio player available for %s", file_path)
     return False

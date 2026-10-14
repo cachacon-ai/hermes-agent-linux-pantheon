@@ -563,6 +563,154 @@ class TestWhisperHallucinationFilter:
 # ============================================================================
 
 class TestPlayAudioFile:
+    def test_register_direct_output_stream_rejects_already_cancelled_owner(self):
+        import threading
+        import tools.voice_mode as vm
+
+        stop = threading.Event()
+        stop.set()
+        stream = MagicMock()
+
+        assert not vm.register_audio_output_stream(stream, stop)
+        stream.abort.assert_called_once_with()
+        assert id(stream) not in vm._active_output_stream_owners
+
+    def test_owner_stop_aborts_only_matching_direct_output_stream(self):
+        import threading
+        import tools.voice_mode as vm
+
+        owner_a = threading.Event()
+        owner_b = threading.Event()
+        stream_a = MagicMock()
+        stream_b = MagicMock()
+
+        assert vm.register_audio_output_stream(stream_a, owner_a)
+        assert vm.register_audio_output_stream(stream_b, owner_b)
+
+        owner_a.set()
+        vm.stop_playback(stop_event=owner_a)
+
+        stream_a.abort.assert_called_once_with()
+        stream_b.abort.assert_not_called()
+        assert id(stream_a) not in vm._active_output_stream_owners
+        assert id(stream_b) in vm._active_output_stream_owners
+
+        owner_b.set()
+        vm.stop_playback(stop_event=owner_b)
+        stream_b.abort.assert_called_once_with()
+        assert not vm._active_output_stream_owners
+
+    def test_owner_stop_terminates_only_that_system_player(
+        self, monkeypatch, sample_wav
+    ):
+        import threading
+        import tools.voice_mode as vm
+
+        started = threading.Condition()
+        players = []
+        results = {}
+
+        class _FakePlayer:
+            def __init__(self):
+                self.returncode = None
+                self.finished = threading.Event()
+                self.terminated = threading.Event()
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if not self.finished.wait(timeout):
+                    raise vm.subprocess.TimeoutExpired("afplay", timeout)
+                return self.returncode
+
+            def terminate(self):
+                self.terminated.set()
+                self.returncode = -15
+                self.finished.set()
+
+            def kill(self):
+                self.terminate()
+
+        def fake_popen(*_args, **_kwargs):
+            player = _FakePlayer()
+            with started:
+                players.append(player)
+                started.notify_all()
+            return player
+
+        monkeypatch.setattr(vm, "_sounddevice_output_allowed", lambda: False)
+        monkeypatch.setattr(vm.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            vm.shutil,
+            "which",
+            lambda name: "/usr/bin/afplay" if name == "afplay" else None,
+        )
+        monkeypatch.setattr(vm.subprocess, "Popen", fake_popen)
+
+        owner_a = threading.Event()
+        owner_b = threading.Event()
+        thread_a = threading.Thread(
+            target=lambda: results.setdefault(
+                "a", vm.play_audio_file(sample_wav, stop_event=owner_a)
+            )
+        )
+        thread_b = threading.Thread(
+            target=lambda: results.setdefault(
+                "b", vm.play_audio_file(sample_wav, stop_event=owner_b)
+            )
+        )
+        thread_a.start()
+        thread_b.start()
+        with started:
+            assert started.wait_for(lambda: len(players) == 2, timeout=3)
+        player_a = next(
+            proc
+            for proc, owner in vm._active_playback_owners.values()
+            if owner is owner_a
+        )
+        player_b = next(
+            proc
+            for proc, owner in vm._active_playback_owners.values()
+            if owner is owner_b
+        )
+
+        owner_a.set()
+        vm.stop_playback(stop_event=owner_a)
+        assert player_a.terminated.is_set()
+        assert not player_b.terminated.is_set()
+
+        owner_b.set()
+        vm.stop_playback(stop_event=owner_b)
+        thread_a.join(3)
+        thread_b.join(3)
+
+        assert not thread_a.is_alive()
+        assert not thread_b.is_alive()
+        assert results == {"a": False, "b": False}
+        assert not vm._active_playback_owners
+
+    def test_cancelled_stream_does_not_launch_a_late_player(
+        self, monkeypatch, sample_wav
+    ):
+        import threading
+        import tools.voice_mode as vm
+
+        stop = threading.Event()
+        stop.set()
+        launched = []
+        monkeypatch.setattr(vm, "_sounddevice_output_allowed", lambda: False)
+        monkeypatch.setattr(vm.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(vm.shutil, "which", lambda _name: "/usr/bin/afplay")
+        monkeypatch.setattr(
+            vm.subprocess, "Popen", lambda *args, **kwargs: launched.append(args)
+        )
+
+        # Exercise the final claim-time check directly, as if cancellation
+        # arrived after play_audio_file's cheap entry check.
+        assert vm._play_audio_file_impl(str(sample_wav), stop_event=stop) is False
+        assert launched == []
+
     @pytest.mark.linux_only
     def test_play_wav_via_sounddevice(self, monkeypatch, sample_wav):
         np = pytest.importorskip("numpy")

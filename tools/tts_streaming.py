@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
@@ -68,18 +69,45 @@ SPEECH_INTERRUPTED_NOTE = (
 )
 _INTERRUPT_TTL_S = 120.0
 _interrupted_at: Optional[float] = None
+_interrupted_at_by_session: Dict[str, float] = {}
+_interruption_lock = threading.Lock()
 
 
-def mark_speech_interrupted() -> None:
+def mark_speech_interrupted(session_id: Optional[str] = None) -> None:
+    """Remember an interruption globally or for one gateway session."""
     global _interrupted_at
-    _interrupted_at = time.monotonic()
+    at = time.monotonic()
+    with _interruption_lock:
+        expired = [
+            key
+            for key, marked_at in _interrupted_at_by_session.items()
+            if at - marked_at >= _INTERRUPT_TTL_S
+        ]
+        for key in expired:
+            _interrupted_at_by_session.pop(key, None)
+        if session_id is None:
+            _interrupted_at = at
+        else:
+            _interrupted_at_by_session[session_id] = at
 
 
-def take_speech_interrupted() -> bool:
-    """Pop the latch; True when a barge happened within the TTL."""
+def take_speech_interrupted(session_id: Optional[str] = None) -> bool:
+    """Pop a recent interruption; session reads cannot consume global state."""
     global _interrupted_at
-    at, _interrupted_at = _interrupted_at, None
-    return at is not None and time.monotonic() - at < _INTERRUPT_TTL_S
+    with _interruption_lock:
+        now = time.monotonic()
+        expired = [
+            key
+            for key, marked_at in _interrupted_at_by_session.items()
+            if now - marked_at >= _INTERRUPT_TTL_S
+        ]
+        for key in expired:
+            _interrupted_at_by_session.pop(key, None)
+        if session_id is None:
+            at, _interrupted_at = _interrupted_at, None
+        else:
+            at = _interrupted_at_by_session.pop(session_id, None)
+    return at is not None and now - at < _INTERRUPT_TTL_S
 
 # Sentence boundary: after .!? followed by whitespace, or a blank line.
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?:\s|\n)|(?:\n\n)")
