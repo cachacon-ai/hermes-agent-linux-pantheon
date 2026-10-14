@@ -11,6 +11,7 @@ stack.
 
 
 import json
+import threading
 
 import pytest
 
@@ -173,6 +174,69 @@ class TestSpeakTextGuards:
 
         # Should simply return None without raising.
         assert speak_text(text) is None
+
+    def test_cancelled_speech_does_not_synthesize(self, monkeypatch):
+        import hermes_cli.voice as voice
+
+        monkeypatch.setattr(
+            "tools.tts_tool.text_to_speech_tool",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("cancelled speech must not synthesize")
+            ),
+        )
+        stop = threading.Event()
+        stop.set()
+
+        assert voice.speak_text("This should not be spoken", stop) is None
+
+    def test_speak_text_passes_owner_event_to_file_player(self, monkeypatch):
+        import hermes_cli.voice as voice
+        from tools import tts_tool, tts_streaming
+
+        played = []
+        returned_path = "/tmp/hermes_voice/owned.mp3"
+        stop = threading.Event()
+        monkeypatch.setattr(tts_streaming, "resolve_streaming_provider", lambda *a, **k: None)
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
+        monkeypatch.setattr(
+            tts_tool,
+            "text_to_speech_tool",
+            lambda **_kwargs: json.dumps({"success": True, "file_path": returned_path}),
+        )
+        monkeypatch.setattr(voice.os, "makedirs", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(voice.os.path, "isfile", lambda path: path == returned_path)
+        monkeypatch.setattr(voice.os.path, "getsize", lambda _path: 1000)
+        monkeypatch.setattr(voice.os, "unlink", lambda _path: None)
+        monkeypatch.setattr(
+            voice,
+            "play_audio_file",
+            lambda path, **kwargs: played.append((path, kwargs.get("stop_event"))),
+        )
+
+        assert voice.speak_text("Speak with an owner", stop) is None
+        assert played == [(returned_path, stop)]
+
+    def test_stop_during_provider_probe_skips_sync_synthesis(self, monkeypatch):
+        import hermes_cli.voice as voice
+        from tools import tts_tool, tts_streaming
+
+        stop = threading.Event()
+        synthesized = []
+        monkeypatch.setattr(
+            tts_streaming,
+            "resolve_streaming_provider",
+            lambda *_args, **_kwargs: (stop.set(), None)[1],
+        )
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
+        monkeypatch.setattr(
+            tts_tool,
+            "text_to_speech_tool",
+            lambda **kwargs: synthesized.append(kwargs),
+        )
+        monkeypatch.setattr(voice.os, "makedirs", lambda *_args, **_kwargs: None)
+
+        assert voice.speak_text("Do not synthesize after Stop", stop) is None
+        assert synthesized == []
 
     def test_speak_text_uses_returned_tts_file_path(self, monkeypatch):
         import hermes_cli.voice as voice

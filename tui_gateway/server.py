@@ -13767,6 +13767,8 @@ def _run_prompt_submit(
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
+        fallback_tts_pipeline = None  # reserved stop handle for whole-reply fallback
+        fallback_tts_dispatched = False
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
@@ -13972,7 +13974,7 @@ def _run_prompt_submit(
             # begin() first — it cuts any still-speaking previous turn, and
             # that cut IS this turn's barge-in, so it must latch before we
             # consume the latch below.
-            tts_queue = _tts_stream_begin()
+            tts_queue, fallback_tts_pipeline = _begin_turn_tts(sid)
 
             # Full-duplex agent-turn listener: armed at utterance-submit so
             # the user can interject DURING generation, not just during
@@ -14016,7 +14018,7 @@ def _run_prompt_submit(
             # ("rude!") instead of being oblivious to its own interruption.
             from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
 
-            if take_speech_interrupted():
+            if take_speech_interrupted(sid):
                 run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
 
             # Reactions the user added since the last turn.
@@ -14371,6 +14373,24 @@ def _run_prompt_submit(
                 terminal_receipt_committed = True
             if terminal_receipt_committed:
                 _retire_turn_marker(session, marker_key)
+            if (
+                status == "complete"
+                and fallback_tts_pipeline is not None
+                and isinstance(raw, str)
+                and raw.strip()
+                and _voice_tts_enabled()
+            ):
+                # Reserve before message.complete reaches the client, closing
+                # the stop-before-fallback-registration race. This starts only
+                # a background speaker worker.
+                try:
+                    fallback_tts_dispatched = _speak_text_with_barge(
+                        raw, sid, pipeline=fallback_tts_pipeline
+                    )
+                except ImportError:
+                    logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
+                except Exception as e:
+                    logger.warning("voice TTS dispatch failed: %s", e)
             _emit("message.complete", sid, payload)
             if _artifacts:
                 _emit("artifact.ready", sid, {"conversation_root_id": _artifacts[0]["conversation_root_id"]})
@@ -14507,28 +14527,6 @@ def _run_prompt_submit(
                     # Transient DB failure — keep pending_title for retry.
                     pass
 
-            # Voice TTS fallback: when the streaming pipeline couldn't start
-            # (no provider / missing deps probed at turn start), speak the
-            # final text whole (cli.py:_voice_speak_response parity). The
-            # streaming path already spoke everything via tts_queue.
-            if (
-                status == "complete"
-                and tts_queue is None
-                and isinstance(raw, str)
-                and raw.strip()
-                and _voice_tts_enabled()
-            ):
-                try:
-                    spoken = raw
-                    # Barge-aware: spoken interruptions must cut this
-                    # fallback playback too, not just the streaming path.
-                    threading.Thread(
-                        target=_speak_text_with_barge, args=(spoken,), daemon=True
-                    ).start()
-                except ImportError:
-                    logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
-                except Exception as e:
-                    logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
             import traceback
 
@@ -14584,6 +14582,8 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            if fallback_tts_pipeline is not None and not fallback_tts_dispatched:
+                _finish_fd_speak_pipeline(fallback_tts_pipeline)
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
             # new/pruned result; retaining either list defeats this trim.
@@ -17670,29 +17670,52 @@ _tts_stream_lock = threading.Lock()
 _tts_stream_state: Optional[dict] = None
 
 
-def _tts_stream_begin() -> Optional[queue.Queue]:
+def _tts_stream_begin(
+    session_id: str | None = None,
+    *,
+    fallback_pipeline: tuple[threading.Event, threading.Event, str | None] | None = None,
+) -> Optional[queue.Queue]:
     """Start a per-turn streaming TTS consumer; None when TTS can't stream."""
     if not _voice_tts_enabled():
         return None
+    stream_tts_to_speaker = None
+    can_stream = False
     try:
         from tools.tts_tool import check_tts_requirements, stream_tts_to_speaker
 
-        if not check_tts_requirements():
-            return None
+        can_stream = bool(check_tts_requirements())
     except Exception:
-        return None
+        can_stream = False
 
-    _tts_stream_stop()
-    text_queue: queue.Queue = queue.Queue()
-    stop = threading.Event()
-    done = threading.Event()
-    threading.Thread(
-        target=stream_tts_to_speaker, args=(text_queue, stop, done), daemon=True
-    ).start()
-
+    text_queue = queue.Queue() if can_stream else None
+    stop = threading.Event() if can_stream else None
+    done = threading.Event() if can_stream else None
     global _tts_stream_state
     with _tts_stream_lock:
-        _tts_stream_state = {"stop": stop, "done": done}
+        with _fd_listener_lock:
+            # If Stop won while provider readiness was being checked, do not
+            # start a new stream after it. Otherwise transfer the reservation
+            # from the fallback slot to this stream atomically.
+            if fallback_pipeline is not None and fallback_pipeline[0].is_set():
+                return None
+            if fallback_pipeline is not None:
+                _fd_speak_pipelines.discard(fallback_pipeline)
+            # The speaker is process-wide. A new turn replaces both streaming
+            # and whole-reply fallback speech, even if this turn must use the
+            # whole-reply fallback because streaming prerequisites are absent.
+            # The two ownership locks prevent a fresh pipeline from starting
+            # in the gap before the old player's stop completes.
+            _stop_voice_output_locked(user_barge=True)
+            if not can_stream:
+                if fallback_pipeline is not None:
+                    _fd_speak_pipelines.add(fallback_pipeline)
+                return None
+            if fallback_pipeline is not None:
+                fallback_pipeline[1].set()
+            _tts_stream_state = {"stop": stop, "done": done, "session_id": session_id}
+            threading.Thread(
+                target=stream_tts_to_speaker, args=(text_queue, stop, done), daemon=True
+            ).start()
 
     if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
         _arm_full_duplex_listener()
@@ -17700,18 +17723,58 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
     return text_queue
 
 
-def _tts_stream_stop(user_barge: bool = True) -> None:
+def _begin_turn_tts(
+    session_id: str,
+) -> tuple[
+    Optional[queue.Queue],
+    tuple[threading.Event, threading.Event, str | None] | None,
+]:
+    """Reserve stop ownership before checking whether this turn can speak.
+
+    The TTS setting can change between turns. Reserving first means a turn
+    cannot pass an unowned provider probe if the setting becomes enabled
+    between the old outer check and ``_tts_stream_begin``.
+    """
+    fallback_pipeline = _register_fd_speak_pipeline(session_id)
+    text_queue = _tts_stream_begin(
+        session_id, fallback_pipeline=fallback_pipeline
+    )
+    if text_queue is not None:
+        # _tts_stream_begin atomically transfers the reservation to the
+        # streaming stop event.
+        return text_queue, None
+    if not _voice_tts_enabled():
+        _finish_fd_speak_pipeline(fallback_pipeline)
+        return None, None
+    return None, fallback_pipeline
+
+
+def _tts_stream_stop(user_barge: bool = True, *, session_id: str | None = None) -> None:
     """Cut any in-flight streaming TTS (new turn, interrupt, /voice off).
 
+    When *session_id* is provided, only stop that session's stream and fallback
+    speaker pipelines; omitting it is reserved for process-wide voice-mode
+    changes, new turns, and voice barge-in.
     *user_barge* latches the interruption for the next turn's model note
     (``mark_speech_interrupted``) — pass ``False`` for mode changes like
     ``/voice off`` where the user isn't talking over the reply.
     """
-    global _tts_stream_state
     with _tts_stream_lock:
-        state, _tts_stream_state = _tts_stream_state, None
+        with _fd_listener_lock:
+            _stop_voice_output_locked(user_barge=user_barge, session_id=session_id)
+
+
+def _tts_stream_stop_locked(
+    user_barge: bool = True, *, session_id: str | None = None
+) -> Optional[dict]:
+    """Mark and detach the matching stream while ``_tts_stream_lock`` is held."""
+    global _tts_stream_state
+    state = _tts_stream_state
     if state is None:
-        return
+        return None
+    if session_id is not None and state.get("session_id") != session_id:
+        return None
+    _tts_stream_state = None
     if user_barge and not state["done"].is_set():
         import traceback as _tb
         logger.debug(
@@ -17721,14 +17784,66 @@ def _tts_stream_stop(user_barge: bool = True) -> None:
         )
         from tools.tts_streaming import mark_speech_interrupted
 
-        mark_speech_interrupted()
+        mark_speech_interrupted(state.get("session_id"))
     state["stop"].set()
+    return state
+
+
+def _stop_fd_speak_pipelines_locked(
+    *, user_barge: bool = True, session_id: str | None = None
+) -> list[threading.Event]:
+    """Stop matching fallback pipelines while ``_fd_listener_lock`` is held."""
+    from tools.tts_streaming import mark_speech_interrupted
+
+    stops = []
+    for stop, done, owner_session_id in list(_fd_speak_pipelines):
+        if session_id is not None and owner_session_id != session_id:
+            continue
+        if done.is_set():
+            continue
+        stop.set()
+        stops.append(stop)
+        if user_barge:
+            mark_speech_interrupted(owner_session_id)
+    return stops
+
+
+def _stop_voice_output_locked(
+    *, user_barge: bool = True, session_id: str | None = None
+) -> None:
+    """Stop stream and fallback speech while both voice ownership locks are held."""
+    stream = _tts_stream_stop_locked(
+        user_barge=user_barge, session_id=session_id
+    )
+    fallback_stops = _stop_fd_speak_pipelines_locked(
+        user_barge=user_barge, session_id=session_id
+    )
+    stops = ([stream["stop"]] if stream is not None else []) + fallback_stops
+
     try:
         from tools.voice_mode import stop_playback
 
-        stop_playback()
+        if session_id is None and stops:
+            # Process-wide changes and voice barge-in deliberately cut every
+            # current player. Both ownership locks stay held through this call,
+            # so no new session can install audio in the stop/start gap.
+            stop_playback()
+        elif session_id is not None:
+            for stop in stops:
+                stop_playback(stop_event=stop)
     except Exception:
         pass
+
+
+def _stop_voice_output(
+    *, user_barge: bool = True, session_id: str | None = None
+) -> None:
+    """Stop voice output with process-wide or session-scoped ownership."""
+    with _tts_stream_lock:
+        with _fd_listener_lock:
+            _stop_voice_output_locked(
+                user_barge=user_barge, session_id=session_id
+            )
 
 
 def _tts_stream_barge_in_monitor(stop: threading.Event, done: threading.Event) -> None:
@@ -17747,17 +17862,40 @@ def _tts_stream_barge_in_monitor(stop: threading.Event, done: threading.Event) -
 
 _fd_listener_lock = threading.Lock()
 _fd_listener_active = False
+_fd_listener_rearm_requested = False
 # (stop, done) pairs for fallback whole-reply speak paths currently active —
 # the listener must cut THEIR private stop events too, and must keep
 # listening while any of them is still speaking.
-_fd_speak_pipelines: "set[tuple[threading.Event, threading.Event]]" = set()
+_fd_speak_pipelines: "set[tuple[threading.Event, threading.Event, str | None]]" = set()
+
+
+def _register_fd_speak_pipeline(
+    session_id: str | None,
+) -> tuple[threading.Event, threading.Event, str | None]:
+    """Reserve a fallback speech slot before synthesis can race with Stop."""
+    pipeline = (threading.Event(), threading.Event(), session_id)
+    with _fd_listener_lock:
+        _fd_speak_pipelines.add(pipeline)
+    return pipeline
+
+
+def _finish_fd_speak_pipeline(
+    pipeline: tuple[threading.Event, threading.Event, str | None],
+) -> None:
+    _stop, done, _session_id = pipeline
+    done.set()
+    with _fd_listener_lock:
+        _fd_speak_pipelines.discard(pipeline)
 
 
 def _arm_full_duplex_listener() -> None:
     """Arm the process-global full-duplex listener (idempotent — one mic)."""
-    global _fd_listener_active
+    global _fd_listener_active, _fd_listener_rearm_requested
     with _fd_listener_lock:
         if _fd_listener_active:
+            # The current listener may already be finishing a captured
+            # utterance. Remember that a newer turn still needs coverage.
+            _fd_listener_rearm_requested = True
             return
         _fd_listener_active = True
     threading.Thread(
@@ -17773,7 +17911,7 @@ def _fd_tts_pending() -> bool:
         return True
     with _fd_listener_lock:
         pipelines = list(_fd_speak_pipelines)
-    return any(not done.is_set() for _stop, done in pipelines)
+    return any(not done.is_set() for _stop, done, _session_id in pipelines)
 
 
 def _full_duplex_listener() -> None:
@@ -17790,13 +17928,12 @@ def _full_duplex_listener() -> None:
     Stop phrase is honored in both phases: mid-generation it interrupts the
     turn AND ends the voice chat ("stop everything").
     """
-    global _fd_listener_active
+    global _fd_listener_active, _fd_listener_rearm_requested
     try:
         from tools.tts_streaming import mark_speech_interrupted
         from tools.voice_mode import (
             full_duplex_listen,
             is_audio_output_active,
-            stop_playback,
             transcribe_recording,
         )
 
@@ -17822,18 +17959,12 @@ def _full_duplex_listener() -> None:
         tripped = threading.Event()
 
         def _cut_all_tts() -> None:
-            # Streaming pipeline (private stop event + player).
-            _tts_stream_stop(user_barge=True)
-            # Fallback whole-reply speak paths (their own stop events).
-            with _fd_listener_lock:
-                pipelines = list(_fd_speak_pipelines)
-            for _stop, _done in pipelines:
-                _stop.set()
-            stop_playback()
+            # One ownership-locked cut avoids a trailing process-wide stop
+            # racing and silencing a newer session's player.
+            _stop_voice_output(user_barge=True)
 
         def _on_trigger(phase: str) -> None:
             tripped.set()
-            mark_speech_interrupted()
             if phase == "playback":
                 logger.debug(
                     "TTS CUT: full-duplex listener tripped during playback"
@@ -17851,9 +17982,12 @@ def _full_duplex_listener() -> None:
                 try:
                     with _sessions_lock:
                         running = [
-                            s for s in _sessions.values() if s.get("running")
+                            (sid, s)
+                            for sid, s in _sessions.items()
+                            if s.get("running")
                         ]
-                    for s in running:
+                    for sid, s in running:
+                        mark_speech_interrupted(sid)
                         agent = s.get("agent")
                         if agent is not None and hasattr(agent, "interrupt"):
                             try:
@@ -17909,11 +18043,28 @@ def _full_duplex_listener() -> None:
     except Exception as e:
         logger.debug("full-duplex listener failed: %s", e)
     finally:
+        restart = False
         with _fd_listener_lock:
-            _fd_listener_active = False
+            if _fd_listener_rearm_requested and _voice_mode_enabled():
+                _fd_listener_rearm_requested = False
+                restart = True
+            else:
+                _fd_listener_active = False
+                _fd_listener_rearm_requested = False
+        if restart:
+            threading.Thread(
+                target=_full_duplex_listener,
+                daemon=True,
+                name="voice-full-duplex",
+            ).start()
 
 
-def _speak_text_with_barge(text: str) -> None:
+def _speak_text_with_barge(
+    text: str,
+    session_id: str | None = None,
+    *,
+    pipeline: tuple[threading.Event, threading.Event, str | None] | None = None,
+) -> bool:
     """Speak *text* via hermes_cli.voice.speak_text with spoken barge-in.
 
     The fallback whole-reply path (streaming couldn't start) and the
@@ -17925,25 +18076,24 @@ def _speak_text_with_barge(text: str) -> None:
     """
     from hermes_cli.voice import speak_text
 
-    stop = threading.Event()
-    done = threading.Event()
-    with _fd_listener_lock:
-        _fd_speak_pipelines.add((stop, done))
+    pipeline = pipeline or _register_fd_speak_pipeline(session_id)
+    stop, _done, _owner_session_id = pipeline
+    if stop.is_set():
+        _finish_fd_speak_pipeline(pipeline)
+        return False
 
     def _speak():
         try:
             speak_text(text, stop)
-        except TypeError:
-            # Older wrapper without the stop_event parameter.
-            speak_text(text)
+        except Exception as e:
+            logger.warning("voice TTS playback failed: %s", e)
         finally:
-            done.set()
-            with _fd_listener_lock:
-                _fd_speak_pipelines.discard((stop, done))
+            _finish_fd_speak_pipeline(pipeline)
 
     threading.Thread(target=_speak, daemon=True).start()
     if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
         _arm_full_duplex_listener()
+    return True
 
 
 def _voice_cfg_dict() -> dict:
@@ -18730,9 +18880,12 @@ def _(rid, params: dict) -> dict:
         # documented 5026 instead of failing silently in the thread.
         import hermes_cli.voice  # noqa: F401
 
-        threading.Thread(
-            target=_speak_text_with_barge, args=(text,), daemon=True
-        ).start()
+        # _speak_text_with_barge only registers ownership and starts its own
+        # worker, so invoke it inline. This makes a following session.interrupt
+        # observe the stop handle before the RPC reports "speaking".
+        _speak_text_with_barge(
+            text, str(params.get("session_id") or "") or None
+        )
         return _ok(rid, {"status": "speaking"})
     except ImportError:
         return _err(rid, 5026, "voice module not available")

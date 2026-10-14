@@ -3657,9 +3657,6 @@ def _(rid, params: dict) -> dict:
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
-    # Keypress barge-in: stopping the turn also silences its streaming TTS
-    # (voice is process-global, so no per-session scoping is needed).
-    _tts_stream_stop()
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -3675,8 +3672,12 @@ def _(rid, params: dict) -> dict:
                 or active_task.get("task_id") != expected_hosted_task_id
             ):
                 return _ok(rid, {"status": "not_interrupted", "interrupted": False})
+    sid = str(params.get("session_id") or "")
+    # Stop promptly after confirming this session exists. Streaming and
+    # fallback speech share one process-wide speaker, but carry per-session
+    # stop events so this chat cannot silence another chat's reply.
+    _stop_voice_output(session_id=sid)
     if _session_uses_compute_host(session):
-        sid = str(params.get("session_id") or "")
         try:
             _interrupt_session_turn(sid, session, request_id=f"interrupt-{rid}")
         except Exception as exc:
@@ -3685,7 +3686,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    _interrupt_session_turn(str(params.get("session_id") or ""), session)
+    _interrupt_session_turn(sid, session)
     # Retire the crash-recovery marker on a confirmed local Stop. Waiting for
     # the run thread's finally leaves a window where a backend exit looks like
     # a crash and session.resume auto-continues the turn the user just stopped.

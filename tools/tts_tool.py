@@ -4273,7 +4273,7 @@ class _SyncSentencePipeline:
                         and os.path.isfile(tmp_path)
                         and os.path.getsize(tmp_path) > 0):
                     from tools.voice_mode import play_audio_file
-                    play_audio_file(tmp_path)
+                    play_audio_file(tmp_path, stop_event=self._stop)
             except Exception as exc:
                 logger.warning("Sync per-sentence TTS failed: %s", exc)
             finally:
@@ -4318,6 +4318,48 @@ def stream_tts_to_speaker(
         _prefetch_threads = []
         tts_config = _load_tts_config()
 
+        def _register_output_stream(stream) -> bool:
+            """Make direct PCM output visible to session-scoped Stop."""
+            try:
+                from tools.voice_mode import register_audio_output_stream
+
+                return register_audio_output_stream(stream, stop_event)
+            except Exception as exc:
+                # An unregistered PortAudio stream cannot be interrupted
+                # reliably. Fall back to file playback, which has its own
+                # owner-aware cancellation path.
+                logger.warning(
+                    "Could not register direct audio output for cancellation: %s",
+                    exc,
+                )
+                return False
+
+        def _close_output_stream(stream, *, abort: bool = False) -> None:
+            # Keep the stream registered through stop/abort. A session Stop
+            # arriving while normal PortAudio stop drains buffered PCM must
+            # still be able to find and abort it.
+            try:
+                if abort or stop_event.is_set():
+                    stream.abort()
+                else:
+                    stream.stop()
+            except Exception:
+                # A failed normal stop must not leave buffered audio playing.
+                try:
+                    stream.abort()
+                except Exception:
+                    pass
+            try:
+                from tools.voice_mode import unregister_audio_output_stream
+
+                unregister_audio_output_stream(stream)
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
@@ -4352,11 +4394,22 @@ def stream_tts_to_speaker(
                         dtype="int16",
                     )
                     output_stream.start()
+                    if not _register_output_stream(output_stream):
+                        _close_output_stream(output_stream, abort=True)
+                        output_stream = None
                 except (ImportError, OSError) as exc:
                     logger.debug("sounddevice not available, streamer→tempfile: %s", exc)
+                    if output_stream is not None:
+                        _close_output_stream(
+                            output_stream, abort=stop_event.is_set()
+                        )
                     output_stream = None
                 except Exception as exc:
                     logger.warning("sounddevice OutputStream failed: %s", exc)
+                    if output_stream is not None:
+                        _close_output_stream(
+                            output_stream, abort=stop_event.is_set()
+                        )
                     output_stream = None
 
         chunker = SentenceChunker()
@@ -4379,13 +4432,22 @@ def stream_tts_to_speaker(
 
         def _create_output_stream():
             """Create and start a fresh PortAudio OutputStream."""
+            if stop_event.is_set():
+                return None
             sd = _import_sounddevice()
             new_stream = sd.OutputStream(
                 samplerate=streamer.sample_rate,
                 channels=streamer.channels,
                 dtype="int16",
             )
-            new_stream.start()
+            try:
+                new_stream.start()
+                if not _register_output_stream(new_stream):
+                    _close_output_stream(new_stream, abort=True)
+                    return None
+            except Exception:
+                _close_output_stream(new_stream, abort=stop_event.is_set())
+                raise
             return new_stream
 
         def _consume_to_queue(
@@ -4416,14 +4478,17 @@ def stream_tts_to_speaker(
             """Close the broken PortAudio stream and try to create a fresh one."""
             nonlocal output_stream
             if output_stream is not None:
-                try:
-                    output_stream.stop()
-                    output_stream.close()
-                except Exception:
-                    pass
+                _close_output_stream(
+                    output_stream, abort=stop_event.is_set()
+                )
+                output_stream = None
+            if stop_event.is_set():
+                return None
             try:
                 new_stream = _create_output_stream()
                 output_stream = new_stream
+                if new_stream is None:
+                    return None
                 logger.info(
                     "TTS: PortAudio output stream reinitialized after error"
                 )
@@ -4486,6 +4551,11 @@ def stream_tts_to_speaker(
                                         ).reshape(-1, 1)
                                     )
                                 except Exception as write_exc:
+                                    if stop_event.is_set():
+                                        logger.debug(
+                                            "TTS output write stopped by cancellation"
+                                        )
+                                        break
                                     logger.warning(
                                         "PortAudio write failed, attempting "
                                         "stream reinit: %s",
@@ -4495,6 +4565,8 @@ def stream_tts_to_speaker(
                                         _reinit_count += 1
                                         _current_stream = _reinit_output_stream()
                                         if _current_stream is not None:
+                                            if stop_event.is_set():
+                                                break
                                             try:
                                                 _current_stream.write(
                                                     _np.frombuffer(
@@ -4632,7 +4704,8 @@ def stream_tts_to_speaker(
                 # pile up).  Release the handle before playback and cleanup.
                 tmp.close()
                 from tools.voice_mode import play_audio_file
-                play_audio_file(tmp_path)
+                if not stop_evt.is_set():
+                    play_audio_file(tmp_path, stop_event=stop_evt)
             except Exception as exc:
                 logger.warning("Temp-file TTS fallback failed: %s", exc)
             finally:
@@ -4696,11 +4769,9 @@ def stream_tts_to_speaker(
             t.join(timeout=10.0)
         # Always close the audio output stream to avoid locking the device
         if output_stream is not None:
-            try:
-                output_stream.stop()
-                output_stream.close()
-            except Exception:
-                pass
+            _close_output_stream(
+                output_stream, abort=stop_event.is_set()
+            )
         tts_done_event.set()
 
 
