@@ -1847,6 +1847,7 @@ from hermes_cli.web_models import (  # noqa: F401
     WhatsAppOnboardingStart,
     WhatsAppOnboardingApply,
     AudioTranscriptionRequest,
+    VoiceLiveSessionRequest,
     ManagedFileUpload,
     ChatImageUpload,
     ManagedDirectoryCreate,
@@ -5499,6 +5500,108 @@ async def get_client_voice_config(profile: Optional[str] = None):
         fallback = {"mode": "relay", "reason": "resolution error"}
         return {"ok": True, "stt": fallback, "tts": dict(fallback)}
 
+    return {"ok": True, **result}
+
+
+@contextmanager
+def http_failure(log_msg: str, status: int, prefix: Optional[str] = None):
+    """Map unexpected exceptions to an ``HTTPException``.
+
+    ``HTTPException`` passes through; anything else is logged with ``log_msg``
+    (traceback) and re-raised as ``HTTPException(status, f"{prefix}: {exc}")``.
+    """
+    try:
+        yield
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception(log_msg)
+        raise HTTPException(status_code=status, detail=f"{prefix}: {exc}") from exc
+
+
+async def _run_config_scoped(profile: Optional[str], fn):
+    """Run ``fn()`` on a worker thread under the config-only profile scope.
+
+    Home-only contextvar scope, NOT ``_profile_scope``: a GPT-Live session
+    blocks for a vendor round-trip and only needs config/.env resolution, while
+    ``_profile_scope`` holds a process-global skills lock for its entire body.
+    """
+    def _scoped():
+        with _config_profile_scope(profile):
+            return fn()
+
+    # to_thread COPIES the current context, so a secondary-profile request's
+    # home override reaches the worker. run_in_executor does NOT: it would drop
+    # the contextvar and silently resolve the LAUNCH profile's config and OpenAI
+    # key — a cross-profile billing/tenant bug invisible in single-profile use.
+    return await asyncio.to_thread(_scoped)
+
+
+@app.get("/api/audio/voice-live/status")
+async def get_voice_live_status(profile: Optional[str] = None):
+    """Which voice chat mode this profile selected (``chained`` | ``gpt-live``) and
+    whether GPT-Live could start. Deliberately non-secret — the client decides
+    which conversation engine to mount from this, and no key material (not even
+    a prefix) ever crosses this boundary."""
+    from tools.voice_live import resolve_gpt_live_status
+
+    with http_failure("GPT-Live status resolution failed", 500, "GPT-Live status failed"):
+        result = await _run_config_scoped(profile, resolve_gpt_live_status)
+    # Upstream reports ``available``; the fork reports ``configured`` so the
+    # client cannot read this as an entitlement check — it only says whether a
+    # key resolved. ``reason`` is dropped for the same reason: it is a hint, not
+    # a contract.
+    return {
+        "ok": True,
+        "configured": bool(result.get("available")),
+        "mode": str(result.get("mode") or "chained"),
+        "model": str(result.get("model") or ""),
+        "voice": str(result.get("voice") or ""),
+    }
+
+
+@app.post("/api/audio/voice-live/session")
+async def create_voice_live_session(
+    payload: VoiceLiveSessionRequest, profile: Optional[str] = None
+):
+    """Exchange the client's WebRTC SDP offer for a GPT-Live session answer.
+
+    The OpenAI key stays on this host; the client receives only the session id
+    and the SDP answer. Client delegation is fixed at creation: every
+    ``session.delegation.created`` the client receives becomes a Hermes turn on
+    the session it belongs to (surface ``voice-live``).
+    """
+    from tools.voice_live import create_webrtc_session
+
+    # Emptiness only: the vendor's SDP parser needs the offer byte-exact,
+    # including its trailing CRLF (a stripped offer answers
+    # 400 "failed to unmarshal SDP: EOF"). Never trim what we forward.
+    sdp = payload.sdp or ""
+    if not sdp.strip():
+        raise HTTPException(status_code=400, detail="An SDP offer is required")
+    try:
+        result = await _run_config_scoped(
+            profile, lambda: create_webrtc_session(sdp, payload.history)
+        )
+    except json.JSONDecodeError as exc:
+        # A 200 whose body is not JSON is a failed session, NOT a missing key —
+        # and JSONDecodeError is a ValueError subclass, so it has to be caught
+        # first or the client is told to fall back to chained permanently.
+        _log.warning("GPT-Live session creation failed: malformed answer: %s", exc)
+        raise HTTPException(status_code=502, detail="GPT-Live session creation failed") from exc
+    except ValueError as exc:
+        # No key resolves for this profile. Not a vendor failure: the client
+        # falls back to the chained STT -> TTS engine permanently.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except HTTPException:
+        raise  # an unknown ?profile= is the scope's own 404, not a fallback
+    except Exception as exc:
+        # Vendor rejection, timeout/network failure and a malformed answer are
+        # one thing to the client: the live session did not start. The detail is
+        # a fixed string because a vendor error body is untrusted and must not
+        # be echoed (nor logged) with anything key-shaped in it.
+        _log.warning("GPT-Live session creation failed: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=502, detail="GPT-Live session creation failed") from exc
     return {"ok": True, **result}
 
 

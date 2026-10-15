@@ -104,6 +104,11 @@ class AudioTranscriptionRequest(BaseModel):
     mime_type: Optional[str] = None
 
 
+class VoiceLiveSessionRequest(BaseModel):
+    sdp: str
+    history: Optional[list[dict[str, Any]]] = None
+
+
 class ManagedFileUpload(BaseModel):
     path: str
     data_url: str

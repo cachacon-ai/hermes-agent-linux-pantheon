@@ -2013,6 +2013,17 @@ DEFAULT_CONFIG = {
     },
 
     "voice": {
+        # chained (default) = the existing STT -> turn -> TTS loop.
+        # gpt-live = one full-duplex voice model that delegates every real
+        # request back to Hermes (tools/voice_live.py). Inert until an
+        # operator opts in by setting this to "gpt-live".
+        "voice_chat_mode": "chained",  # chained | gpt-live
+        "gpt_live": {
+            "model": "gpt-live-1",
+            "voice": "marin",
+            "instructions": "",
+            # optional "api_key" / "base_url" override this mode only
+        },
         "record_key": "ctrl+b",
         "submit_mode": "direct",       # TUI: direct submits immediately; draft leaves an editable transcript
         "max_recording_seconds": 120,
