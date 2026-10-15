@@ -1960,7 +1960,7 @@ class TestStreamTtsTempfileFallback:
 
         played = []
 
-        def _fake_play(path):
+        def _fake_play(path, stop_event=None):
             events.append(("play", path))
             played.append(path)
             # At play time the file must be a fully written, readable WAV.

@@ -20055,7 +20055,15 @@ def test_get_usage_clamps_post_compression_sentinel():
 # Streaming TTS — per-turn pipeline + barge-in
 # ---------------------------------------------------------------------------
 
-def _fake_tts_modules(monkeypatch, *, requirements=True, playback_stops=None, listen=None, transcribe=None):
+def _fake_tts_modules(
+    monkeypatch,
+    *,
+    requirements=True,
+    playback_stops=None,
+    playback_stop_events=None,
+    listen=None,
+    transcribe=None,
+):
     """Install lightweight tools.tts_tool / tools.voice_mode fakes."""
     started = {}
 
@@ -20069,6 +20077,12 @@ def _fake_tts_modules(monkeypatch, *, requirements=True, playback_stops=None, li
 
     def default_fd_listen(should_stop, is_playing=None, on_trigger=None, **_kw):
         return None
+
+    def fake_stop_playback(*, stop_event=None):
+        if playback_stops is not None:
+            playback_stops.append(True)
+        if playback_stop_events is not None:
+            playback_stop_events.append(stop_event)
 
     monkeypatch.setitem(
         sys.modules,
@@ -20085,7 +20099,7 @@ def _fake_tts_modules(monkeypatch, *, requirements=True, playback_stops=None, li
         sys.modules,
         "tools.voice_mode",
         types.SimpleNamespace(
-            stop_playback=lambda: (playback_stops.append(True) if playback_stops is not None else None),
+            stop_playback=fake_stop_playback,
             listen_for_speech=listen or default_listen,
             full_duplex_listen=listen or default_fd_listen,
             is_audio_output_active=lambda: False,
@@ -20094,6 +20108,7 @@ def _fake_tts_modules(monkeypatch, *, requirements=True, playback_stops=None, li
     )
     # Fresh listener slot per test — the arm is idempotent per process.
     monkeypatch.setattr(server, "_fd_listener_active", False)
+    monkeypatch.setattr(server, "_fd_listener_rearm_requested", False)
     return started
 
 
@@ -20106,6 +20121,216 @@ def test_tts_stream_begin_requires_working_provider(monkeypatch):
     monkeypatch.setenv("HERMES_VOICE_TTS", "1")
     _fake_tts_modules(monkeypatch, requirements=False)
     assert server._tts_stream_begin() is None
+
+
+def test_tts_stream_begin_respects_and_transfers_fallback_reservation(monkeypatch):
+    """Stop during provider probing prevents a late stream from starting."""
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    started = _fake_tts_modules(monkeypatch)
+    server._tts_stream_stop(user_barge=False)
+
+    cancelled = server._register_fd_speak_pipeline("session-cancelled")
+    server._stop_voice_output(session_id="session-cancelled", user_barge=False)
+    assert cancelled[0].is_set()
+    assert (
+        server._tts_stream_begin(
+            "session-cancelled", fallback_pipeline=cancelled
+        )
+        is None
+    )
+    assert "queue" not in started
+    server._finish_fd_speak_pipeline(cancelled)
+
+    reserved = server._register_fd_speak_pipeline("session-streaming")
+    text_queue = server._tts_stream_begin(
+        "session-streaming", fallback_pipeline=reserved
+    )
+    assert text_queue is not None
+    assert reserved[1].is_set()
+    with server._fd_listener_lock:
+        assert reserved not in server._fd_speak_pipelines
+    with server._tts_stream_lock:
+        state = server._tts_stream_state
+    assert state is not None and state["session_id"] == "session-streaming"
+    server._tts_stream_stop(user_barge=False)
+
+
+def test_process_wide_stop_silences_untracked_players(monkeypatch):
+    """A process-wide stop reaches players this process never registered.
+
+    `/voice off`, TTS-off and a new turn all stop the speaker process-wide.
+    Gating that on a registered stream or fallback left a player started
+    outside those slots audible straight through the mode change.
+    """
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    playback_stops: list = []
+    _fake_tts_modules(monkeypatch, playback_stops=playback_stops)
+    server._tts_stream_stop(user_barge=False)
+    playback_stops.clear()
+
+    # Nothing is owned by this process: no stream slot, no fallback pipelines.
+    with server._tts_stream_lock:
+        assert server._tts_stream_state is None
+    with server._fd_listener_lock:
+        assert not server._fd_speak_pipelines
+
+    server._stop_voice_output(session_id=None)
+    assert playback_stops == [True]
+
+
+def test_reserved_but_unplayed_pipeline_is_stopped_without_marking(monkeypatch):
+    """Stop during generation must not claim an interruption that never happened.
+
+    The fallback slot is reserved for the whole turn so a Stop landing during
+    generation cannot let the stale reply speak afterwards. But nothing has
+    played yet, so this session must not be marked speech-interrupted.
+    """
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: marked.append(session_id)
+        ),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    reserved = server._register_fd_speak_pipeline("session-idle")
+    assert not reserved[3].is_set(), "a reserved slot has not started playing"
+
+    server._stop_voice_output(session_id="session-idle")
+    assert reserved[0].is_set(), "the stale reply must not be able to speak"
+    assert marked == [], "nothing played, so nothing was interrupted"
+
+    server._finish_fd_speak_pipeline(reserved)
+    server._tts_stream_stop(user_barge=False)
+
+
+def test_playing_pipeline_is_still_marked_interrupted_on_stop(monkeypatch):
+    """The reservation flag must gate marking, not disable it.
+
+    Once speech has actually begun, a Stop is a real interruption and has to
+    latch the note the next turn carries — otherwise barge-in silently stops
+    working.
+    """
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: marked.append(session_id)
+        ),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    playing = server._register_fd_speak_pipeline("session-live")
+    playing[3].set()  # speech actually started
+
+    server._stop_voice_output(session_id="session-live")
+    assert playing[0].is_set()
+    assert marked == ["session-live"]
+
+    server._finish_fd_speak_pipeline(playing)
+    server._tts_stream_stop(user_barge=False)
+
+
+def test_new_turn_cuts_shared_speaker_without_marking_another_session(monkeypatch):
+    """One speaker means a new turn silences others; it must not blame them.
+
+    Starting a turn in one session displaces whatever the single shared speaker
+    is playing. That other session is cut off, but it did not get interrupted by
+    the user, so its next turn must not carry an interruption note.
+    """
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: marked.append(session_id)
+        ),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    other = server._register_fd_speak_pipeline("session-other")
+    other[3].set()  # it is speaking
+
+    text_queue = server._tts_stream_begin("session-new")
+    assert text_queue is not None
+
+    assert other[0].is_set(), "the shared speaker must be cut off"
+    assert marked == [], "session-other was displaced, not interrupted by the user"
+
+    server._finish_fd_speak_pipeline(other)
+    server._tts_stream_stop(user_barge=False)
+
+
+def test_begin_turn_tts_reserves_stop_owner_before_provider_probe(monkeypatch):
+    """Stop during provider readiness cannot leave an unowned speech attempt."""
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    started = _fake_tts_modules(monkeypatch)
+    sid = "session-provider-probe-stop"
+    fake_tts = sys.modules["tools.tts_tool"]
+
+    def _stop_during_probe():
+        with server._fd_listener_lock:
+            matching = [
+                pipeline
+                for pipeline in server._fd_speak_pipelines
+                if pipeline[2] == sid
+            ]
+        assert len(matching) == 1, "turn stop owner must exist before provider probe"
+        server._stop_voice_output(session_id=sid, user_barge=False)
+        return True
+
+    fake_tts.check_tts_requirements = _stop_during_probe
+    queue, fallback = server._begin_turn_tts(sid)
+
+    assert queue is None
+    assert fallback is not None and fallback[0].is_set()
+    assert "queue" not in started, "a stopped turn must not start streaming TTS"
+    server._finish_fd_speak_pipeline(fallback)
+
+
+def test_new_fallback_turn_cuts_previous_fallback_even_without_streaming_tts(
+    monkeypatch,
+):
+    """A provider probe failure must not let two sessions speak at once."""
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    playback_stops = []
+    _fake_tts_modules(
+        monkeypatch, requirements=False, playback_stops=playback_stops
+    )
+    server._tts_stream_stop(user_barge=False)
+    old_pipeline = server._register_fd_speak_pipeline("session-a")
+    new_pipeline = server._register_fd_speak_pipeline("session-b")
+
+    assert (
+        server._tts_stream_begin("session-b", fallback_pipeline=new_pipeline)
+        is None
+    )
+    assert old_pipeline[0].is_set()
+    assert not new_pipeline[0].is_set()
+    # The initial reset plus the new turn's unconditional process-wide stop.
+    assert playback_stops == [True, True]
+    with server._fd_listener_lock:
+        assert new_pipeline in server._fd_speak_pipelines
+
+    server._finish_fd_speak_pipeline(old_pipeline)
+    server._finish_fd_speak_pipeline(new_pipeline)
+    server._tts_stream_stop(user_barge=False)
 
 
 def test_tts_stream_begin_and_stop_lifecycle(monkeypatch):
@@ -20125,9 +20350,336 @@ def test_tts_stream_begin_and_stop_lifecycle(monkeypatch):
 
     server._tts_stream_stop()
     assert state["stop"].is_set()
-    assert playback_stops == [True]
+    # Both operations stop the process-wide speaker unconditionally: begin()
+    # silences anything left over from before, stop() silences this stream.
+    assert playback_stops == [True, True]
     with server._tts_stream_lock:
         assert server._tts_stream_state is None
+
+
+def test_tts_stream_stop_is_scoped_to_the_interrupted_session(monkeypatch):
+    """A stop request for another chat cannot silence this session's speaker."""
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(mark_speech_interrupted=lambda session_id=None: marked.append(session_id)),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    text_queue = server._tts_stream_begin("session-a")
+    assert text_queue is not None
+    with server._tts_stream_lock:
+        state = server._tts_stream_state
+    assert state is not None and state["session_id"] == "session-a"
+
+    server._tts_stream_stop(session_id="session-b")
+    with server._tts_stream_lock:
+        assert server._tts_stream_state is state
+    assert not state["stop"].is_set()
+    assert marked == []
+
+    server._tts_stream_stop(session_id="session-a")
+    assert state["stop"].is_set()
+    assert marked == ["session-a"]
+
+
+def test_tts_stream_scoped_stop_cannot_stop_a_new_sessions_playback(monkeypatch):
+    """A new begin waits until the old owner's player has stopped."""
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    playback_stop_entered = threading.Event()
+    finish_playback_stop = threading.Event()
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            stop_playback=lambda *, stop_event=None: (
+                playback_stop_entered.set(), finish_playback_stop.wait(2)
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(mark_speech_interrupted=lambda _session_id=None: None),
+    )
+    server._tts_stream_stop(user_barge=False)
+    server._tts_stream_begin("session-a")
+    with server._tts_stream_lock:
+        first = server._tts_stream_state
+
+    stop_thread = threading.Thread(
+        target=lambda: server._tts_stream_stop(session_id="session-a")
+    )
+    stop_thread.start()
+    assert playback_stop_entered.wait(2)
+
+    begin_started = threading.Event()
+    begin_finished = threading.Event()
+    result = {}
+
+    def begin_session_b():
+        begin_started.set()
+        result["queue"] = server._tts_stream_begin("session-b")
+        begin_finished.set()
+
+    begin_thread = threading.Thread(target=begin_session_b)
+    begin_thread.start()
+    try:
+        assert begin_started.wait(2)
+        assert not begin_finished.wait(0.05)
+    finally:
+        finish_playback_stop.set()
+    stop_thread.join(2)
+    begin_thread.join(2)
+
+    assert not stop_thread.is_alive()
+    assert not begin_thread.is_alive()
+    assert result.get("queue") is not None
+    assert first is not None and first["stop"].is_set()
+    with server._tts_stream_lock:
+        second = server._tts_stream_state
+    assert second is not None and second["session_id"] == "session-b"
+    assert not second["stop"].is_set()
+    server._tts_stream_stop(user_barge=False)
+
+
+def test_full_duplex_cut_cannot_stop_stream_started_after_the_cut(monkeypatch):
+    """The barge cut stays atomic through player stop and the next begin."""
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    playback_stop_entered = threading.Event()
+    finish_playback_stop = threading.Event()
+    listener_after_cut = threading.Event()
+    allow_listener_exit = threading.Event()
+    second_listener_started = threading.Event()
+    listener_calls = []
+
+    def blocking_stop_playback(*, stop_event=None):
+        playback_stop_entered.set()
+        assert finish_playback_stop.wait(2)
+
+    voice_mode = sys.modules["tools.voice_mode"]
+    voice_mode.stop_playback = blocking_stop_playback
+
+    def fake_full_duplex_listen(
+        should_stop, is_playing=None, on_trigger=None, **_kw
+    ):
+        listener_calls.append(True)
+        if len(listener_calls) == 1:
+            on_trigger("playback")
+            listener_after_cut.set()
+            assert allow_listener_exit.wait(2)
+        else:
+            second_listener_started.set()
+        return None
+
+    voice_mode.full_duplex_listen = fake_full_duplex_listen
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"barge_in": True}})
+    monkeypatch.setattr(server, "_voice_emit", lambda *_args, **_kwargs: None)
+    server._tts_stream_stop(user_barge=False)
+    server._tts_stream_begin("session-a")
+    monkeypatch.setenv("HERMES_VOICE", "1")
+
+    server._arm_full_duplex_listener()
+    assert playback_stop_entered.wait(2)
+
+    begin_started = threading.Event()
+    begin_finished = threading.Event()
+    result = {}
+
+    def begin_session_b():
+        begin_started.set()
+        result["queue"] = server._tts_stream_begin("session-b")
+        begin_finished.set()
+
+    begin_thread = threading.Thread(target=begin_session_b)
+    begin_thread.start()
+    try:
+        assert begin_started.wait(2)
+        assert not begin_finished.wait(0.05)
+    finally:
+        finish_playback_stop.set()
+    begin_thread.join(2)
+    assert listener_after_cut.wait(2)
+
+    assert not begin_thread.is_alive()
+    assert result.get("queue") is not None
+    with server._tts_stream_lock:
+        state = server._tts_stream_state
+    assert state is not None and state["session_id"] == "session-b"
+    assert not state["stop"].is_set()
+    with server._fd_listener_lock:
+        assert server._fd_listener_rearm_requested
+
+    allow_listener_exit.set()
+    assert second_listener_started.wait(2)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and server._fd_listener_active:
+        time.sleep(0.01)
+    assert listener_calls == [True, True]
+    assert not state["stop"].is_set()
+    server._tts_stream_stop(user_barge=False)
+
+
+def test_session_interrupt_does_not_stop_another_sessions_tts(monkeypatch):
+    """The RPC handler must pass its session identity to the TTS stop seam."""
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    server._tts_stream_stop(user_barge=False)
+    target = "interrupt-target"
+    speaker = "speaking-session"
+    target_session = _session(agent_ready=threading.Event())
+    target_session["agent_ready"].set()
+    server._sessions[target] = target_session
+    text_queue = server._tts_stream_begin(speaker)
+    assert text_queue is not None
+    with server._tts_stream_lock:
+        state = server._tts_stream_state
+
+    try:
+        response = server.handle_request({
+            "id": "interrupt-other-tts",
+            "method": "session.interrupt",
+            "params": {"session_id": target},
+        })
+        assert response.get("result")
+        with server._tts_stream_lock:
+            assert server._tts_stream_state is state
+        assert state is not None and not state["stop"].is_set()
+    finally:
+        server._sessions.pop(target, None)
+        server._tts_stream_stop(user_barge=False)
+
+
+def test_session_interrupt_stops_only_owned_fallback_speech(monkeypatch):
+    """Stop reaches a pending fallback reply without silencing another chat."""
+    monkeypatch.setenv("HERMES_VOICE_TTS", "0")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    playback_stop_events = []
+    interrupted_sessions = []
+    _fake_tts_modules(monkeypatch, playback_stop_events=playback_stop_events)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: interrupted_sessions.append(
+                session_id
+            )
+        ),
+    )
+    target = "fallback-interrupt-target"
+    other = "fallback-speaking-other"
+    target_session = _session(agent_ready=threading.Event())
+    target_session["agent_ready"].set()
+    server._sessions[target] = target_session
+    target_pipeline = server._register_fd_speak_pipeline(target)
+    other_pipeline = server._register_fd_speak_pipeline(other)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "interrupt-fallback",
+                "method": "session.interrupt",
+                "params": {"session_id": target},
+            }
+        )
+
+        assert response.get("result")
+        assert target_pipeline[0].is_set()
+        assert not other_pipeline[0].is_set()
+        assert playback_stop_events == [target_pipeline[0]]
+        # The fallback is still pending: it was reserved but never started
+        # speaking, so there is no interruption to latch onto the next turn.
+        # A pipeline that actually started playing IS marked — see
+        # test_playing_pipeline_is_still_marked_interrupted_on_stop.
+        assert interrupted_sessions == []
+
+        # A reply reaching fallback dispatch after Stop must not start speech.
+        spoken = []
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.voice",
+            types.SimpleNamespace(
+                speak_text=lambda *args, **kwargs: spoken.append((args, kwargs))
+            ),
+        )
+        assert (
+            server._speak_text_with_barge(
+                "late fallback reply", target, pipeline=target_pipeline
+            )
+            is False
+        )
+        assert spoken == []
+    finally:
+        server._sessions.pop(target, None)
+        server._finish_fd_speak_pipeline(target_pipeline)
+        server._finish_fd_speak_pipeline(other_pipeline)
+
+
+def test_streaming_speak_playback_start_latches_playing_so_stop_counts(monkeypatch):
+    """A streaming provider must latch ``playing`` too, or Stop is a no-op.
+
+    ``speak_text`` routes streaming providers through ``_speak_text_streaming``,
+    which fires ``on_playback_start`` when the first audio chunk reaches the
+    speaker. That signal is the only thing setting the slot's ``playing`` event,
+    so while it went unfired a barge-in over streamed speech stopped the audio
+    without ever being recorded as an interruption for the next turn to carry.
+    """
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: marked.append(session_id)
+        ),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    speaking = threading.Event()
+    release = threading.Event()
+
+    def streaming_speak_text(text, stop_event=None, on_playback_start=None):
+        """Streaming shape: audio arrives chunk by chunk, then plays on."""
+        speaking.set()
+        if on_playback_start is not None:
+            on_playback_start()
+        release.wait(5)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(speak_text=streaming_speak_text),
+    )
+
+    assert server._speak_text_with_barge("a streamed reply", "session-stream")
+    assert speaking.wait(5), "the streaming speak never started"
+
+    with server._fd_listener_lock:
+        pipelines = [p for p in server._fd_speak_pipelines if p[2] == "session-stream"]
+    assert len(pipelines) == 1
+    pipeline = pipelines[0]
+    assert pipeline[3].is_set(), "first streamed audio must latch the playing flag"
+
+    server._stop_voice_output(session_id="session-stream")
+    assert pipeline[0].is_set(), "Stop must cut playback"
+    assert marked == ["session-stream"], (
+        "a Stop over audible speech is a real interruption and must be latched"
+    )
+
+    release.set()
+    server._finish_fd_speak_pipeline(pipeline)
+    server._tts_stream_stop(user_barge=False)
 
 
 def test_tts_stream_begin_barges_in_on_previous_pipeline(monkeypatch):
@@ -20263,6 +20815,8 @@ def test_full_duplex_generation_phase_interrupts_running_turn(monkeypatch, tmp_p
     assert interrupted.is_set()  # the running turn was interrupted
     assert ("voice.interrupted", None) in events
     assert ("voice.transcript", {"text": "wait, try another way"}) in events
+    assert ts.take_speech_interrupted("another-session") is False
+    assert ts.take_speech_interrupted("sid-fd") is True
     assert not wav.exists()
 
 
@@ -20342,10 +20896,12 @@ def test_speak_text_with_barge_arms_monitor_and_cuts_playback(monkeypatch, tmp_p
     speak_started = threading.Event()
     release_speak = threading.Event()
 
-    def fake_speak_text(text, stop_event=None):
+    def fake_speak_text(text, stop_event=None, on_playback_start=None):
         speak_calls["text"] = text
         speak_calls["stop_event"] = stop_event
         speak_started.set()
+        if on_playback_start is not None:
+            on_playback_start()
         release_speak.wait(5)
 
     monkeypatch.setitem(
@@ -20395,12 +20951,16 @@ def test_speak_text_with_barge_no_monitor_when_voice_mode_off(monkeypatch):
         return None
 
     done_speaking = threading.Event()
+
+    def _fake_speak_that_signals_playback(text, stop_event=None, on_playback_start=None):
+        if on_playback_start is not None:
+            on_playback_start()
+        done_speaking.set()
+
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.voice",
-        types.SimpleNamespace(
-            speak_text=lambda text, stop_event=None: done_speaking.set()
-        ),
+        types.SimpleNamespace(speak_text=_fake_speak_that_signals_playback),
     )
     _fake_tts_modules(monkeypatch, listen=fake_listen)
 

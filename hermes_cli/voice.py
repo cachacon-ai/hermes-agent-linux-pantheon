@@ -892,7 +892,11 @@ def _continuous_on_silence() -> None:
 # ── TTS API ──────────────────────────────────────────────────────────
 
 
-def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = None) -> bool:
+def _speak_text_streaming(
+    text: str,
+    stop_event: Optional[threading.Event] = None,
+    on_playback_start: Optional[Callable[[], None]] = None,
+) -> bool:
     """Speak ``text`` via the generic streaming dispatcher; True on success.
 
     Bridges the one-shot ``speak_text`` contract onto the shared
@@ -906,6 +910,12 @@ def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = Non
     external barge-in / stop paths can cut streaming playback — without
     it the pipeline's stop event was private and speech over this path
     was uninterruptible (the desktop/TUI fallback-speak hole).
+
+    ``on_playback_start`` (optional) is forwarded to the pipeline, which
+    fires it once at the moment the first audio chunk reaches the speaker.
+    Without it the streaming path never told its caller that playback had
+    begun, so a Stop landing mid-speech was not recognized as an
+    interruption the user could actually have heard.
 
     Returns False when playback produced nothing (caller falls back to the
     whole-file sync path).
@@ -921,11 +931,20 @@ def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = Non
     if stop_event is None:
         stop_event = _threading.Event()
     done_event = _threading.Event()
-    stream_tts_to_speaker(text_queue, stop_event, done_event)
+    stream_tts_to_speaker(
+        text_queue,
+        stop_event,
+        done_event,
+        on_playback_start=on_playback_start,
+    )
     return done_event.is_set()
 
 
-def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
+def speak_text(
+    text: str,
+    stop_event: Optional[threading.Event] = None,
+    on_playback_start: Optional[Callable[[], None]] = None,
+) -> None:
     """Synthesize ``text`` with the configured TTS provider and play it.
 
     Mirrors cli.py:_voice_speak_response exactly — same markdown strip
@@ -938,8 +957,15 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
     cleared so the continuous-recording loop knows to wait before
     re-arming the mic (otherwise the agent's spoken reply feedback-loops
     through the microphone and the agent ends up replying to itself).
+
+    ``on_playback_start`` is called exactly once, when the first audio
+    chunk reaches the speaker — on both the whole-file and the streaming
+    path — so callers can distinguish "speech is audible" from "still
+    synthesizing". Never called when nothing is played.
     """
     if not text or not text.strip():
+        return
+    if stop_event is not None and stop_event.is_set():
         return
 
     import re
@@ -980,7 +1006,7 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
             from tools.tts_tool import _load_tts_config
 
             if resolve_streaming_provider(_load_tts_config()) is not None:
-                if _speak_text_streaming(text, stop_event):
+                if _speak_text_streaming(text, stop_event, on_playback_start):
                     return
         except Exception as e:
             _debug(f"speak_text: streaming dispatch unavailable ({e}); using sync path")
@@ -1018,6 +1044,8 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         )
 
         _debug(f"speak_text: synthesizing {len(tts_text)} chars -> {mp3_path}")
+        if stop_event is not None and stop_event.is_set():
+            return
         raw_result = text_to_speech_tool(text=tts_text, output_path=mp3_path)
         try:
             tts_result = json.loads(raw_result) if isinstance(raw_result, str) else {}
@@ -1031,12 +1059,26 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         ]
         played_any = False
         for play_path in play_paths if tts_result.get("success") else []:
+            if stop_event is not None and stop_event.is_set():
+                break
             if os.path.isfile(play_path) and os.path.getsize(play_path) > 0:
                 _debug(
                     f"speak_text: playing {play_path} "
                     f"({os.path.getsize(play_path)} bytes)"
                 )
-                play_audio_file(play_path)
+                if not played_any and on_playback_start is not None:
+                    # Audio is reaching the speaker for the first time.
+                    # Signalling here rather than before synthesis keeps a
+                    # Stop that lands mid-synthesis from counting as an
+                    # interruption the user could not possibly have heard.
+                    try:
+                        on_playback_start()
+                    except Exception:
+                        pass
+                if stop_event is None:
+                    play_audio_file(play_path)
+                else:
+                    play_audio_file(play_path, stop_event=stop_event)
                 played_any = True
         cleanup_paths = set(play_paths + [mp3_path, mp3_path.rsplit(".", 1)[0] + ".ogg"])
         for path in cleanup_paths:
