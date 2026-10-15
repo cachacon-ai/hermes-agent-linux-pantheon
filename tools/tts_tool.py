@@ -4216,8 +4216,15 @@ class _SyncSentencePipeline:
     ``tools.voice_mode`` keep working unchanged.
     """
 
-    def __init__(self, stop_event: threading.Event, *, lookahead: int = 2):
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        *,
+        lookahead: int = 2,
+        on_playback_start: Optional[Callable[[], None]] = None,
+    ):
         self._stop = stop_event
+        self._on_playback_start = on_playback_start
         self._queue: "queue.Queue[Optional[tuple[str, Future]]]" = queue.Queue(
             maxsize=max(1, lookahead)
         )
@@ -4273,6 +4280,8 @@ class _SyncSentencePipeline:
                         and os.path.isfile(tmp_path)
                         and os.path.getsize(tmp_path) > 0):
                     from tools.voice_mode import play_audio_file
+                    if self._on_playback_start is not None:
+                        self._on_playback_start()
                     play_audio_file(tmp_path, stop_event=self._stop)
             except Exception as exc:
                 logger.warning("Sync per-sentence TTS failed: %s", exc)
@@ -4290,6 +4299,7 @@ def stream_tts_to_speaker(
     tts_done_event: threading.Event,
     display_callback: Optional[Callable[[str], None]] = None,
     provider: Optional[str] = None,
+    on_playback_start: Optional[Callable[[], None]] = None,
 ):
     """Consume text deltas from *text_queue*, buffer them into sentences, and
     speak each sentence the moment it's ready — the conversational path.
@@ -4306,9 +4316,35 @@ def stream_tts_to_speaker(
         * *stop_event* can be set to abort early (barge-in / user interrupt).
         * *tts_done_event* is **set** in the ``finally`` block so callers
           waiting on it (continuous voice mode) know playback is finished.
+        * *on_playback_start* is invoked at most once, at the moment the first
+          audio chunk is handed to the speaker — never at synthesis time.
+          Callers use it to tell "the user can hear speech now" from "we are
+          still synthesizing", which is what decides whether a Stop landing
+          mid-turn counts as an interruption they could have heard.
     """
     tts_done_event.clear()
     sync_pipeline: Optional[_SyncSentencePipeline] = None
+
+    # Once-only latch for the playback signal, shared by every playback path
+    # (direct PCM write, its tempfile fallback, and the sync sentence pipeline)
+    # so the caller's callback is entered exactly once no matter which path
+    # wins or how often the fallback re-arms.
+    _playback_start_lock = threading.Lock()
+    _playback_started = False
+
+    def _fire_playback_start() -> None:
+        nonlocal _playback_started
+        if on_playback_start is None:
+            return
+        with _playback_start_lock:
+            if _playback_started:
+                return
+            _playback_started = True
+        try:
+            on_playback_start()
+        except Exception as exc:
+            # A failing listener must not take playback down with it.
+            logger.debug("on_playback_start callback failed: %s", exc)
 
     try:
         output_stream = None
@@ -4368,7 +4404,13 @@ def stream_tts_to_speaker(
         # No chunked streamer: per-sentence sync synthesis, pipelined so the
         # next sentence synthesizes while the current one plays (closed in the
         # finally block, which flushes anything still queued).
-        sync_pipeline = _SyncSentencePipeline(stop_event) if streamer is None else None
+        sync_pipeline = (
+            _SyncSentencePipeline(
+                stop_event, on_playback_start=_fire_playback_start
+            )
+            if streamer is None
+            else None
+        )
 
         stream_max_len = 0
         if streamer is not None:
@@ -4544,6 +4586,8 @@ def stream_tts_to_speaker(
                             _buf = _pcm_leftover + chunk
                             _aligned_len = len(_buf) - (len(_buf) % 2)
                             if _aligned_len >= 2:
+                                # First real PCM about to hit the speakers.
+                                _fire_playback_start()
                                 try:
                                     _current_stream.write(
                                         _np.frombuffer(
@@ -4694,8 +4738,10 @@ def stream_tts_to_speaker(
                     wf.setnchannels(1)
                     wf.setsampwidth(2)  # 16-bit
                     wf.setframerate(sample_rate)
+                    wrote_audio = False
                     for aligned in _align_int16_chunks(audio_iter, stop_evt):
                         wf.writeframes(aligned)
+                        wrote_audio = True
                 # wave.open() given a file object flushes but does NOT close it
                 # (it only closes files it opened itself, by name), so the OS
                 # handle to tmp stays open.  On Windows an open write handle
@@ -4705,6 +4751,11 @@ def stream_tts_to_speaker(
                 tmp.close()
                 from tools.voice_mode import play_audio_file
                 if not stop_evt.is_set():
+                    if wrote_audio:
+                        # Only real frames on disk are audible — a segment the
+                        # provider produced no audio for must never claim
+                        # playback started.
+                        _fire_playback_start()
                     play_audio_file(tmp_path, stop_event=stop_evt)
             except Exception as exc:
                 logger.warning("Temp-file TTS fallback failed: %s", exc)

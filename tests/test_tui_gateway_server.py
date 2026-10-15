@@ -20624,6 +20624,64 @@ def test_session_interrupt_stops_only_owned_fallback_speech(monkeypatch):
         server._finish_fd_speak_pipeline(other_pipeline)
 
 
+def test_streaming_speak_playback_start_latches_playing_so_stop_counts(monkeypatch):
+    """A streaming provider must latch ``playing`` too, or Stop is a no-op.
+
+    ``speak_text`` routes streaming providers through ``_speak_text_streaming``,
+    which fires ``on_playback_start`` when the first audio chunk reaches the
+    speaker. That signal is the only thing setting the slot's ``playing`` event,
+    so while it went unfired a barge-in over streamed speech stopped the audio
+    without ever being recorded as an interruption for the next turn to carry.
+    """
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: marked.append(session_id)
+        ),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    speaking = threading.Event()
+    release = threading.Event()
+
+    def streaming_speak_text(text, stop_event=None, on_playback_start=None):
+        """Streaming shape: audio arrives chunk by chunk, then plays on."""
+        speaking.set()
+        if on_playback_start is not None:
+            on_playback_start()
+        release.wait(5)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(speak_text=streaming_speak_text),
+    )
+
+    assert server._speak_text_with_barge("a streamed reply", "session-stream")
+    assert speaking.wait(5), "the streaming speak never started"
+
+    with server._fd_listener_lock:
+        pipelines = [p for p in server._fd_speak_pipelines if p[2] == "session-stream"]
+    assert len(pipelines) == 1
+    pipeline = pipelines[0]
+    assert pipeline[3].is_set(), "first streamed audio must latch the playing flag"
+
+    server._stop_voice_output(session_id="session-stream")
+    assert pipeline[0].is_set(), "Stop must cut playback"
+    assert marked == ["session-stream"], (
+        "a Stop over audible speech is a real interruption and must be latched"
+    )
+
+    release.set()
+    server._finish_fd_speak_pipeline(pipeline)
+    server._tts_stream_stop(user_barge=False)
+
+
 def test_tts_stream_begin_barges_in_on_previous_pipeline(monkeypatch):
     """A new turn's pipeline stops the previous turn's speech (one speaker)."""
     monkeypatch.setenv("HERMES_VOICE_TTS", "1")

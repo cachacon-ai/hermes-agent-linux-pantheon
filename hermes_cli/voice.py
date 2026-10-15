@@ -892,7 +892,11 @@ def _continuous_on_silence() -> None:
 # ── TTS API ──────────────────────────────────────────────────────────
 
 
-def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = None) -> bool:
+def _speak_text_streaming(
+    text: str,
+    stop_event: Optional[threading.Event] = None,
+    on_playback_start: Optional[Callable[[], None]] = None,
+) -> bool:
     """Speak ``text`` via the generic streaming dispatcher; True on success.
 
     Bridges the one-shot ``speak_text`` contract onto the shared
@@ -906,6 +910,12 @@ def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = Non
     external barge-in / stop paths can cut streaming playback — without
     it the pipeline's stop event was private and speech over this path
     was uninterruptible (the desktop/TUI fallback-speak hole).
+
+    ``on_playback_start`` (optional) is forwarded to the pipeline, which
+    fires it once at the moment the first audio chunk reaches the speaker.
+    Without it the streaming path never told its caller that playback had
+    begun, so a Stop landing mid-speech was not recognized as an
+    interruption the user could actually have heard.
 
     Returns False when playback produced nothing (caller falls back to the
     whole-file sync path).
@@ -921,7 +931,12 @@ def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = Non
     if stop_event is None:
         stop_event = _threading.Event()
     done_event = _threading.Event()
-    stream_tts_to_speaker(text_queue, stop_event, done_event)
+    stream_tts_to_speaker(
+        text_queue,
+        stop_event,
+        done_event,
+        on_playback_start=on_playback_start,
+    )
     return done_event.is_set()
 
 
@@ -942,6 +957,11 @@ def speak_text(
     cleared so the continuous-recording loop knows to wait before
     re-arming the mic (otherwise the agent's spoken reply feedback-loops
     through the microphone and the agent ends up replying to itself).
+
+    ``on_playback_start`` is called exactly once, when the first audio
+    chunk reaches the speaker — on both the whole-file and the streaming
+    path — so callers can distinguish "speech is audible" from "still
+    synthesizing". Never called when nothing is played.
     """
     if not text or not text.strip():
         return
@@ -986,7 +1006,7 @@ def speak_text(
             from tools.tts_tool import _load_tts_config
 
             if resolve_streaming_provider(_load_tts_config()) is not None:
-                if _speak_text_streaming(text, stop_event):
+                if _speak_text_streaming(text, stop_event, on_playback_start):
                     return
         except Exception as e:
             _debug(f"speak_text: streaming dispatch unavailable ({e}); using sync path")

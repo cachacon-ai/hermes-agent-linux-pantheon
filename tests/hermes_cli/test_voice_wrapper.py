@@ -621,4 +621,143 @@ class TestSpeakTextStreamingDispatch:
         assert streamed == ["Hello streaming world"]
         assert synced == [], "sync whole-file path must be skipped when streaming"
 
+    @staticmethod
+    def _streaming_provider(ts, chunks):
+        """A chunked streamer recording each synthesis into a returned list.
+
+        Synthesis is deliberately *not* logged onto the speaker-side ordering
+        list: the dispatcher prefetches sentence n+1 while sentence n still
+        plays, so the two genuinely interleave.
+        """
+        synthesized = []
+
+        class _Fake(ts.StreamingTTSProvider):
+            sample_rate = 24000
+            channels = 1
+
+            @staticmethod
+            def available():
+                return True
+
+            def stream(self, text):
+                synthesized.append(text)
+                for chunk in chunks:
+                    yield chunk
+
+        return _Fake, synthesized
+
+    @staticmethod
+    def _mock_speaker(monkeypatch, tts_tool, order):
+        """Route the dispatcher's direct-PCM branch at a recording fake.
+
+        PortAudio is mocked and the host is pinned to Linux so the mocked
+        branch runs everywhere (macOS deliberately skips it in production).
+        No real audio device is opened. ``order`` collects speaker-side events
+        only: the playback signal and each PCM write.
+        """
+        from unittest.mock import MagicMock
+
+        import tools.voice_mode as voice_mode
+
+        out = MagicMock()
+        out.write.side_effect = lambda *_a, **_k: order.append("played")
+        sd = MagicMock()
+        sd.OutputStream.return_value = out
+
+        monkeypatch.setattr(tts_tool.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(tts_tool, "_import_sounddevice", lambda: sd)
+        monkeypatch.setattr(
+            voice_mode, "register_audio_output_stream", lambda *a, **k: True
+        )
+        monkeypatch.setattr(voice_mode, "unregister_audio_output_stream", lambda *a: None)
+        monkeypatch.setattr(voice_mode, "mark_audio_output_active", lambda _a: None)
+        return out
+
+    def test_streaming_path_fires_on_playback_start_exactly_once(self, monkeypatch):
+        """The streaming path must latch playback at the speaker, once.
+
+        ``speak_text`` accepts ``on_playback_start`` so callers can tell "the
+        user is hearing speech" from "we are still synthesizing" — the
+        streaming dispatcher never called it, so the TUI gateway's ``playing``
+        flag stayed clear and a Stop mid-speech was not counted as an
+        interruption. Drives the real dispatcher with a chunked streamer:
+        several sentences produce many chunk writes, and the signal must
+        still arrive exactly once, at the first of them.
+        """
+        pytest.importorskip("numpy")
+        import hermes_cli.voice as voice
+        import tools.tts_streaming as ts
+        import tools.voice_mode as voice_mode
+        from tools import tts_tool
+
+        order = []
+        fake_provider, synthesized = self._streaming_provider(
+            ts, [b"\x01\x00" * 40, b"\x02\x00" * 40]
+        )
+        monkeypatch.setattr(ts, "_REGISTRY", dict(ts._REGISTRY), raising=False)
+        monkeypatch.setitem(ts._REGISTRY, "hermestest", fake_provider)
+        monkeypatch.setattr(
+            ts, "resolve_streaming_provider", lambda cfg, preferred=None: fake_provider({}, {})
+        )
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
+        self._mock_speaker(monkeypatch, tts_tool, order)
+
+        fired = []
+        monkeypatch.setattr(
+            voice_mode,
+            "play_audio_file",
+            lambda *a, **k: pytest.fail("must not use tempfile"),
+        )
+
+        assert (
+            voice.speak_text(
+                "First sentence here. Second sentence there.",
+                on_playback_start=lambda: (order.append("playback_start"), fired.append(1)),
+            )
+            is None
+        )
+
+        assert synthesized, "the chunked streamer must actually have been used"
+        assert fired == [1], "the streaming path must signal playback exactly once"
+        # The signal lands at the speaker: it precedes the first PCM write
+        # rather than firing at dispatch, so a Stop landing during
+        # synthesis still cannot count as an interruption the user never
+        # heard — the same ordering the whole-file path guarantees.
+        assert order[0] == "playback_start"
+        assert "played" in order[1:]
+        assert order.count("played") > 1, "several chunks must have been written"
+
+    def test_streaming_path_does_not_signal_when_no_audio_produced(self, monkeypatch):
+        """A streamer that yields nothing must never report playback starting.
+
+        Nothing reaches the speaker, so a Stop landing after this speak is not
+        an interruption the user could have heard — the same contract the
+        whole-file path keeps with its ``played_any`` guard.
+        """
+        pytest.importorskip("numpy")
+        import hermes_cli.voice as voice
+        import tools.tts_streaming as ts
+        from tools import tts_tool
+
+        fake_provider, synthesized = self._streaming_provider(ts, [])
+        monkeypatch.setattr(ts, "_REGISTRY", dict(ts._REGISTRY), raising=False)
+        monkeypatch.setitem(ts._REGISTRY, "hermestest", fake_provider)
+        monkeypatch.setattr(
+            ts, "resolve_streaming_provider", lambda cfg, preferred=None: fake_provider({}, {})
+        )
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
+        self._mock_speaker(monkeypatch, tts_tool, [])
+
+        fired = []
+
+        assert (
+            voice.speak_text(
+                "A sentence that yields no audio.",
+                on_playback_start=lambda: fired.append(1),
+            )
+            is None
+        )
+        assert synthesized, "the chunked streamer must actually have been used"
+        assert fired == []
+
 
