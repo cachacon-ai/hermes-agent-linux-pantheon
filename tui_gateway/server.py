@@ -2723,6 +2723,8 @@ def _compute_host_turn_frame(
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
     clock_context: str | None = None,
+    voice_live_turn: dict | None = None,
+    client_surface: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2754,6 +2756,16 @@ def _compute_host_turn_frame(
     }
     if clock_context:
         frame["clock_context"] = clock_context
+    if client_surface is not None:
+        # Per-turn, for the same reason as voice_live_turn: the session mirror is
+        # overwritten by the NEXT submit, so a turn that drains later would render
+        # the window its neighbour was typed in. "" is a real value (app window).
+        frame["client_surface"] = client_surface
+    if voice_live_turn:
+        # Per-turn surface data travels with the turn frame. An isolated worker
+        # runs the same turn prologue as the in-process path, so the delegation
+        # note must arrive here or the turn silently loses its contract.
+        frame["voice_live_turn"] = voice_live_turn
     return frame
 
 
@@ -2915,6 +2927,8 @@ def _submit_prompt_to_compute_host(
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
     clock_context: str | None = None,
+    voice_live_turn: dict | None = None,
+    client_surface: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2926,6 +2940,8 @@ def _submit_prompt_to_compute_host(
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
         clock_context=clock_context,
+        voice_live_turn=voice_live_turn,
+        client_surface=client_surface,
     )
 
     def _complete(done: dict) -> None:
@@ -10854,6 +10870,8 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    voice_live_turn: dict | None = None,
+    client_surface: str | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -10863,6 +10881,9 @@ def _enqueue_prompt(
     separate envelopes, so their attachment ownership and chronology survive.
     ``transport`` is pinned so the drained turn streams back to the client that
     sent it even if the session transport is rebound meanwhile.
+    ``client_surface`` is pinned for the same reason ``transport`` is: it is a
+    fact about ONE turn, and the session mirror is overwritten by the next submit
+    before this envelope drains.
     """
     image_paths = list(image_paths or [])
     # #84417: scrub any live-turn self-duplicates first so the consecutive-text
@@ -10882,6 +10903,15 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if voice_live_turn:
+        # Pinned to THIS envelope: the drained turn renders its own transcript.
+        # A queued voice delegation that lost it would run against the live
+        # turn's context, or none.
+        queued["voice_live_turn"] = voice_live_turn
+    if client_surface is not None:
+        # Pinned per envelope, "" included: a queued app-window turn must not
+        # inherit the HUD note of whatever window the next submit came from.
+        queued["client_surface"] = client_surface
     existing = session.get("queued_prompt")
     if (
         existing
@@ -10890,6 +10920,14 @@ def _enqueue_prompt(
         and not existing.get("image_paths")
         and not image_paths
         and not session.get("queued_prompts")
+        # A live-voice delegation keeps its own envelope: merging its text into a
+        # plain next-turn would silently run the transcript-less turn as the
+        # merged one, or attach one turn's transcript to another's words.
+        and not voice_live_turn
+        and not existing.get("voice_live_turn")
+        # Merging across surfaces would either graft the HUD note onto app-window
+        # words or drop it from the HUD words it belongs to.
+        and existing.get("client_surface", "") == (client_surface or "")
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -11012,7 +11050,9 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
+    voice_live_turn: dict | None = None,
+    client_surface: str | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -11090,7 +11130,11 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session, text, transport, image_paths=image_paths,
+            voice_live_turn=voice_live_turn,
+            client_surface=client_surface,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -11152,6 +11196,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return True
     dispatch_failed = False
     try:
+        queued_voice_live_turn = queued.get("voice_live_turn") or None
+        # Absent key = the envelope predates per-turn surfaces (or the turn source
+        # pinned none) and falls back to the session mirror; "" = an explicit
+        # app-window turn that must not read the mirror.
+        queued_client_surface = queued.get("client_surface")
         if use_compute_host:
             if queued.get("image_paths"):
                 resp = _submit_prompt_to_compute_host(
@@ -11161,10 +11210,15 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    voice_live_turn=queued_voice_live_turn,
+                    client_surface=queued_client_surface,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid, sid, session, queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    voice_live_turn=queued_voice_live_turn,
+                    client_surface=queued_client_surface,
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -11182,6 +11236,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    voice_live_turn=queued_voice_live_turn,
+                    client_surface=queued_client_surface,
                 )
             else:
                 _run_prompt_submit(
@@ -11190,6 +11246,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    voice_live_turn=queued_voice_live_turn,
+                    client_surface=queued_client_surface,
                 )
     except Exception as exc:
         print(
@@ -13485,9 +13543,16 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _hud_surface_note(session: dict) -> str:
-    """The HUD-mode note for this turn, or "" when it was not typed there."""
-    if session.get("client_surface") != "hud":
+def _hud_surface_note(session: dict, client_surface: str | None = None) -> str:
+    """The HUD-mode note for THIS turn, or "" when it was not typed there.
+
+    ``client_surface`` is the per-turn value carried with the turn. ``None`` means "this
+    turn source did not pin a surface" and falls back to the session mirror; "" is an
+    explicit app-window turn and must NOT read the mirror, or a queued turn drained after
+    a later HUD submit inherits that submit's window.
+    """
+    surface = session.get("client_surface") if client_surface is None else client_surface
+    if surface != "hud":
         return ""
     from agent.prompt_builder import hud_surface_note
 
@@ -13683,6 +13748,8 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     clock_context: str | None = None,
+    voice_live_turn: dict | None = None,
+    client_surface: str | None = None,
 ) -> bool:
     # Ownership admission at the ONE chokepoint every fresh turn source must
     # cross. prompt.submit already claims the slot in its RPC handler (so this
@@ -14025,8 +14092,24 @@ def _run_prompt_submit(
             run_message = _prepend_note(run_message, _pending_reaction_notes(session))
 
             # Which window the message was typed into. HUD mode is per-turn
-            # state, so it cannot live in the (byte-stable) system prompt.
-            run_message = _prepend_note(run_message, _hud_surface_note(session))
+            # state, so it cannot live in the (byte-stable) system prompt. The
+            # per-turn value wins over the session mirror: a turn queued behind
+            # another one must render the window IT was typed in, not whatever
+            # the newest submit left behind.
+            run_message = _prepend_note(
+                run_message, _hud_surface_note(session, client_surface)
+            )
+
+            # A live-voice delegation: the spoken-delegation contract, for THIS
+            # turn only, on the same model-input seam as the HUD note above and
+            # never in the system prompt — mutating the system prompt mid-
+            # conversation would invalidate the cached prefix for every later
+            # turn. Only voice-live turns pass through here; the HUD note above
+            # keeps its own seam, so neither note is ever emitted twice.
+            if voice_live_turn:
+                from gateway.session_surface import surface_note
+
+                run_message = _prepend_note(run_message, surface_note(voice_live_turn))
 
             def _stream(delta):
                 with session["history_lock"]:

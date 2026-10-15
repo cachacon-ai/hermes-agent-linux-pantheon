@@ -110,6 +110,41 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _worker_carries_voice_live(server: Any) -> bool:
+    """Whether this worker's turn prologue can carry a live-voice delegation.
+
+    The frame is a plain pipe protocol, so an isolated worker running a build
+    without ``voice_live_turn`` would accept the field and drop it. Probing the
+    signature turns that silent contract loss into a refused turn.
+    """
+    import inspect
+
+    run_prompt_submit = getattr(server, "_run_prompt_submit", None)
+    if run_prompt_submit is None:
+        return False
+    try:
+        return "voice_live_turn" in inspect.signature(run_prompt_submit).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _worker_carries_client_surface(server: Any) -> bool:
+    """Whether this worker's turn prologue can carry the per-turn client surface.
+
+    Same fail-closed contract as the delegation frame: without it a queued HUD turn
+    drained on an older worker would read whatever the session mirror last held.
+    """
+    import inspect
+
+    run_prompt_submit = getattr(server, "_run_prompt_submit", None)
+    if run_prompt_submit is None:
+        return False
+    try:
+        return "client_surface" in inspect.signature(run_prompt_submit).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _build_sha() -> str:
     try:
         return subprocess.check_output(
@@ -533,6 +568,31 @@ class ComputeHost:
             from tui_gateway.methods_prompt import normalize_prompt_clock_context
 
             clock_context = normalize_prompt_clock_context(frame.get("clock_context"))
+            voice_live_turn = frame.get("voice_live_turn") or None
+            # Absent key means the producer pinned no surface; "" is an explicit
+            # app-window turn and must not fall back to the session mirror.
+            client_surface = frame.get("client_surface")
+            if (voice_live_turn and not _worker_carries_voice_live(server)) or (
+                client_surface is not None and not _worker_carries_client_surface(server)
+            ):
+                # Fail closed. Running the delegation without its transcript would
+                # answer the spoken request from the typed prompt alone — the
+                # model never learns it came from a live voice turn. A visible
+                # error the client can retry beats a silent contract loss.
+                self.emit(
+                    {
+                        "type": "turn.error",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "message": (
+                            "this compute host cannot carry this turn's client surface"
+                        ),
+                    }
+                )
+                with session["history_lock"]:
+                    session["running"] = False
+                    session["_turn_cancel_requested"] = False
+                return
             server._run_prompt_submit(
                 request_id,
                 sid,
@@ -540,6 +600,8 @@ class ComputeHost:
                 text,
                 display_kind=frame.get("display_kind") or None,
                 clock_context=clock_context,
+                voice_live_turn=voice_live_turn,
+                client_surface=client_surface,
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

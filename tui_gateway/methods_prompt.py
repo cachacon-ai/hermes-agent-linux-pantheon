@@ -297,6 +297,70 @@ def normalize_prompt_clock_context(raw) -> str | None:
     return None
 
 
+def admit_prompt_surface(params) -> tuple[str, dict | None, str | None]:
+    """Admit the per-turn client surface of a ``prompt.submit`` request.
+
+    Returns ``(client_surface, voice_live_turn, refusal)``:
+    ``client_surface`` is mirrored on the session for the existing HUD note seam,
+    ``voice_live_turn`` is the committed surface dict of a live-voice turn (``None``
+    for every other surface) and ``refusal`` is the invalid-params message to
+    refuse the whole submit with, or ``None`` when it admits.
+
+    A surface is a fact about ONE turn, so ``voice_live_turn`` is returned for the
+    caller to thread into that turn only — never parked on mutable session state,
+    where a queued submit would inherit the next submit's transcript.
+
+    Fork divergence, deliberate: upstream refuses an unknown ``surface`` and
+    silently drops a ``voice_context`` that arrives on any surface but
+    ``voice-live``. Here an unknown surface stays tolerant — the fork has always
+    read a surface it does not know as "no surface", since every non-HUD client
+    simply omits the field — while a ``voice_context`` is REFUSED. The transcript
+    is model input: the words the model reads instead of the typed prompt, so a
+    client able to attach it to an arbitrary surface could inject context into a
+    turn the user never dictated. Over-long context is refused rather than clipped
+    for the same reason: a silently truncated transcript changes what the turn
+    refers to, which is worse than a rejected request the client can retry.
+    """
+    from gateway.session_surface import (
+        SURFACES,
+        VOICE_CONTEXT_LIMIT,
+        SurfaceAdmissionError,
+        admit_surface,
+    )
+
+    params = dict(params)
+    raw_surface = params.get("surface")
+    if raw_surface is not None:
+        # Type-check BEFORE the membership test: ``["hud"] not in SURFACES`` is a
+        # TypeError (unhashable), not a tolerated unknown surface. A non-string is
+        # a protocol error the client can fix, so it is refused like a bad
+        # voice_context rather than silently read as "no surface".
+        if not isinstance(raw_surface, str):
+            return "", None, "invalid surface fields: surface must be a string"
+        if raw_surface not in SURFACES:
+            # Deliberate fork divergence (see the docstring): an unknown surface
+            # NAME is tolerated and read as "no surface".
+            params["surface"] = None
+    context = params.get("voice_context")
+    try:
+        if context is not None:
+            if not isinstance(context, str):
+                raise SurfaceAdmissionError("invalid_params")
+            if len(context) > VOICE_CONTEXT_LIMIT:
+                raise SurfaceAdmissionError("invalid_params")
+        committed = admit_surface(params)
+    except SurfaceAdmissionError:
+        return (
+            "",
+            None,
+            "invalid surface fields: voice_context is accepted only with "
+            'surface "voice-live", as a string of at most '
+            f"{VOICE_CONTEXT_LIMIT} characters",
+        )
+    voice_live_turn = committed if committed.get("surface") == "voice-live" else None
+    return str(committed.get("surface") or ""), voice_live_turn, None
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -456,11 +520,21 @@ def _(rid, params: dict) -> dict:
             str(limit_message),
             {"reason": reason} if reason else None,
         )
-    # Which desktop window this message was typed into. Rewritten on every
-    # submit, because one session can be driven from the app window and the HUD
-    # in turn: a stale "hud" would tell the model the user is still floating
-    # over another app when they are back in Hermes.
-    session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
+    # Which desktop window this message was typed into, and — for a live voice
+    # delegation — the recent spoken exchange the turn refers to. Admitted once,
+    # here, BEFORE the session is claimed or any row is persisted, so a refused
+    # submit leaves the session exactly as it was.
+    #
+    # client_surface is mirrored on the session (rewritten on every submit)
+    # because the HUD note's existing seam reads it. It is ALSO threaded into
+    # the one turn it was submitted with — a queued turn drained after a later
+    # submit would otherwise render the newest submit's window. voice_live_turn
+    # is never parked on the session at all: overlapping and queued submits each
+    # keep their own transcript.
+    client_surface, voice_live_turn, surface_refusal = admit_prompt_surface(params)
+    if surface_refusal is not None:
+        return _err(rid, 4004, surface_refusal)
+    session["client_surface"] = client_surface
     has_truncation = (
         truncate_user_ordinal is not None
         or params.get("truncate_before_row_id") is not None
@@ -503,6 +577,8 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            voice_live_turn=voice_live_turn,
+            client_surface=client_surface,
         )
         if busy_response is not None:
             return busy_response
@@ -951,6 +1027,8 @@ def _(rid, params: dict) -> dict:
             text,
             display_kind=display_kind,
             clock_context=clock_context,
+            voice_live_turn=voice_live_turn,
+            client_surface=client_surface,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -1071,6 +1149,8 @@ def _(rid, params: dict) -> dict:
             display_kind=display_kind,
             terminal_callback=hosted_terminal_callback,
             clock_context=clock_context,
+            voice_live_turn=voice_live_turn,
+            client_surface=client_surface,
         )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
@@ -1950,6 +2030,8 @@ def register(server) -> None:
         # PAN-17: prompt.submit free-name; must be on server globals after
         # method_ctx.install() rebinds the handler (NameError otherwise).
         normalize_prompt_clock_context,
+        # PAN-49: same rule for the live-voice surface admission helper.
+        admit_prompt_surface,
     ):
         setattr(
             server,
