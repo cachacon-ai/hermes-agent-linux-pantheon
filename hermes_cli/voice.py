@@ -941,6 +941,8 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
     """
     if not text or not text.strip():
         return
+    if stop_event is not None and stop_event.is_set():
+        return
 
     import re
     import tempfile
@@ -1018,6 +1020,8 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         )
 
         _debug(f"speak_text: synthesizing {len(tts_text)} chars -> {mp3_path}")
+        if stop_event is not None and stop_event.is_set():
+            return
         raw_result = text_to_speech_tool(text=tts_text, output_path=mp3_path)
         try:
             tts_result = json.loads(raw_result) if isinstance(raw_result, str) else {}
@@ -1031,12 +1035,17 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         ]
         played_any = False
         for play_path in play_paths if tts_result.get("success") else []:
+            if stop_event is not None and stop_event.is_set():
+                break
             if os.path.isfile(play_path) and os.path.getsize(play_path) > 0:
                 _debug(
                     f"speak_text: playing {play_path} "
                     f"({os.path.getsize(play_path)} bytes)"
                 )
-                play_audio_file(play_path)
+                if stop_event is None:
+                    play_audio_file(play_path)
+                else:
+                    play_audio_file(play_path, stop_event=stop_event)
                 played_any = True
         cleanup_paths = set(play_paths + [mp3_path, mp3_path.rsplit(".", 1)[0] + ".ogg"])
         for path in cleanup_paths:

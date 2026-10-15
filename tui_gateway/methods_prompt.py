@@ -340,15 +340,15 @@ def _(rid, params: dict) -> dict:
             logger.info("prompt.submit: typed stop phrase — voice chat ended")
             return _ok(rid, {"voice_stopped": True})
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
-    if params.get("interrupted"):
-        # Client-side barge-in (desktop VAD / typing over playback) — latch it
-        # so this turn's model message carries the interruption note.
-        from tools.tts_streaming import mark_speech_interrupted
-
-        mark_speech_interrupted()
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if params.get("interrupted"):
+        # Client-side barge-in (desktop VAD / typing over playback) — latch it
+        # on this live session so another session cannot consume the note.
+        from tools.tts_streaming import mark_speech_interrupted
+
+        mark_speech_interrupted(sid)
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
