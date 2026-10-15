@@ -330,8 +330,17 @@ def admit_prompt_surface(params) -> tuple[str, dict | None, str | None]:
 
     params = dict(params)
     raw_surface = params.get("surface")
-    if raw_surface is not None and raw_surface not in SURFACES:
-        params["surface"] = None
+    if raw_surface is not None:
+        # Type-check BEFORE the membership test: ``["hud"] not in SURFACES`` is a
+        # TypeError (unhashable), not a tolerated unknown surface. A non-string is
+        # a protocol error the client can fix, so it is refused like a bad
+        # voice_context rather than silently read as "no surface".
+        if not isinstance(raw_surface, str):
+            return "", None, "invalid surface fields: surface must be a string"
+        if raw_surface not in SURFACES:
+            # Deliberate fork divergence (see the docstring): an unknown surface
+            # NAME is tolerated and read as "no surface".
+            params["surface"] = None
     context = params.get("voice_context")
     try:
         if context is not None:
@@ -517,9 +526,11 @@ def _(rid, params: dict) -> dict:
     # submit leaves the session exactly as it was.
     #
     # client_surface is mirrored on the session (rewritten on every submit)
-    # because that is the HUD note's existing seam. voice_live_turn is NOT
-    # parked there: it is threaded into the one turn it was submitted with, so
-    # overlapping and queued submits each keep their own transcript.
+    # because the HUD note's existing seam reads it. It is ALSO threaded into
+    # the one turn it was submitted with — a queued turn drained after a later
+    # submit would otherwise render the newest submit's window. voice_live_turn
+    # is never parked on the session at all: overlapping and queued submits each
+    # keep their own transcript.
     client_surface, voice_live_turn, surface_refusal = admit_prompt_surface(params)
     if surface_refusal is not None:
         return _err(rid, 4004, surface_refusal)
@@ -567,6 +578,7 @@ def _(rid, params: dict) -> dict:
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
             voice_live_turn=voice_live_turn,
+            client_surface=client_surface,
         )
         if busy_response is not None:
             return busy_response
@@ -1016,6 +1028,7 @@ def _(rid, params: dict) -> dict:
             display_kind=display_kind,
             clock_context=clock_context,
             voice_live_turn=voice_live_turn,
+            client_surface=client_surface,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -1137,6 +1150,7 @@ def _(rid, params: dict) -> dict:
             terminal_callback=hosted_terminal_callback,
             clock_context=clock_context,
             voice_live_turn=voice_live_turn,
+            client_surface=client_surface,
         )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)

@@ -128,6 +128,23 @@ def _worker_carries_voice_live(server: Any) -> bool:
         return False
 
 
+def _worker_carries_client_surface(server: Any) -> bool:
+    """Whether this worker's turn prologue can carry the per-turn client surface.
+
+    Same fail-closed contract as the delegation frame: without it a queued HUD turn
+    drained on an older worker would read whatever the session mirror last held.
+    """
+    import inspect
+
+    run_prompt_submit = getattr(server, "_run_prompt_submit", None)
+    if run_prompt_submit is None:
+        return False
+    try:
+        return "client_surface" in inspect.signature(run_prompt_submit).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _build_sha() -> str:
     try:
         return subprocess.check_output(
@@ -552,7 +569,12 @@ class ComputeHost:
 
             clock_context = normalize_prompt_clock_context(frame.get("clock_context"))
             voice_live_turn = frame.get("voice_live_turn") or None
-            if voice_live_turn and not _worker_carries_voice_live(server):
+            # Absent key means the producer pinned no surface; "" is an explicit
+            # app-window turn and must not fall back to the session mirror.
+            client_surface = frame.get("client_surface")
+            if (voice_live_turn and not _worker_carries_voice_live(server)) or (
+                client_surface is not None and not _worker_carries_client_surface(server)
+            ):
                 # Fail closed. Running the delegation without its transcript would
                 # answer the spoken request from the typed prompt alone — the
                 # model never learns it came from a live voice turn. A visible
@@ -562,7 +584,9 @@ class ComputeHost:
                         "type": "turn.error",
                         "sid": sid,
                         "request_id": request_id,
-                        "message": "this compute host cannot carry a live-voice delegation",
+                        "message": (
+                            "this compute host cannot carry this turn's client surface"
+                        ),
                     }
                 )
                 with session["history_lock"]:
@@ -577,6 +601,7 @@ class ComputeHost:
                 display_kind=frame.get("display_kind") or None,
                 clock_context=clock_context,
                 voice_live_turn=voice_live_turn,
+                client_surface=client_surface,
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

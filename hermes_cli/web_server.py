@@ -5571,7 +5571,12 @@ async def create_voice_live_session(
     ``session.delegation.created`` the client receives becomes a Hermes turn on
     the session it belongs to (surface ``voice-live``).
     """
-    from tools.voice_live import create_webrtc_session
+    from tools.voice_live import (
+        VoiceLiveDisabledError,
+        VoiceLiveHistoryError,
+        VoiceLiveMissingKeyError,
+        create_webrtc_session,
+    )
 
     # Emptiness only: the vendor's SDP parser needs the offer byte-exact,
     # including its trailing CRLF (a stripped offer answers
@@ -5589,7 +5594,17 @@ async def create_voice_live_session(
         # first or the client is told to fall back to chained permanently.
         _log.warning("GPT-Live session creation failed: malformed answer: %s", exc)
         raise HTTPException(status_code=502, detail="GPT-Live session creation failed") from exc
-    except ValueError as exc:
+    except VoiceLiveDisabledError as exc:
+        # The profile is on the chained engine. Retrying is pointless and the
+        # client must not treat this as a transient failure, so it is a
+        # conflict with the selected mode rather than a 5xx.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except VoiceLiveHistoryError as exc:
+        # The client's history is structurally unusable. It is the client's
+        # request to fix, so it is a 400 — and the message names the offending
+        # entry without echoing its content.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VoiceLiveMissingKeyError as exc:
         # No key resolves for this profile. Not a vendor failure: the client
         # falls back to the chained STT -> TTS engine permanently.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -5600,7 +5615,7 @@ async def create_voice_live_session(
         # one thing to the client: the live session did not start. The detail is
         # a fixed string because a vendor error body is untrusted and must not
         # be echoed (nor logged) with anything key-shaped in it.
-        _log.warning("GPT-Live session creation failed: %s: %s", type(exc).__name__, exc)
+        _log.warning("GPT-Live session creation failed: %s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="GPT-Live session creation failed") from exc
     return {"ok": True, **result}
 

@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 
 GPT_LIVE_MODE = "gpt-live"
 CHAINED_MODE = "chained"
+
+# Vendor limits for the ``input`` history of a live session (live-conversations guide):
+# at most 128 messages, ~8192 combined tokens. Sizes are enforced by pruning the OLDEST
+# messages; a structurally invalid entry is a client error and is refused instead.
+LIVE_HISTORY_MAX_MESSAGES = 128
+LIVE_HISTORY_MAX_TOKENS = 8192
+# Conservative token estimate: 4 characters per token over-estimates rather than
+# under-estimates, so pruning happens before the vendor rejects the session.
+LIVE_HISTORY_CHARS_PER_TOKEN = 4
+LIVE_HISTORY_ROLES = frozenset({"system", "user", "assistant"})
+# The only content parts a live session accepts. Anything else (audio, image, tool
+# output) is not text the voice model can be primed with.
+LIVE_HISTORY_PART_TYPES = frozenset({"text", "input_text"})
+
 DEFAULT_LIVE_MODEL = "gpt-live-1"
 DEFAULT_LIVE_VOICE = "marin"
 DEFAULT_LIVE_BASE_URL = "https://api.openai.com/v1"
@@ -111,6 +125,53 @@ def voice_chat_mode(voice: Optional[dict[str, Any]] = None) -> str:
     return GPT_LIVE_MODE if mode in {GPT_LIVE_MODE, "gptlive", "live"} else CHAINED_MODE
 
 
+class VoiceLiveError(RuntimeError):
+    """A typed GPT-Live failure. The HTTP route maps each subclass to its own status
+    and a fixed detail string, so a vendor body never reaches the client."""
+
+
+class VoiceLiveDisabledError(VoiceLiveError):
+    """``voice.voice_chat_mode`` is not ``gpt-live``. Raised BEFORE any vendor call: this
+    mode is opt-in, and a chained install must never start (or bill) a live session."""
+
+
+class VoiceLiveProtocolError(VoiceLiveError):
+    """The vendor answered 2xx with a body that is not a usable session answer (no session
+    id, or no SDP answer). A failed session, not a missing key."""
+
+
+class VoiceLiveUpstreamError(VoiceLiveError):
+    """The vendor rejected the request or the transport failed. Carries the HTTP status and
+    an error category only — never the upstream body, which is untrusted and may echo key
+    material."""
+
+
+class VoiceLiveHistoryError(ValueError):
+    """A ``history`` entry is structurally unusable (not a message, a disallowed role, or
+    non-text content). Subclasses ``ValueError`` so it cannot be mistaken for the missing-key
+    case, and is raised as a client error (400) rather than pruned."""
+
+
+class VoiceLiveMissingKeyError(ValueError):
+    """No OpenAI key resolves for this profile. The client falls back to chained mode."""
+
+
+def ensure_gpt_live_mode(voice: Optional[dict[str, Any]] = None) -> str:
+    """Refuse unless the profile actually selected ``gpt-live``.
+
+    The mode gate lives here, ahead of credential resolution and the network call, so a
+    chained install cannot start a live session even when a key happens to resolve. The
+    opt-in is the contract: a key alone does not enable this mode.
+    """
+    mode = voice_chat_mode(voice)
+    if mode != GPT_LIVE_MODE:
+        raise VoiceLiveDisabledError(
+            f"voice chat mode is {CHAINED_MODE!r}; set voice.voice_chat_mode: {GPT_LIVE_MODE} "
+            "to use GPT-Live"
+        )
+    return mode
+
+
 def _resolve_credentials(live: dict[str, Any]) -> tuple[str, str]:
     """``(api_key, base_url)`` — ``voice.gpt_live.api_key`` first, else the same OpenAI audio
     chain the STT/TTS providers use (``VOICE_TOOLS_OPENAI_KEY`` → ``OPENAI_API_KEY`` → pool).
@@ -144,6 +205,78 @@ def resolve_gpt_live_status() -> dict[str, Any]:
     }
 
 
+def _history_message_text(message: dict[str, Any], index: int) -> str:
+    """The single text body of a history message.
+
+    The live API accepts ONE text part per message and text content only. A bare string
+    content is the common shape; a parts list is accepted only when every part is text,
+    and is joined so the message still carries one text part.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                raise VoiceLiveHistoryError(f"history[{index}] has a non-object content part")
+            part_type = part.get("type")
+            text = part.get("text")
+            if part_type not in LIVE_HISTORY_PART_TYPES or not isinstance(text, str):
+                raise VoiceLiveHistoryError(
+                    f"history[{index}] content must be text (type and text string)"
+                )
+            texts.append(text)
+        return "\n".join(texts)
+    raise VoiceLiveHistoryError(f"history[{index}] content must be a string or a list of text parts")
+
+
+def normalize_session_history(history: Optional[list]) -> list[dict[str, Any]]:
+    """Validate and prune the client-supplied ``input`` history for a live session.
+
+    Structural violations are REFUSED (400), not silently dropped: a message whose role or
+    content the voice model cannot be primed with is a client bug, and quietly discarding it
+    would leave the model primed on a history the user never saw. SIZE limits are pruned
+    instead — the oldest messages go first, which is what the vendor itself asks for.
+    """
+    if not history:
+        return []
+    if not isinstance(history, list):
+        raise VoiceLiveHistoryError("history must be a list of messages")
+    normalized: list[dict[str, Any]] = []
+    for index, message in enumerate(history):
+        if not isinstance(message, dict):
+            raise VoiceLiveHistoryError(f"history[{index}] must be an object")
+        role = message.get("role")
+        if not isinstance(role, str) or role.strip().lower() not in LIVE_HISTORY_ROLES:
+            raise VoiceLiveHistoryError(
+                f"history[{index}] role must be one of {sorted(LIVE_HISTORY_ROLES)}"
+            )
+        text = _history_message_text(message, index)
+        if not text.strip():
+            # An empty message has nothing to prime with and costs a slot in a 128-message
+            # budget; drop it rather than pruning a real one later.
+            continue
+        normalized.append(
+            {
+                "type": "message",
+                "role": role.strip().lower(),
+                "content": [{"type": "input_text", "text": text}],
+            }
+        )
+    # Prune oldest-first against the vendor's count and token budget. The token estimate
+    # is deliberately coarse (4 chars/token) so it prunes early rather than late.
+    pruned = normalized[-LIVE_HISTORY_MAX_MESSAGES:]
+    budget_chars = LIVE_HISTORY_MAX_TOKENS * LIVE_HISTORY_CHARS_PER_TOKEN
+    total_chars = sum(
+        len(part["text"]) for message in pruned for part in message["content"]
+    )
+    while len(pruned) > 1 and total_chars > budget_chars:
+        dropped = pruned.pop(0)
+        total_chars -= len(dropped["content"][0]["text"])
+    return pruned
+
+
 def build_session_config(history: Optional[list] = None) -> dict[str, Any]:
     """The ``session`` object for ``POST /v1/live/sessions`` (client delegation, WebRTC — the
     transport negotiates the audio format, so none is set)."""
@@ -154,22 +287,70 @@ def build_session_config(history: Optional[list] = None) -> dict[str, Any]:
         "audio": {"output": {"voice": str(live.get("voice") or DEFAULT_LIVE_VOICE)}},
         "delegation": {"type": "client"},
     }
-    if history:
-        config["input"] = history
+    normalized = normalize_session_history(history)
+    if normalized:
+        config["input"] = normalized
     return config
+
+
+def _validate_session_answer(payload: Any) -> dict[str, Any]:
+    """Require a usable session answer: a non-empty session id and a WebRTC SDP answer.
+
+    A 200 with an unexpected body is a FAILED session reported as a success — the client
+    would mount a media session against a payload that has no answer. Both fields are
+    checked for shape here so the failure is one typed error (mapped to 502) instead of a
+    confusing WebRTC error much later.
+    """
+    if not isinstance(payload, dict):
+        raise VoiceLiveProtocolError("vendor answer is not an object")
+    session = payload.get("session")
+    session_id = session.get("id") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise VoiceLiveProtocolError("vendor answer has no session id")
+    transport = payload.get("transport")
+    if not isinstance(transport, dict):
+        raise VoiceLiveProtocolError("vendor answer has no transport")
+    sdp = transport.get("sdp")
+    if not isinstance(sdp, str) or not sdp.strip():
+        raise VoiceLiveProtocolError("vendor answer has no SDP")
+    # Sanity check only: an SDP answer always starts with the "v=" protocol version line.
+    # A stray body that happens to carry a non-empty string here is not an answer.
+    if not sdp.lstrip().startswith("v="):
+        raise VoiceLiveProtocolError("vendor answer SDP is not an SDP")
+    return payload
+
+
+def _vendor_error_category(status: int) -> str:
+    """A coarse category for logs — never the upstream body, which may echo key material."""
+    if status in (401, 403):
+        return "auth"
+    if status == 404:
+        return "not_found"
+    if status == 429:
+        return "rate_limited"
+    if 500 <= status < 600:
+        return "server_error"
+    return "rejected"
 
 
 def create_webrtc_session(sdp_offer: str, history: Optional[list] = None) -> dict[str, Any]:
     """Exchange the renderer's SDP offer for the Live session answer.
 
-    Returns the vendor response ``{"session": {"id": ...}, "transport": {"type": "webrtc",
-    "sdp": ...}}``. Raises ``ValueError`` for a missing key and ``RuntimeError`` (with the vendor
-    status/detail) for a rejected request.
+    Raises ``VoiceLiveMissingKeyError`` (no key for this profile),
+    ``VoiceLiveDisabledError`` (``voice_chat_mode`` is not ``gpt-live``),
+    ``VoiceLiveHistoryError`` (malformed ``history``), and ``VoiceLiveProtocolError`` /
+    ``VoiceLiveUpstreamError`` for a rejected or unusable vendor answer. The upstream body is
+    never logged, raised, or returned.
     """
+    # Mode gate BEFORE credentials and before any network call: this mode is opt-in, so a
+    # chained install must not start — or bill — a live session even when a key resolves.
+    ensure_gpt_live_mode()
     live = _live_section()
     api_key, base_url = _resolve_credentials(live)
     if not api_key:
-        raise ValueError("GPT-Live needs an OpenAI API key (OPENAI_API_KEY or voice.gpt_live.api_key)")
+        raise VoiceLiveMissingKeyError(
+            "GPT-Live needs an OpenAI API key (OPENAI_API_KEY or voice.gpt_live.api_key)"
+        )
     body = json.dumps({
         "session": build_session_config(history),
         "transport": {"type": "webrtc", "sdp": sdp_offer},
@@ -179,8 +360,13 @@ def create_webrtc_session(sdp_offer: str, history: Optional[list] = None) -> dic
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:600]
-        logger.warning("GPT-Live session creation failed: %s %s", exc.code, detail)
-        raise RuntimeError(f"GPT-Live session creation failed ({exc.code}): {detail}") from exc
+        # Log status + category only. The upstream body is untrusted and can echo the key,
+        # so it is neither logged nor put in the exception the route logs.
+        category = _vendor_error_category(int(exc.code))
+        logger.warning("GPT-Live session creation rejected: status=%s category=%s", exc.code, category)
+        raise VoiceLiveUpstreamError(
+            f"GPT-Live session creation rejected (status {exc.code}, {category})"
+        ) from None
+    return _validate_session_answer(payload)

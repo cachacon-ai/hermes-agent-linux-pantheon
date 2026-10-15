@@ -54,7 +54,9 @@ def admit_surface(params):
     persisted row rather than a transcript.
     """
     surface, context, interrupted, voice_turn = (params.get(key) for key in _SUBMIT_FIELDS)
-    if surface is not None and surface not in SURFACES:
+    # Type-check before the membership test: an unhashable surface (list/dict) makes
+    # ``in SURFACES`` raise TypeError instead of refusing the submit.
+    if surface is not None and (not isinstance(surface, str) or surface not in SURFACES):
         raise SurfaceAdmissionError("invalid_params")
     # The spoken transcript only makes sense for a live-voice delegation; anywhere
     # else it is a client smuggling model input past the persisted row.
