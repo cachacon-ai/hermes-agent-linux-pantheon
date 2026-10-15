@@ -238,6 +238,68 @@ class TestSpeakTextGuards:
         assert voice.speak_text("Do not synthesize after Stop", stop) is None
         assert synthesized == []
 
+    def test_on_playback_start_fires_after_synthesis_at_first_play(self, monkeypatch):
+        """The callback must land when audio plays, not when it is generated.
+
+        Synthesis can take seconds. A Stop in that window is not something the
+        user could have heard cut off, so it must not count as an interruption.
+        """
+        import hermes_cli.voice as voice
+        from tools import tts_tool, tts_streaming
+
+        order = []
+        returned_path = "/tmp/hermes_voice/start.mp3"
+        monkeypatch.setattr(
+            tts_streaming, "resolve_streaming_provider", lambda *a, **k: None
+        )
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
+        monkeypatch.setattr(
+            tts_tool,
+            "text_to_speech_tool",
+            lambda **_kwargs: (
+                order.append("synthesized"),
+                json.dumps({"success": True, "file_path": returned_path}),
+            )[1],
+        )
+        monkeypatch.setattr(voice.os, "makedirs", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(voice.os.path, "isfile", lambda path: path == returned_path)
+        monkeypatch.setattr(voice.os.path, "getsize", lambda _path: 1000)
+        monkeypatch.setattr(voice.os, "unlink", lambda _path: None)
+        monkeypatch.setattr(
+            voice,
+            "play_audio_file",
+            lambda path, **kwargs: order.append("played"),
+        )
+
+        assert voice.speak_text("Say this", on_playback_start=lambda: order.append("playback_start")) is None
+        # Synthesis strictly precedes the signal, and the signal strictly
+        # precedes the audio actually reaching the speaker.
+        assert order == ["synthesized", "playback_start", "played"]
+
+    def test_on_playback_start_not_called_when_nothing_plays(self, monkeypatch):
+        """A provider that yields no audio must never report playback starting."""
+        import hermes_cli.voice as voice
+        from tools import tts_tool, tts_streaming
+
+        fired = []
+        monkeypatch.setattr(
+            tts_streaming, "resolve_streaming_provider", lambda *a, **k: None
+        )
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
+        monkeypatch.setattr(
+            tts_tool,
+            "text_to_speech_tool",
+            lambda **_kwargs: json.dumps({"success": False}),
+        )
+        monkeypatch.setattr(voice.os, "makedirs", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(voice.os, "unlink", lambda _path: None)
+        monkeypatch.setattr(
+            voice, "play_audio_file", lambda *_a, **_k: pytest.fail("must not play")
+        )
+
+        assert voice.speak_text("Nothing to say", on_playback_start=lambda: fired.append(1)) is None
+        assert fired == []
+
     def test_speak_text_uses_returned_tts_file_path(self, monkeypatch):
         import hermes_cli.voice as voice
         from tools import tts_tool

@@ -17779,10 +17779,16 @@ def _tts_stream_stop_locked(
 ) -> Optional[dict]:
     """Mark and detach the matching stream while ``_tts_stream_lock`` is held.
 
-    A stream slot only exists once playback has begun, so a cut landing on it
-    always has audio to attribute. *mark_only* still applies: a new turn in one
-    session cuts the shared speaker, but must not tell a different session
-    that the user interrupted it.
+    *mark_only* narrows which session may be latched: a new turn in one session
+    cuts the shared speaker, but must not tell a different session that the user
+    interrupted it.
+
+    Known gap, unchanged from main: the stream slot is installed by
+    ``_tts_stream_begin`` at the start of the turn, not when audio starts
+    flowing. A Stop landing during generation therefore still latches an
+    interruption on a streaming turn even though nothing was heard yet. The
+    whole-reply fallback path gates this on its ``playing`` flag; the streaming
+    path does not yet.
     """
     global _tts_stream_state
     state = _tts_stream_state
@@ -18149,11 +18155,11 @@ def _speak_text_with_barge(
 
     def _speak():
         try:
-            # Speech is about to start, so this slot can now be marked as
-            # interrupted if something cuts it. A slot reserved but never
-            # reached this line must not latch an interruption.
-            playing.set()
-            speak_text(text, stop)
+            # The playing flag is latched by speak_text when audio actually
+            # reaches the speaker, not here — synthesis can take seconds, and a
+            # Stop landing in that window must not count as an interruption the
+            # user never heard.
+            speak_text(text, stop, on_playback_start=playing.set)
         except Exception as e:
             logger.warning("voice TTS playback failed: %s", e)
         finally:

@@ -20838,10 +20838,12 @@ def test_speak_text_with_barge_arms_monitor_and_cuts_playback(monkeypatch, tmp_p
     speak_started = threading.Event()
     release_speak = threading.Event()
 
-    def fake_speak_text(text, stop_event=None):
+    def fake_speak_text(text, stop_event=None, on_playback_start=None):
         speak_calls["text"] = text
         speak_calls["stop_event"] = stop_event
         speak_started.set()
+        if on_playback_start is not None:
+            on_playback_start()
         release_speak.wait(5)
 
     monkeypatch.setitem(
@@ -20891,12 +20893,16 @@ def test_speak_text_with_barge_no_monitor_when_voice_mode_off(monkeypatch):
         return None
 
     done_speaking = threading.Event()
+
+    def _fake_speak_that_signals_playback(text, stop_event=None, on_playback_start=None):
+        if on_playback_start is not None:
+            on_playback_start()
+        done_speaking.set()
+
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.voice",
-        types.SimpleNamespace(
-            speak_text=lambda text, stop_event=None: done_speaking.set()
-        ),
+        types.SimpleNamespace(speak_text=_fake_speak_that_signals_playback),
     )
     _fake_tts_modules(monkeypatch, listen=fake_listen)
 

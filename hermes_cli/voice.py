@@ -925,7 +925,11 @@ def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = Non
     return done_event.is_set()
 
 
-def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
+def speak_text(
+    text: str,
+    stop_event: Optional[threading.Event] = None,
+    on_playback_start: Optional[Callable[[], None]] = None,
+) -> None:
     """Synthesize ``text`` with the configured TTS provider and play it.
 
     Mirrors cli.py:_voice_speak_response exactly — same markdown strip
@@ -1042,6 +1046,15 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
                     f"speak_text: playing {play_path} "
                     f"({os.path.getsize(play_path)} bytes)"
                 )
+                if not played_any and on_playback_start is not None:
+                    # Audio is reaching the speaker for the first time.
+                    # Signalling here rather than before synthesis keeps a
+                    # Stop that lands mid-synthesis from counting as an
+                    # interruption the user could not possibly have heard.
+                    try:
+                        on_playback_start()
+                    except Exception:
+                        pass
                 if stop_event is None:
                     play_audio_file(play_path)
                 else:
