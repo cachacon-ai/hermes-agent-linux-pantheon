@@ -5,9 +5,12 @@ tui_gateway/
 agent/pantheon_artifacts.py
 agent/transports/codex_app_server_session.py
 tools/pantheon_tool.py
+tools/voice_live.py
 hermes_state.py
 gateway/
 hermes_cli/web_server.py
+hermes_cli/web_models.py
+hermes_cli/config_defaults.py
 hermes_cli/web_routers/
 agent/conversation_compression.py
 run_agent.py
@@ -27,3 +30,7 @@ tests/hermes_cli/test_config_read_guard.py
 tests/hermes_cli/test_web_server_validation_errors.py
 tests/tools/test_subprocess_stdin_guard.py
 tests/agent/test_compression_concurrent_fork.py
+tests/tui_gateway/test_voice_live_delegation.py
+tests/tui_gateway/test_hud_surface_note.py
+tests/gateway/test_surface_admission.py
+tests/hermes_cli/test_voice_live_routes.py
