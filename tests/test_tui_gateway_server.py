@@ -20156,6 +20156,125 @@ def test_tts_stream_begin_respects_and_transfers_fallback_reservation(monkeypatc
     server._tts_stream_stop(user_barge=False)
 
 
+def test_process_wide_stop_silences_untracked_players(monkeypatch):
+    """A process-wide stop reaches players this process never registered.
+
+    `/voice off`, TTS-off and a new turn all stop the speaker process-wide.
+    Gating that on a registered stream or fallback left a player started
+    outside those slots audible straight through the mode change.
+    """
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    playback_stops: list = []
+    _fake_tts_modules(monkeypatch, playback_stops=playback_stops)
+    server._tts_stream_stop(user_barge=False)
+    playback_stops.clear()
+
+    # Nothing is owned by this process: no stream slot, no fallback pipelines.
+    with server._tts_stream_lock:
+        assert server._tts_stream_state is None
+    with server._fd_listener_lock:
+        assert not server._fd_speak_pipelines
+
+    server._stop_voice_output(session_id=None)
+    assert playback_stops == [True]
+
+
+def test_reserved_but_unplayed_pipeline_is_stopped_without_marking(monkeypatch):
+    """Stop during generation must not claim an interruption that never happened.
+
+    The fallback slot is reserved for the whole turn so a Stop landing during
+    generation cannot let the stale reply speak afterwards. But nothing has
+    played yet, so this session must not be marked speech-interrupted.
+    """
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: marked.append(session_id)
+        ),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    reserved = server._register_fd_speak_pipeline("session-idle")
+    assert not reserved[3].is_set(), "a reserved slot has not started playing"
+
+    server._stop_voice_output(session_id="session-idle")
+    assert reserved[0].is_set(), "the stale reply must not be able to speak"
+    assert marked == [], "nothing played, so nothing was interrupted"
+
+    server._finish_fd_speak_pipeline(reserved)
+    server._tts_stream_stop(user_barge=False)
+
+
+def test_playing_pipeline_is_still_marked_interrupted_on_stop(monkeypatch):
+    """The reservation flag must gate marking, not disable it.
+
+    Once speech has actually begun, a Stop is a real interruption and has to
+    latch the note the next turn carries — otherwise barge-in silently stops
+    working.
+    """
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: marked.append(session_id)
+        ),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    playing = server._register_fd_speak_pipeline("session-live")
+    playing[3].set()  # speech actually started
+
+    server._stop_voice_output(session_id="session-live")
+    assert playing[0].is_set()
+    assert marked == ["session-live"]
+
+    server._finish_fd_speak_pipeline(playing)
+    server._tts_stream_stop(user_barge=False)
+
+
+def test_new_turn_cuts_shared_speaker_without_marking_another_session(monkeypatch):
+    """One speaker means a new turn silences others; it must not blame them.
+
+    Starting a turn in one session displaces whatever the single shared speaker
+    is playing. That other session is cut off, but it did not get interrupted by
+    the user, so its next turn must not carry an interruption note.
+    """
+    marked = []
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.tts_streaming",
+        types.SimpleNamespace(
+            mark_speech_interrupted=lambda session_id=None: marked.append(session_id)
+        ),
+    )
+    server._tts_stream_stop(user_barge=False)
+
+    other = server._register_fd_speak_pipeline("session-other")
+    other[3].set()  # it is speaking
+
+    text_queue = server._tts_stream_begin("session-new")
+    assert text_queue is not None
+
+    assert other[0].is_set(), "the shared speaker must be cut off"
+    assert marked == [], "session-other was displaced, not interrupted by the user"
+
+    server._finish_fd_speak_pipeline(other)
+    server._tts_stream_stop(user_barge=False)
+
+
 def test_begin_turn_tts_reserves_stop_owner_before_provider_probe(monkeypatch):
     """Stop during provider readiness cannot leave an unowned speech attempt."""
     monkeypatch.setenv("HERMES_VOICE_TTS", "1")
@@ -20204,7 +20323,8 @@ def test_new_fallback_turn_cuts_previous_fallback_even_without_streaming_tts(
     )
     assert old_pipeline[0].is_set()
     assert not new_pipeline[0].is_set()
-    assert playback_stops == [True]
+    # The initial reset plus the new turn's unconditional process-wide stop.
+    assert playback_stops == [True, True]
     with server._fd_listener_lock:
         assert new_pipeline in server._fd_speak_pipelines
 
@@ -20230,7 +20350,9 @@ def test_tts_stream_begin_and_stop_lifecycle(monkeypatch):
 
     server._tts_stream_stop()
     assert state["stop"].is_set()
-    assert playback_stops == [True]
+    # Both operations stop the process-wide speaker unconditionally: begin()
+    # silences anything left over from before, stop() silences this stream.
+    assert playback_stops == [True, True]
     with server._tts_stream_lock:
         assert server._tts_stream_state is None
 
@@ -20474,7 +20596,11 @@ def test_session_interrupt_stops_only_owned_fallback_speech(monkeypatch):
         assert target_pipeline[0].is_set()
         assert not other_pipeline[0].is_set()
         assert playback_stop_events == [target_pipeline[0]]
-        assert interrupted_sessions == [target]
+        # The fallback is still pending: it was reserved but never started
+        # speaking, so there is no interruption to latch onto the next turn.
+        # A pipeline that actually started playing IS marked — see
+        # test_playing_pipeline_is_still_marked_interrupted_on_stop.
+        assert interrupted_sessions == []
 
         # A reply reaching fallback dispatch after Stop must not start speech.
         spoken = []

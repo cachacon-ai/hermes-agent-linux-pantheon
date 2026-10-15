@@ -17705,7 +17705,14 @@ def _tts_stream_begin(
             # whole-reply fallback because streaming prerequisites are absent.
             # The two ownership locks prevent a fresh pipeline from starting
             # in the gap before the old player's stop completes.
-            _stop_voice_output_locked(user_barge=True)
+            #
+            # Starting a turn therefore DOES cut another session's audio — there
+            # is only one speaker, so the alternative is two replies talking at
+            # once. What it must not do is tell that other session the user
+            # interrupted it: `mark_only` confines the interruption note to the
+            # session that is starting, so a displaced reply is cut off but is
+            # not annotated as a barge on its next turn.
+            _stop_voice_output_locked(user_barge=True, mark_only=session_id)
             if not can_stream:
                 if fallback_pipeline is not None:
                     _fd_speak_pipelines.add(fallback_pipeline)
@@ -17765,9 +17772,18 @@ def _tts_stream_stop(user_barge: bool = True, *, session_id: str | None = None) 
 
 
 def _tts_stream_stop_locked(
-    user_barge: bool = True, *, session_id: str | None = None
+    user_barge: bool = True,
+    *,
+    session_id: str | None = None,
+    mark_only: str | None = None,
 ) -> Optional[dict]:
-    """Mark and detach the matching stream while ``_tts_stream_lock`` is held."""
+    """Mark and detach the matching stream while ``_tts_stream_lock`` is held.
+
+    A stream slot only exists once playback has begun, so a cut landing on it
+    always has audio to attribute. *mark_only* still applies: a new turn in one
+    session cuts the shared speaker, but must not tell a different session
+    that the user interrupted it.
+    """
     global _tts_stream_state
     state = _tts_stream_state
     if state is None:
@@ -17775,7 +17791,12 @@ def _tts_stream_stop_locked(
     if session_id is not None and state.get("session_id") != session_id:
         return None
     _tts_stream_state = None
-    if user_barge and not state["done"].is_set():
+    owner = state.get("session_id")
+    if (
+        user_barge
+        and not state["done"].is_set()
+        and (mark_only is None or owner == mark_only)
+    ):
         import traceback as _tb
         logger.debug(
             "TTS CUT: _tts_stream_stop(user_barge=True) — new turn or "
@@ -17784,49 +17805,75 @@ def _tts_stream_stop_locked(
         )
         from tools.tts_streaming import mark_speech_interrupted
 
-        mark_speech_interrupted(state.get("session_id"))
+        mark_speech_interrupted(owner)
     state["stop"].set()
     return state
 
 
 def _stop_fd_speak_pipelines_locked(
-    *, user_barge: bool = True, session_id: str | None = None
+    *,
+    user_barge: bool = True,
+    session_id: str | None = None,
+    mark_only: str | None = None,
 ) -> list[threading.Event]:
-    """Stop matching fallback pipelines while ``_fd_listener_lock`` is held."""
+    """Stop matching fallback pipelines while ``_fd_listener_lock`` is held.
+
+    A reserved slot that never reached playback is still stopped, so a stale
+    reply cannot speak after Stop landed mid-generation. It is deliberately not
+    marked as speech-interrupted though: nothing was said, so there is no
+    interruption to attach to the next turn. *mark_only* narrows marking to one
+    session, used when a single session's new turn displaces the shared speaker.
+    """
     from tools.tts_streaming import mark_speech_interrupted
 
     stops = []
-    for stop, done, owner_session_id in list(_fd_speak_pipelines):
+    for stop, done, owner_session_id, playing in list(_fd_speak_pipelines):
         if session_id is not None and owner_session_id != session_id:
             continue
         if done.is_set():
             continue
         stop.set()
         stops.append(stop)
-        if user_barge:
+        if user_barge and playing.is_set() and (
+            mark_only is None or owner_session_id == mark_only
+        ):
             mark_speech_interrupted(owner_session_id)
     return stops
 
 
 def _stop_voice_output_locked(
-    *, user_barge: bool = True, session_id: str | None = None
+    *,
+    user_barge: bool = True,
+    session_id: str | None = None,
+    mark_only: str | None = None,
 ) -> None:
-    """Stop stream and fallback speech while both voice ownership locks are held."""
+    """Stop stream and fallback speech while both voice ownership locks are held.
+
+    *mark_only* narrows which sessions may be latched as speech-interrupted.
+    It is set when a shared-speaker replacement is driven by one session's new
+    turn: the audio is cut for everyone, because there is only one speaker,
+    but only the session that started the turn gets the interruption note. A
+    genuine barge-in leaves it ``None`` so every cut session is marked.
+    """
     stream = _tts_stream_stop_locked(
-        user_barge=user_barge, session_id=session_id
+        user_barge=user_barge, session_id=session_id, mark_only=mark_only
     )
     fallback_stops = _stop_fd_speak_pipelines_locked(
-        user_barge=user_barge, session_id=session_id
+        user_barge=user_barge, session_id=session_id, mark_only=mark_only
     )
     stops = ([stream["stop"]] if stream is not None else []) + fallback_stops
 
     try:
         from tools.voice_mode import stop_playback
 
-        if session_id is None and stops:
+        if session_id is None:
             # Process-wide changes and voice barge-in deliberately cut every
-            # current player. Both ownership locks stay held through this call,
-            # so no new session can install audio in the stop/start gap.
+            # current player — including players this process never registered
+            # a stream or fallback slot for, which is what `main` does. Gating
+            # this on registered stops left untracked players audible across
+            # `/voice off`, TTS-off and a new turn. Both ownership locks stay
+            # held through this call, so no new session can install audio in
+            # the stop/start gap.
             stop_playback()
         elif session_id is not None:
             for stop in stops:
@@ -17836,13 +17883,18 @@ def _stop_voice_output_locked(
 
 
 def _stop_voice_output(
-    *, user_barge: bool = True, session_id: str | None = None
+    *,
+    user_barge: bool = True,
+    session_id: str | None = None,
+    mark_only: str | None = None,
 ) -> None:
     """Stop voice output with process-wide or session-scoped ownership."""
     with _tts_stream_lock:
         with _fd_listener_lock:
             _stop_voice_output_locked(
-                user_barge=user_barge, session_id=session_id
+                user_barge=user_barge,
+                session_id=session_id,
+                mark_only=mark_only,
             )
 
 
@@ -17866,23 +17918,33 @@ _fd_listener_rearm_requested = False
 # (stop, done) pairs for fallback whole-reply speak paths currently active —
 # the listener must cut THEIR private stop events too, and must keep
 # listening while any of them is still speaking.
-_fd_speak_pipelines: "set[tuple[threading.Event, threading.Event, str | None]]" = set()
+_fd_speak_pipelines: (
+    "set[tuple[threading.Event, threading.Event, str | None, threading.Event]]"
+) = set()
 
 
 def _register_fd_speak_pipeline(
     session_id: str | None,
-) -> tuple[threading.Event, threading.Event, str | None]:
-    """Reserve a fallback speech slot before synthesis can race with Stop."""
-    pipeline = (threading.Event(), threading.Event(), session_id)
+) -> tuple[threading.Event, threading.Event, str | None, threading.Event]:
+    """Reserve a fallback speech slot before synthesis can race with Stop.
+
+    The slot is reserved for the whole turn, which is the point: Stop can land
+    during generation and must not let the stale reply speak afterwards. The
+    trailing ``playing`` event records whether speech actually began, so a Stop
+    arriving in that window cuts the slot without claiming the user interrupted
+    a reply that never played. It is an Event rather than a mutable flag because
+    the pipeline lives in a set and must stay hashable.
+    """
+    pipeline = (threading.Event(), threading.Event(), session_id, threading.Event())
     with _fd_listener_lock:
         _fd_speak_pipelines.add(pipeline)
     return pipeline
 
 
 def _finish_fd_speak_pipeline(
-    pipeline: tuple[threading.Event, threading.Event, str | None],
+    pipeline: tuple[threading.Event, threading.Event, str | None, threading.Event],
 ) -> None:
-    _stop, done, _session_id = pipeline
+    _stop, done, _session_id, _playing = pipeline
     done.set()
     with _fd_listener_lock:
         _fd_speak_pipelines.discard(pipeline)
@@ -17911,7 +17973,9 @@ def _fd_tts_pending() -> bool:
         return True
     with _fd_listener_lock:
         pipelines = list(_fd_speak_pipelines)
-    return any(not done.is_set() for _stop, done, _session_id in pipelines)
+    return any(
+        not done.is_set() for _stop, done, _session_id, _playing in pipelines
+    )
 
 
 def _full_duplex_listener() -> None:
@@ -18063,7 +18127,8 @@ def _speak_text_with_barge(
     text: str,
     session_id: str | None = None,
     *,
-    pipeline: tuple[threading.Event, threading.Event, str | None] | None = None,
+    pipeline: tuple[threading.Event, threading.Event, str | None, threading.Event]
+    | None = None,
 ) -> bool:
     """Speak *text* via hermes_cli.voice.speak_text with spoken barge-in.
 
@@ -18077,13 +18142,17 @@ def _speak_text_with_barge(
     from hermes_cli.voice import speak_text
 
     pipeline = pipeline or _register_fd_speak_pipeline(session_id)
-    stop, _done, _owner_session_id = pipeline
+    stop, _done, _owner_session_id, playing = pipeline
     if stop.is_set():
         _finish_fd_speak_pipeline(pipeline)
         return False
 
     def _speak():
         try:
+            # Speech is about to start, so this slot can now be marked as
+            # interrupted if something cuts it. A slot reserved but never
+            # reached this line must not latch an interruption.
+            playing.set()
             speak_text(text, stop)
         except Exception as e:
             logger.warning("voice TTS playback failed: %s", e)
