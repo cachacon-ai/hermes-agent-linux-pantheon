@@ -32,6 +32,12 @@ def _restore_sys_modules():
     The purge under test evicts real Hermes modules from the cache; later
     tests in the same process may hold references to the evicted module
     objects (e.g. `patch.object` targets), so put the originals back.
+
+    A re-import also rebinds the parent package attribute
+    (``hermes_cli.gateway = <fresh>``) and restoring ``sys.modules`` does
+    not undo that. ``import hermes_cli.gateway`` then returns the parent
+    attribute while ``importlib.import_module`` returns the restored cache
+    entry. Put the attribute back so the two stay the same object.
     """
     snapshot = dict(sys.modules)
     yield
@@ -40,6 +46,38 @@ def _restore_sys_modules():
     for name in list(sys.modules):
         if name not in snapshot:
             del sys.modules[name]
+    for name, mod in snapshot.items():
+        parent_name, _, child = name.rpartition(".")
+        if not child or mod is None:
+            continue
+        parent = snapshot.get(parent_name)
+        if parent is None or getattr(parent, child, None) is mod:
+            continue
+        try:
+            setattr(parent, child, mod)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _gateway_module_cmd_update_imports():
+    """Module object the restart phase's from-import binds.
+
+    ``from hermes_cli.gateway import find_gateway_pids`` resolves through
+    ``sys.modules``. ``import hermes_cli.gateway as gateway`` reads the
+    parent package attribute, which is a different object after a purge
+    rebinds that attribute and a later ``sys.modules`` restore puts the
+    previous module back.
+    """
+    import importlib
+
+    return importlib.import_module("hermes_cli.gateway")
+
+
+def _import_find_gateway_pids_like_cmd_update():
+    """The import ``cmd_update`` performs after the purge."""
+    from hermes_cli.gateway import find_gateway_pids
+
+    return find_gateway_pids
 
 
 def _fake_module(name: str) -> types.ModuleType:
@@ -107,6 +145,70 @@ def test_purge_never_raises_on_weird_sys_modules():
         cli_main._purge_stale_hermes_modules()
     finally:
         sys.modules.pop("hermes_cli._purge_test_none", None)
+
+
+def test_purge_discards_a_find_gateway_pids_patch():
+    """The restart phase re-imports gateway discovery after this purge.
+
+    ``cmd_update`` calls ``_m()._purge_stale_hermes_modules()`` and then
+    ``from hermes_cli.gateway import find_gateway_pids``. The purge drops
+    ``hermes_cli.gateway`` from ``sys.modules``, so that import binds a
+    fresh scanner. A sentinel installed on the pre-purge module must not
+    survive. That fresh scan is what called ``os.kill`` on host PID 16306
+    in the 5d630cfd7 full suite
+    (``test_active_profile_included_in_skill_sync``, attempt 1). The
+    file retry passed only because the PID was gone.
+    """
+    from hermes_cli.update_cmd import _m
+
+    gateway = _gateway_module_cmd_update_imports()
+    original = gateway.find_gateway_pids
+
+    def _sentinel(*_args, **_kwargs):
+        return ["sentinel-pid"]
+
+    gateway.find_gateway_pids = _sentinel
+    try:
+        assert _import_find_gateway_pids_like_cmd_update() is _sentinel
+        assert _sentinel(all_profiles=True) == ["sentinel-pid"]
+        _m()._purge_stale_hermes_modules()
+        rebound = _import_find_gateway_pids_like_cmd_update()
+        assert rebound is not _sentinel
+        assert rebound.__defaults__ == original.__defaults__
+    finally:
+        gateway.find_gateway_pids = original
+
+
+def test_noop_purge_preserves_the_gateway_pid_patch_across_reimport():
+    """Stubbing the purge keeps the sentinel across cmd_update's re-import.
+
+    The cmd_update autouse fixture replaces ``_purge_stale_hermes_modules``
+    with a no-op so the discovery mock is still the function the restart
+    phase imports. The sentinel has to be installed on the ``sys.modules``
+    entry that ``from hermes_cli.gateway import find_gateway_pids`` reads,
+    including when an earlier cmd_update test in this process left the
+    parent package attribute pointing at a different module object.
+    """
+    from hermes_cli.update_cmd import _m
+
+    gateway = _gateway_module_cmd_update_imports()
+    original_fn = gateway.find_gateway_pids
+    updater = _m()
+    original_purge = updater._purge_stale_hermes_modules
+
+    def _sentinel(*_args, **_kwargs):
+        return ["sentinel-pid"]
+
+    gateway.find_gateway_pids = _sentinel
+    updater._purge_stale_hermes_modules = lambda *args, **kwargs: None
+    try:
+        updater._purge_stale_hermes_modules()
+        rebound = _import_find_gateway_pids_like_cmd_update()
+        assert rebound is _sentinel
+        assert rebound(all_profiles=True) == ["sentinel-pid"]
+    finally:
+        gateway.find_gateway_pids = original_fn
+        updater._purge_stale_hermes_modules = original_purge
 
 
 def test_stale_symbol_scenario_end_to_end():

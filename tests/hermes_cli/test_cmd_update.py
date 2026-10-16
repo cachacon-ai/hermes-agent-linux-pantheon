@@ -84,12 +84,32 @@ def _patch_gateway_discovery():
     the phase is surfaced (#78574: an aborted restart now fails the update),
     an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
     conftest live-system guard and turns into a spurious ``sys.exit(1)``.
-    Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+
+    Patching ``find_gateway_pids`` alone does not hold. ``cmd_update`` calls
+    ``_purge_stale_hermes_modules`` immediately before
+    ``from hermes_cli.gateway import find_gateway_pids``, and that purge
+    evicts ``hermes_cli.gateway`` from ``sys.modules``. The fresh import
+    binds the real scanner, which then ``os.kill``s host PIDs. On the
+    5d630cfd7 full suite that scan found PID 16306, the live-system guard
+    blocked the signal, and the fail-closed restart contract exited 1. The
+    file-level retry passed because the PID was gone — host state, not
+    shared env with the commandcode test.
+
+    Stub the purge so the discovery mocks survive, and stub the other host
+    probes the success path reads (inventory, fleet versions, and the
+    "rows expected" signal). None of the tests here assert on restarts.
+    Same isolation as ``tests/hermes_cli/test_update_autostash.py``.
     """
+    from hermes_cli import main as hermes_main
+
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.update_inventory.collect_runtime_inventory", return_value=None), \
+         patch("hermes_cli.update_inventory.report_unaccounted_runtimes", return_value=False), \
+         patch.object(hermes_main, "_fleet_probe_expected_runtimes", lambda *a, **kw: False), \
+         patch.object(hermes_main, "_purge_stale_hermes_modules", lambda *a, **kw: None), \
+         patch("hermes_cli.update_receipt.collect_fleet_versions", return_value=[]):
         yield
 
 
