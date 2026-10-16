@@ -632,9 +632,31 @@ class TestSessionClose:
             )
 
         assert resp.status_code == 502
+        payload = resp.json()
+        assert payload["detail"]["code"] == "voice_live_close_upstream_rejected"
         assert body_text not in resp.text
         assert secret not in resp.text
         logged = "\n".join(record.getMessage() for record in caplog.records)
         assert body_text not in logged
         assert secret not in logged
         assert "502" in logged and "server_error" in logged
+
+    def test_vendor_404_returns_already_closed(self, auth_client, monkeypatch, no_vendor):
+        _install_voice(monkeypatch, voice_chat_mode="gpt-live")
+        _install_credentials(monkeypatch)
+        from tools import voice_live
+
+        def raise_http_error(req, timeout=0):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
+
+        monkeypatch.setattr(voice_live.urllib.request, "urlopen", raise_http_error)
+
+        body = auth_client.post(
+            "/api/audio/voice-live/session/close",
+            json={"session_id": "live_gone"},
+        ).json()
+
+        assert body["ok"] is True
+        assert body["closed"] is True
+        assert body["already_closed"] is True
+        assert body["vendor_close_method"] == "hangup"

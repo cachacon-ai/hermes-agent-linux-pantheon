@@ -5650,9 +5650,16 @@ async def close_voice_live_session(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except HTTPException:
         raise
-    except VoiceLiveUpstreamError:
+    except VoiceLiveUpstreamError as exc:
         _log.warning("GPT-Live session close failed: upstream rejection")
-        raise HTTPException(status_code=502, detail="GPT-Live session close failed") from None
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "GPT-Live session close failed",
+                "code": "voice_live_close_upstream_rejected",
+                "upstream_status": getattr(exc, "upstream_status", None),
+            },
+        ) from None
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -5661,6 +5668,7 @@ async def close_voice_live_session(
     return {
         "ok": True,
         "closed": bool(result.get("closed")),
+        "already_closed": bool(result.get("already_closed")),
         "vendor_close_method": str(result.get("method") or "hangup"),
     }
 
