@@ -10936,8 +10936,12 @@ def _enqueue_prompt(
         and not voice_live_turn
         and not existing.get("voice_live_turn")
         # Merging across surfaces would either graft the HUD note onto app-window
-        # words or drop it from the HUD words it belongs to.
-        and existing.get("client_surface", "") == (client_surface or "")
+        # words or drop it from the HUD words it belongs to. A missing key and
+        # an explicit ``""`` are different pins: the former falls back to the
+        # session mirror, the latter must not.
+        and (
+            existing["client_surface"] if "client_surface" in existing else None
+        ) == client_surface
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -11163,6 +11167,28 @@ def _handle_busy_submit(
     return _ok(rid, {"status": "queued"})
 
 
+def _queued_turn_dispatch_kwargs(queued: dict, queue_generation: int) -> dict:
+    """Kwargs for one drained envelope.
+
+    Only pins the envelope actually carries are forwarded. An absent
+    ``client_surface`` means "not pinned" (the turn falls back to the session
+    mirror); passing ``None`` would still be an explicit argument and would
+    collapse that distinction for callers that compare dispatch kwargs.
+    ``""`` is forwarded because it is an explicit app-window pin.
+    ``voice_live_turn`` is forwarded only when this envelope carries one.
+    """
+    kwargs: dict = {"queued_prompt_generation": queue_generation}
+    image_paths = queued.get("image_paths")
+    if image_paths:
+        kwargs["image_paths"] = image_paths
+    if "client_surface" in queued:
+        kwargs["client_surface"] = queued.get("client_surface")
+    voice_live_turn = queued.get("voice_live_turn")
+    if voice_live_turn:
+        kwargs["voice_live_turn"] = voice_live_turn
+    return kwargs
+
+
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """Fire a queued next-turn prompt if one is waiting and the session is idle.
 
@@ -11206,30 +11232,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return True
     dispatch_failed = False
     try:
-        queued_voice_live_turn = queued.get("voice_live_turn") or None
-        # Absent key = the envelope predates per-turn surfaces (or the turn source
-        # pinned none) and falls back to the session mirror; "" = an explicit
-        # app-window turn that must not read the mirror.
-        queued_client_surface = queued.get("client_surface")
+        # Absent key = the envelope predates per-turn surfaces (or the turn
+        # source pinned none) and falls back to the session mirror; "" = an
+        # explicit app-window turn that must not read the mirror.
+        dispatch_kwargs = _queued_turn_dispatch_kwargs(queued, queue_generation)
         if use_compute_host:
-            if queued.get("image_paths"):
-                resp = _submit_prompt_to_compute_host(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                    voice_live_turn=queued_voice_live_turn,
-                    client_surface=queued_client_surface,
-                )
-            else:
-                resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"],
-                    queued_prompt_generation=queue_generation,
-                    voice_live_turn=queued_voice_live_turn,
-                    client_surface=queued_client_surface,
-                )
+            resp = _submit_prompt_to_compute_host(
+                rid, sid, session, queued["text"], **dispatch_kwargs,
+            )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
@@ -11238,27 +11248,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
         else:
-            if queued.get("image_paths"):
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                    voice_live_turn=queued_voice_live_turn,
-                    client_surface=queued_client_surface,
-                )
-            else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    queued_prompt_generation=queue_generation,
-                    voice_live_turn=queued_voice_live_turn,
-                    client_surface=queued_client_surface,
-                )
+            _run_prompt_submit(
+                rid, sid, session, queued["text"], **dispatch_kwargs,
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
