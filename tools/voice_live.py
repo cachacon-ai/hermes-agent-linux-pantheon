@@ -370,3 +370,58 @@ def create_webrtc_session(sdp_offer: str, history: Optional[list] = None) -> dic
             f"GPT-Live session creation rejected (status {exc.code}, {category})"
         ) from None
     return _validate_session_answer(payload)
+
+
+def close_live_session(session_id: str) -> dict[str, Any]:
+    """End a vendor Live session server-side.
+
+    OpenAI documents ``POST /v1/live/sessions/{session_id}/hangup`` for SIP and WebRTC
+    sessions (empty body, ``200 OK`` on success). WebRTC clients may also send
+    ``session.close`` on the data channel; this HTTP hangup is the server-side teardown
+    hook Pantheon can call when the renderer only has the vendor session id.
+
+    Returns ``{"closed": True, "method": "hangup"}`` on success. Never logs or returns
+    the upstream body.
+    """
+    ensure_gpt_live_mode()
+    vendor_id = str(session_id or "").strip()
+    if not vendor_id:
+        raise ValueError("session_id is required")
+
+    live = _live_section()
+    api_key, base_url = _resolve_credentials(live)
+    if not api_key:
+        raise VoiceLiveMissingKeyError(
+            "GPT-Live needs an OpenAI API key (OPENAI_API_KEY or voice.gpt_live.api_key)"
+        )
+
+    req = urllib.request.Request(
+        f"{base_url}/live/sessions/{vendor_id}/hangup",
+        data=b"",
+        method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "*/*"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        category = _vendor_error_category(int(exc.code))
+        logger.warning(
+            "GPT-Live session hangup rejected: status=%s category=%s",
+            exc.code,
+            category,
+        )
+        raise VoiceLiveUpstreamError(
+            f"GPT-Live session hangup rejected (status {exc.code}, {category})"
+        ) from None
+    if status >= 400:
+        category = _vendor_error_category(status)
+        logger.warning(
+            "GPT-Live session hangup rejected: status=%s category=%s",
+            status,
+            category,
+        )
+        raise VoiceLiveUpstreamError(
+            f"GPT-Live session hangup rejected (status {status}, {category})"
+        )
+    return {"closed": True, "method": "hangup"}

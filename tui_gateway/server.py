@@ -14041,7 +14041,12 @@ def _run_prompt_submit(
             # begin() first — it cuts any still-speaking previous turn, and
             # that cut IS this turn's barge-in, so it must latch before we
             # consume the latch below.
-            tts_queue, fallback_tts_pipeline = _begin_turn_tts(sid)
+            # GPT-Live delegations are spoken by the Live model on the client;
+            # server-side TTS here would double-speak on desktop gpt-live.
+            if voice_live_turn:
+                tts_queue, fallback_tts_pipeline = None, None
+            else:
+                tts_queue, fallback_tts_pipeline = _begin_turn_tts(sid)
 
             # Full-duplex agent-turn listener: armed at utterance-submit so
             # the user can interject DURING generation, not just during

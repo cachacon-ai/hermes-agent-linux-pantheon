@@ -1847,6 +1847,7 @@ from hermes_cli.web_models import (  # noqa: F401
     WhatsAppOnboardingStart,
     WhatsAppOnboardingApply,
     AudioTranscriptionRequest,
+    VoiceLiveSessionCloseRequest,
     VoiceLiveSessionRequest,
     ManagedFileUpload,
     ChatImageUpload,
@@ -5618,6 +5619,50 @@ async def create_voice_live_session(
         _log.warning("GPT-Live session creation failed: %s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="GPT-Live session creation failed") from exc
     return {"ok": True, **result}
+
+
+@app.post("/api/audio/voice-live/session/close")
+async def close_voice_live_session(
+    payload: VoiceLiveSessionCloseRequest, profile: Optional[str] = None
+):
+    """Server-side teardown for a vendor GPT-Live session (``POST …/hangup``).
+
+    The OpenAI key stays on this host. Accepts the vendor ``session.id`` returned
+    from ``/api/audio/voice-live/session``; never logs key material or upstream bodies.
+    """
+    from tools.voice_live import (
+        VoiceLiveDisabledError,
+        VoiceLiveMissingKeyError,
+        VoiceLiveUpstreamError,
+        close_live_session,
+    )
+
+    session_id = (payload.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    try:
+        result = await _run_config_scoped(
+            profile, lambda: close_live_session(session_id)
+        )
+    except VoiceLiveDisabledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except VoiceLiveMissingKeyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except VoiceLiveUpstreamError:
+        _log.warning("GPT-Live session close failed: upstream rejection")
+        raise HTTPException(status_code=502, detail="GPT-Live session close failed") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _log.warning("GPT-Live session close failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="GPT-Live session close failed") from exc
+    return {
+        "ok": True,
+        "closed": bool(result.get("closed")),
+        "vendor_close_method": str(result.get("method") or "hangup"),
+    }
 
 
 def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:

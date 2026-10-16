@@ -508,3 +508,79 @@ class TestUpstreamBodyIsNeverEchoed:
         assert secret not in logged
         # The operator still gets the status and a category.
         assert "400" in logged
+
+
+class TestSessionClose:
+    def test_requires_session_id(self, auth_client, monkeypatch, no_vendor):
+        _install_voice(monkeypatch, voice_chat_mode="gpt-live")
+        _install_credentials(monkeypatch)
+
+        resp = auth_client.post("/api/audio/voice-live/session/close", json={"session_id": "  "})
+
+        assert resp.status_code == 400
+
+    def test_hangup_success_never_leaks_key(self, auth_client, monkeypatch, no_vendor):
+        _install_voice(monkeypatch, voice_chat_mode="gpt-live")
+        _install_credentials(monkeypatch)
+        captured = {}
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["auth"] = req.headers.get("Authorization", "")
+            return _Resp()
+
+        from tools import voice_live
+
+        monkeypatch.setattr(voice_live.urllib.request, "urlopen", fake_urlopen)
+
+        body = auth_client.post(
+            "/api/audio/voice-live/session/close",
+            json={"session_id": "live_close_me"},
+        ).json()
+
+        _assert_no_key(body)
+        assert body["ok"] is True
+        assert body["closed"] is True
+        assert body["vendor_close_method"] == "hangup"
+        assert captured["auth"] == f"Bearer {FAKE_KEY}"
+
+    def test_upstream_rejection_is_sanitized(self, auth_client, monkeypatch, caplog):
+        _install_voice(monkeypatch, voice_chat_mode="gpt-live")
+        _install_credentials(monkeypatch)
+        from tools import voice_live
+
+        body_text = "must-not-appear-in-response"
+        secret = FAKE_KEY
+
+        def raise_http_error(req, timeout=0):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                502,
+                "Bad Gateway",
+                {},
+                io.BytesIO(json.dumps({"error": body_text, "key": secret}).encode()),
+            )
+
+        monkeypatch.setattr(voice_live.urllib.request, "urlopen", raise_http_error)
+
+        with caplog.at_level(logging.DEBUG):
+            resp = auth_client.post(
+                "/api/audio/voice-live/session/close",
+                json={"session_id": "live_x"},
+            )
+
+        assert resp.status_code == 502
+        assert body_text not in resp.text
+        assert secret not in resp.text
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert body_text not in logged
+        assert secret not in logged
+        assert "502" in logged and "server_error" in logged
