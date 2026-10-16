@@ -263,6 +263,54 @@ class TestVendorAnswerValidation:
 class TestSessionClose:
     """Vendor hangup stays server-side; bodies and keys never leak."""
 
+    @pytest.mark.parametrize(
+        "bad_id",
+        ["live/x", "live?a=1", "live#h", "..", "%2F", "seg%2Fment"],
+    )
+    def test_invalid_session_id_never_calls_the_vendor(self, monkeypatch, bad_id):
+        monkeypatch.setattr(
+            voice_live, "_voice_section", lambda: {"voice_chat_mode": "gpt-live"}
+        )
+        monkeypatch.setattr(
+            voice_live, "_resolve_credentials", lambda live: ("sk-test", "https://api.example/v1")
+        )
+        monkeypatch.setattr(
+            voice_live.urllib.request,
+            "urlopen",
+            lambda *a, **k: pytest.fail("vendor must not be called for invalid session_id"),
+        )
+
+        with pytest.raises(ValueError, match="session_id must match"):
+            voice_live.close_live_session(bad_id)
+
+    def test_hangup_url_uses_one_encoded_path_segment(self, monkeypatch):
+        captured = {}
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            return _Resp()
+
+        monkeypatch.setattr(
+            voice_live, "_voice_section", lambda: {"voice_chat_mode": "gpt-live"}
+        )
+        monkeypatch.setattr(
+            voice_live, "_resolve_credentials", lambda live: ("sk-test", "https://api.example/v1")
+        )
+        monkeypatch.setattr(voice_live.urllib.request, "urlopen", fake_urlopen)
+
+        voice_live.close_live_session("live_u2_sess-99")
+
+        assert captured["url"] == "https://api.example/v1/live/sessions/live_u2_sess-99/hangup"
+
     def test_hangup_posts_to_the_vendor_endpoint(self, monkeypatch):
         captured = {}
 

@@ -511,6 +511,60 @@ class TestUpstreamBodyIsNeverEchoed:
 
 
 class TestSessionClose:
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "live/foo",
+            "live?x=1",
+            "live#frag",
+            "..",
+            "%2F",
+            "a%2Fb",
+        ],
+    )
+    def test_rejects_reserved_characters_before_vendor_call(
+        self, auth_client, monkeypatch, no_vendor, bad_id
+    ):
+        _install_voice(monkeypatch, voice_chat_mode="gpt-live")
+        _install_credentials(monkeypatch)
+
+        resp = auth_client.post(
+            "/api/audio/voice-live/session/close",
+            json={"session_id": bad_id},
+        )
+
+        assert resp.status_code == 400
+        assert "session_id" in resp.json().get("detail", "").lower()
+
+    def test_accepts_realistic_vendor_session_ids(self, auth_client, monkeypatch, no_vendor):
+        _install_voice(monkeypatch, voice_chat_mode="gpt-live")
+        _install_credentials(monkeypatch)
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        from tools import voice_live
+
+        monkeypatch.setattr(
+            voice_live.urllib.request,
+            "urlopen",
+            lambda *a, **k: _Resp(),
+        )
+
+        body = auth_client.post(
+            "/api/audio/voice-live/session/close",
+            json={"session_id": "live_u2_abc123-def"},
+        ).json()
+
+        assert body["ok"] is True
+        assert body["closed"] is True
+
     def test_requires_session_id(self, auth_client, monkeypatch, no_vendor):
         _install_voice(monkeypatch, voice_chat_mode="gpt-live")
         _install_credentials(monkeypatch)
