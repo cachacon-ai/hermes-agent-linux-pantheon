@@ -17,8 +17,8 @@ permissions:
 
 jobs:
   build-index:
-    # Only run on the upstream repository, not on forks
-    if: github.repository == 'NousResearch/hermes-agent'
+    # Only run when vars.CI_PRIMARY_REPOSITORY matches this repo (unset = off)
+    if: vars.CI_PRIMARY_REPOSITORY != '' && github.repository == vars.CI_PRIMARY_REPOSITORY
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: trusted-automation
