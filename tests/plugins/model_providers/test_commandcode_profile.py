@@ -257,24 +257,77 @@ class TestCommandCodeFetchModelsPickerContract:
         assert profile is not None
         assert "base_url" in inspect.signature(profile.fetch_models).parameters
 
-    def test_resolve_provider_full(self):
+    def test_resolve_provider_full(self, monkeypatch):
         """Both profiles must resolve through the model-switch path.
 
         Regression: ``resolve_provider_full`` only knew models.dev + overlay
         providers, so plugin-only providers (commandcode) failed with
         "Unknown provider" on /model switches even though the picker listed
         them.
+
+        The live models.dev catalog is not part of this contract. A fetch
+        that contains ``commandcode`` with env ``CMD_API_KEY`` shadows the
+        plugin profile and this assertion fails; a miss falls through to
+        ``COMMANDCODE_API_KEY``. Full-suite CI flipped between those two
+        outcomes (pass at 5d630cfd7, fail at 5e08a1d9) with the same
+        resolver code and no ``CMD_API_KEY`` in the process environment.
+        Stub the catalog closed so the test asserts the plugin fallback.
         """
+        monkeypatch.setattr(
+            "agent.models_dev.get_provider_info",
+            lambda *_args, **_kwargs: None,
+        )
         from hermes_cli.providers import resolve_provider_full
 
         chat = resolve_provider_full("commandcode", {}, [])
         assert chat is not None and chat.id == "commandcode"
         assert chat.transport == "openai_chat"
         assert "COMMANDCODE_API_KEY" in chat.api_key_env_vars
+        assert chat.source == "plugin-profile"
 
         anth = resolve_provider_full("commandcode-anthropic", {}, [])
         assert anth is not None and anth.id == "commandcode-anthropic"
         assert anth.transport == "anthropic_messages"
+
+    def test_catalog_payload_chooses_env_tuple_not_process_env(self, monkeypatch):
+        """The resolved key names come from the catalog return value.
+
+        Same process, neither credential present in ``os.environ``: a
+        stubbed models.dev hit yields that hit's env tuple, and a miss
+        yields the plugin profile. Nothing in the environment has to
+        change for ``'COMMANDCODE_API_KEY' in ('CMD_API_KEY',)`` to flip.
+        """
+        import os
+
+        from agent.models_dev import ProviderInfo
+        from hermes_cli.providers import resolve_provider_full
+
+        assert "CMD_API_KEY" not in os.environ
+        assert "COMMANDCODE_API_KEY" not in os.environ
+
+        monkeypatch.setattr(
+            "agent.models_dev.get_provider_info",
+            lambda *_args, **_kwargs: ProviderInfo(
+                id="commandcode",
+                name="Command Code",
+                env=("CMD_API_KEY",),
+                api="https://api.commandcode.ai/provider/v1",
+            ),
+        )
+        shadowed = resolve_provider_full("commandcode", {}, [])
+        assert shadowed is not None
+        assert shadowed.source == "models.dev"
+        assert shadowed.api_key_env_vars == ("CMD_API_KEY",)
+        assert "COMMANDCODE_API_KEY" not in shadowed.api_key_env_vars
+
+        monkeypatch.setattr(
+            "agent.models_dev.get_provider_info",
+            lambda *_args, **_kwargs: None,
+        )
+        plugin = resolve_provider_full("commandcode", {}, [])
+        assert plugin is not None
+        assert plugin.source == "plugin-profile"
+        assert "COMMANDCODE_API_KEY" in plugin.api_key_env_vars
 
 
 # ── base_url endpoint override ───────────────────────────────────────────────
