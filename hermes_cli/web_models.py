@@ -109,6 +109,10 @@ class VoiceLiveSessionRequest(BaseModel):
     history: Optional[list[dict[str, Any]]] = None
 
 
+class VoiceLiveSessionCloseRequest(BaseModel):
+    session_id: str
+
+
 class ManagedFileUpload(BaseModel):
     path: str
     data_url: str

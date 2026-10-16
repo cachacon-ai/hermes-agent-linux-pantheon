@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,10 @@ LIVE_HISTORY_PART_TYPES = frozenset({"text", "input_text"})
 DEFAULT_LIVE_MODEL = "gpt-live-1"
 DEFAULT_LIVE_VOICE = "marin"
 DEFAULT_LIVE_BASE_URL = "https://api.openai.com/v1"
+# Vendor session ids are opaque tokens (e.g. ``live_u2_…``). Restrict to one URL path
+# segment so an authenticated hangup cannot be redirected by ``/``, ``?``, ``#``, or
+# encoded separators in the request body.
+LIVE_VENDOR_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Voices the vendor lists for gpt-live-1 (live-conversations guide) plus the realtime defaults it
 # accepts; free text stays allowed for custom voices.
 GPT_LIVE_VOICES = (
@@ -370,3 +376,73 @@ def create_webrtc_session(sdp_offer: str, history: Optional[list] = None) -> dic
             f"GPT-Live session creation rejected (status {exc.code}, {category})"
         ) from None
     return _validate_session_answer(payload)
+
+
+def _normalize_vendor_session_id(session_id: str) -> str:
+    """Validate a vendor live session id before it is embedded in a URL path."""
+    vendor_id = str(session_id or "").strip()
+    if not vendor_id:
+        raise ValueError("session_id is required")
+    if LIVE_VENDOR_SESSION_ID_RE.fullmatch(vendor_id) is None:
+        raise ValueError(
+            "session_id must match [A-Za-z0-9_-]{1,128} (vendor live session id)"
+        )
+    return vendor_id
+
+
+def _vendor_session_hangup_url(base_url: str, session_id: str) -> str:
+    vendor_id = _normalize_vendor_session_id(session_id)
+    segment = quote(vendor_id, safe="")
+    return f"{base_url.rstrip('/')}/live/sessions/{segment}/hangup"
+
+
+def close_live_session(session_id: str) -> dict[str, Any]:
+    """End a vendor Live session server-side.
+
+    OpenAI documents ``POST /v1/live/sessions/{session_id}/hangup`` for SIP and WebRTC
+    sessions (empty body, ``200 OK`` on success). WebRTC clients may also send
+    ``session.close`` on the data channel; this HTTP hangup is the server-side teardown
+    hook Pantheon can call when the renderer only has the vendor session id.
+
+    Returns ``{"closed": True, "method": "hangup"}`` on success. Never logs or returns
+    the upstream body.
+    """
+    ensure_gpt_live_mode()
+
+    live = _live_section()
+    api_key, base_url = _resolve_credentials(live)
+    if not api_key:
+        raise VoiceLiveMissingKeyError(
+            "GPT-Live needs an OpenAI API key (OPENAI_API_KEY or voice.gpt_live.api_key)"
+        )
+
+    req = urllib.request.Request(
+        _vendor_session_hangup_url(base_url, session_id),
+        data=b"",
+        method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "*/*"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        category = _vendor_error_category(int(exc.code))
+        logger.warning(
+            "GPT-Live session hangup rejected: status=%s category=%s",
+            exc.code,
+            category,
+        )
+        raise VoiceLiveUpstreamError(
+            f"GPT-Live session hangup rejected (status {exc.code}, {category})"
+        ) from None
+    if status >= 400:
+        category = _vendor_error_category(status)
+        logger.warning(
+            "GPT-Live session hangup rejected: status=%s category=%s",
+            status,
+            category,
+        )
+        raise VoiceLiveUpstreamError(
+            f"GPT-Live session hangup rejected (status {status}, {category})"
+        )
+    return {"closed": True, "method": "hangup"}

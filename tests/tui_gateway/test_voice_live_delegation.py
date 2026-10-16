@@ -260,6 +260,118 @@ class TestVendorAnswerValidation:
         assert voice_live.create_webrtc_session("v=0 offer") == payload
 
 
+class TestSessionClose:
+    """Vendor hangup stays server-side; bodies and keys never leak."""
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        ["live/x", "live?a=1", "live#h", "..", "%2F", "seg%2Fment"],
+    )
+    def test_invalid_session_id_never_calls_the_vendor(self, monkeypatch, bad_id):
+        monkeypatch.setattr(
+            voice_live, "_voice_section", lambda: {"voice_chat_mode": "gpt-live"}
+        )
+        monkeypatch.setattr(
+            voice_live, "_resolve_credentials", lambda live: ("sk-test", "https://api.example/v1")
+        )
+        monkeypatch.setattr(
+            voice_live.urllib.request,
+            "urlopen",
+            lambda *a, **k: pytest.fail("vendor must not be called for invalid session_id"),
+        )
+
+        with pytest.raises(ValueError, match="session_id must match"):
+            voice_live.close_live_session(bad_id)
+
+    def test_hangup_url_uses_one_encoded_path_segment(self, monkeypatch):
+        captured = {}
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            return _Resp()
+
+        monkeypatch.setattr(
+            voice_live, "_voice_section", lambda: {"voice_chat_mode": "gpt-live"}
+        )
+        monkeypatch.setattr(
+            voice_live, "_resolve_credentials", lambda live: ("sk-test", "https://api.example/v1")
+        )
+        monkeypatch.setattr(voice_live.urllib.request, "urlopen", fake_urlopen)
+
+        voice_live.close_live_session("live_u2_sess-99")
+
+        assert captured["url"] == "https://api.example/v1/live/sessions/live_u2_sess-99/hangup"
+
+    def test_hangup_posts_to_the_vendor_endpoint(self, monkeypatch):
+        captured = {}
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            return _Resp()
+
+        monkeypatch.setattr(
+            voice_live, "_voice_section", lambda: {"voice_chat_mode": "gpt-live"}
+        )
+        monkeypatch.setattr(
+            voice_live, "_resolve_credentials", lambda live: ("sk-test", "https://api.example/v1")
+        )
+        monkeypatch.setattr(voice_live.urllib.request, "urlopen", fake_urlopen)
+
+        result = voice_live.close_live_session("live_sess_abc")
+
+        assert result == {"closed": True, "method": "hangup"}
+        assert captured["method"] == "POST"
+        assert captured["url"] == "https://api.example/v1/live/sessions/live_sess_abc/hangup"
+
+    def test_hangup_rejection_never_logs_the_body(self, monkeypatch, caplog):
+        secret = "sk-live-SECRET-do-not-leak-abcdef"
+        monkeypatch.setattr(
+            voice_live, "_voice_section", lambda: {"voice_chat_mode": "gpt-live"}
+        )
+        monkeypatch.setattr(
+            voice_live, "_resolve_credentials", lambda live: (secret, "https://x/v1")
+        )
+
+        def raise_http_error(req, timeout=0):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                404,
+                "Not Found",
+                {},
+                io.BytesIO(json.dumps({"error": {"message": secret}}).encode()),
+            )
+
+        monkeypatch.setattr(voice_live.urllib.request, "urlopen", raise_http_error)
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(voice_live.VoiceLiveUpstreamError) as excinfo:
+                voice_live.close_live_session("live_gone")
+
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert secret not in logged
+        assert secret not in str(excinfo.value)
+        assert "404" in logged and "not_found" in logged
+
+
 class TestVendorErrorHygiene:
     """R6: the upstream body is untrusted and can echo key material. Never logged, never raised."""
 
@@ -736,6 +848,168 @@ class TestSurfaceDoesNotBleedBetweenQueuedTurns:
         assert busy_session["queued_prompt"]["text"] == "first"
         assert busy_session["queued_prompts"][0]["text"] == "second"
         assert busy_session["queued_prompts"][0]["client_surface"] == ""
+
+
+class TestVoiceLiveSkipsServerTts:
+    """GPT-Live delegations are spoken by the Live client — server TTS would double-speak."""
+
+    def test_voice_live_turn_skips_begin_turn_tts(self, monkeypatch):
+        begin_calls = []
+        tts_puts = []
+
+        def fake_begin(sid):
+            begin_calls.append(sid)
+            mock_q = types.SimpleNamespace(
+                put=lambda delta: tts_puts.append(delta),
+            )
+            return mock_q, None
+
+        monkeypatch.setattr(server, "_begin_turn_tts", fake_begin)
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+        monkeypatch.setattr(
+            server,
+            "_start_usage_ticker",
+            lambda *a, **k: (threading.Event(), types.SimpleNamespace(join=lambda: None)),
+        )
+        monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: [])
+        monkeypatch.setattr(server, "_wire_callbacks", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_provider_credentials_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_session_cwd", lambda *a, **k: "/tmp")
+        monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+        monkeypatch.setattr(server, "make_stream_renderer", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_voice_mode_enabled", lambda: True)
+        monkeypatch.setattr(server, "_voice_cfg_dict", lambda: {"barge_in": False})
+        monkeypatch.setattr(server, "_load_interim_assistant_messages", lambda: False)
+        monkeypatch.setattr(server, "_hud_surface_note", lambda *a, **k: "")
+        monkeypatch.setattr(server, "_pending_reaction_notes", lambda *a: "")
+        monkeypatch.setattr(server, "_prepend_note", lambda msg, note: msg if not note else f"{note}\n{msg}")
+        monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+        monkeypatch.setattr(server, "record_turn_start", lambda *a, **k: None)
+        monkeypatch.setattr(server, "clear_turn_marker", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_session_home", lambda *a: types.SimpleNamespace())
+        monkeypatch.setattr(server, "_retire_turn_marker", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_set_session_not_running", lambda *a, **k: None)
+
+        class _SyncThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+            def is_alive(self):
+                return False
+
+        monkeypatch.setattr(server.threading, "Thread", _SyncThread)
+
+        def run_conv(msg, **kwargs):
+            stream_cb = kwargs.get("stream_callback")
+            if stream_cb:
+                stream_cb("spoken chunk")
+            return {"messages": []}
+
+        agent = types.SimpleNamespace(
+            clear_interrupt=lambda: None,
+            run_conversation=run_conv,
+            session_id="agent-sid",
+            valid_tool_names=set(),
+            model="test",
+            base_url="",
+            api_key="",
+            provider="",
+        )
+        session = _session(agent=agent, running=True, session_key="sk")
+        server._sessions["sid-vlive"] = session
+
+        voice_live_turn = {"surface": "voice-live", "voice_context": "User: hi"}
+        try:
+            server._run_prompt_submit(
+                "rid",
+                "sid-vlive",
+                session,
+                "delegate text",
+                voice_live_turn=voice_live_turn,
+            )
+            assert begin_calls == []
+            assert tts_puts == []
+        finally:
+            server._sessions.pop("sid-vlive", None)
+
+    def test_plain_turn_still_begins_server_tts(self, monkeypatch):
+        begin_calls = []
+
+        monkeypatch.setattr(
+            server,
+            "_begin_turn_tts",
+            lambda sid: begin_calls.append(sid) or (None, None),
+        )
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+        monkeypatch.setattr(
+            server,
+            "_start_usage_ticker",
+            lambda *a, **k: (threading.Event(), types.SimpleNamespace(join=lambda: None)),
+        )
+        monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: [])
+        monkeypatch.setattr(server, "_wire_callbacks", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_provider_credentials_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_session_cwd", lambda *a, **k: "/tmp")
+        monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+        monkeypatch.setattr(server, "make_stream_renderer", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_voice_mode_enabled", lambda: True)
+        monkeypatch.setattr(server, "_voice_cfg_dict", lambda: {"barge_in": False})
+        monkeypatch.setattr(server, "_load_interim_assistant_messages", lambda: False)
+        monkeypatch.setattr(server, "_hud_surface_note", lambda *a, **k: "")
+        monkeypatch.setattr(server, "_pending_reaction_notes", lambda *a: "")
+        monkeypatch.setattr(server, "_prepend_note", lambda msg, note: msg)
+        monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+        monkeypatch.setattr(server, "record_turn_start", lambda *a, **k: None)
+        monkeypatch.setattr(server, "clear_turn_marker", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_session_home", lambda *a: types.SimpleNamespace())
+        monkeypatch.setattr(server, "_retire_turn_marker", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_set_session_not_running", lambda *a, **k: None)
+
+        class _SyncThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+            def is_alive(self):
+                return False
+
+        monkeypatch.setattr(server.threading, "Thread", _SyncThread)
+
+        agent = types.SimpleNamespace(
+            clear_interrupt=lambda: None,
+            run_conversation=lambda *a, **k: {"messages": []},
+            session_id="agent-sid",
+            valid_tool_names=set(),
+            model="test",
+            base_url="",
+            api_key="",
+            provider="",
+        )
+        session = _session(agent=agent, running=True, session_key="sk")
+        server._sessions["sid-plain"] = session
+
+        try:
+            server._run_prompt_submit("rid", "sid-plain", session, "hello")
+            assert begin_calls == ["sid-plain"]
+        finally:
+            server._sessions.pop("sid-plain", None)
 
 
 class TestNonStringSurface:
