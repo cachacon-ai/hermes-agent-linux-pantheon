@@ -2888,7 +2888,13 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         session["_metadata_mirror_updated_at"] = time.time()
 
 
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+def _on_compute_host_turn_done(
+    rid: str,
+    sid: str,
+    session: dict,
+    frame: dict,
+    voice_live_turn: dict | None = None,
+) -> None:
     is_error = frame.get("type") == "turn.error"
     with session["history_lock"]:
         if frame.get("session_key"):
@@ -2907,7 +2913,9 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session.pop("_compute_host_pending_clarify", None)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        payload = {"text": f"Error: {message}", "status": "error"}
+        payload.update(live_delegation_correlation(voice_live_turn))
+        _emit("message.complete", sid, payload)
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
@@ -2951,7 +2959,9 @@ def _submit_prompt_to_compute_host(
         # duplicate terminal error.
         if done.get("reason") == "send_failed":
             return
-        _on_compute_host_turn_done(rid, sid, session, done)
+        _on_compute_host_turn_done(
+            rid, sid, session, done, voice_live_turn=voice_live_turn,
+        )
 
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
@@ -11320,6 +11330,7 @@ def _emit_terminal_turn_error(
     error_surface: Optional[dict] = None,
     *,
     retire_marker: bool = True,
+    voice_live_turn: dict | None = None,
 ) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
@@ -11332,6 +11343,10 @@ def _emit_terminal_turn_error(
     ``error_surface`` lets callers that already know the failing layer (e.g.
     agent-init failures = local runtime) pass it explicitly; exception
     callers leave it None and the classifier derives it here.
+
+    ``voice_live_turn`` is the same per-turn dict the successful final reads.
+    When it names a delegation, those ids are copied onto this error final;
+    when it does not, the keys are left off.
     """
     agent = session.get("agent")
     # Classify the failure into a {layer, code, retryable} descriptor so the
@@ -11366,6 +11381,9 @@ def _emit_terminal_turn_error(
         payload["error_surface"] = error_surface
     if partial:
         payload["partial"] = True
+    # Same ids the successful final copies on. Omit the keys when this turn
+    # has none, so a plain failure stays indistinguishable from before.
+    payload.update(live_delegation_correlation(voice_live_turn))
     try:
         rendered = render_message(text, cols)
     except Exception:
@@ -14674,6 +14692,7 @@ def _run_prompt_submit(
                     session,
                     e,
                     retire_marker=terminal_receipt_committed,
+                    voice_live_turn=voice_live_turn,
                 )
                 turn_error_retained = True
                 turn_error_detail = _turn_failure_detail(
@@ -14686,7 +14705,14 @@ def _run_prompt_submit(
                     file=sys.stderr,
                     flush=True,
                 )
-                _emit("error", sid, {"message": str(e)})
+                _emit(
+                    "error",
+                    sid,
+                    {
+                        "message": str(e),
+                        **live_delegation_correlation(voice_live_turn),
+                    },
+                )
         finally:
             if fallback_tts_pipeline is not None and not fallback_tts_dispatched:
                 _finish_fd_speak_pipeline(fallback_tts_pipeline)
