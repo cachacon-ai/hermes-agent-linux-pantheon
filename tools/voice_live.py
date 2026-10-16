@@ -151,6 +151,10 @@ class VoiceLiveUpstreamError(VoiceLiveError):
     an error category only — never the upstream body, which is untrusted and may echo key
     material."""
 
+    def __init__(self, message: str, *, upstream_status: int | None = None) -> None:
+        super().__init__(message)
+        self.upstream_status = upstream_status
+
 
 class VoiceLiveHistoryError(ValueError):
     """A ``history`` entry is structurally unusable (not a message, a disallowed role, or
@@ -426,14 +430,23 @@ def close_live_session(session_id: str) -> dict[str, Any]:
         with urllib.request.urlopen(req, timeout=30) as resp:
             status = int(getattr(resp, "status", 200) or 200)
     except urllib.error.HTTPError as exc:
-        category = _vendor_error_category(int(exc.code))
+        status = int(exc.code)
+        category = _vendor_error_category(status)
+        if status in (404, 410):
+            logger.info(
+                "GPT-Live session hangup: session already gone: status=%s category=%s",
+                status,
+                category,
+            )
+            return {"closed": True, "method": "hangup", "already_closed": True}
         logger.warning(
             "GPT-Live session hangup rejected: status=%s category=%s",
-            exc.code,
+            status,
             category,
         )
         raise VoiceLiveUpstreamError(
-            f"GPT-Live session hangup rejected (status {exc.code}, {category})"
+            f"GPT-Live session hangup rejected (status {status}, {category})",
+            upstream_status=status,
         ) from None
     if status >= 400:
         category = _vendor_error_category(status)

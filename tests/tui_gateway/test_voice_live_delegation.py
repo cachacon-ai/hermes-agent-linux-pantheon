@@ -342,7 +342,7 @@ class TestSessionClose:
         assert captured["method"] == "POST"
         assert captured["url"] == "https://api.example/v1/live/sessions/live_sess_abc/hangup"
 
-    def test_hangup_rejection_never_logs_the_body(self, monkeypatch, caplog):
+    def test_hangup_404_is_already_closed_without_logging_body(self, monkeypatch, caplog):
         secret = "sk-live-SECRET-do-not-leak-abcdef"
         monkeypatch.setattr(
             voice_live, "_voice_section", lambda: {"voice_chat_mode": "gpt-live"}
@@ -363,13 +363,29 @@ class TestSessionClose:
         monkeypatch.setattr(voice_live.urllib.request, "urlopen", raise_http_error)
 
         with caplog.at_level(logging.DEBUG):
-            with pytest.raises(voice_live.VoiceLiveUpstreamError) as excinfo:
-                voice_live.close_live_session("live_gone")
+            result = voice_live.close_live_session("live_gone")
 
+        assert result == {"closed": True, "method": "hangup", "already_closed": True}
         logged = "\n".join(record.getMessage() for record in caplog.records)
         assert secret not in logged
-        assert secret not in str(excinfo.value)
         assert "404" in logged and "not_found" in logged
+
+    def test_hangup_502_still_raises_upstream_error(self, monkeypatch):
+        monkeypatch.setattr(
+            voice_live, "_voice_section", lambda: {"voice_chat_mode": "gpt-live"}
+        )
+        monkeypatch.setattr(
+            voice_live, "_resolve_credentials", lambda live: ("sk-test", "https://x/v1")
+        )
+
+        def raise_http_error(req, timeout=0):
+            raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b""))
+
+        monkeypatch.setattr(voice_live.urllib.request, "urlopen", raise_http_error)
+
+        with pytest.raises(voice_live.VoiceLiveUpstreamError) as excinfo:
+            voice_live.close_live_session("live_x")
+        assert excinfo.value.upstream_status == 502
 
 
 class TestVendorErrorHygiene:
