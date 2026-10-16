@@ -957,6 +957,83 @@ class TestVoiceLiveSkipsServerTts:
         finally:
             server._sessions.pop("sid-vlive", None)
 
+    def test_voice_live_events_carry_delegation_ids(self, monkeypatch):
+        emitted = []
+
+        monkeypatch.setattr(server, "_begin_turn_tts", lambda sid: (None, None))
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+        monkeypatch.setattr(
+            server,
+            "_start_usage_ticker",
+            lambda *a, **k: (threading.Event(), types.SimpleNamespace(join=lambda: None)),
+        )
+        monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: [])
+        monkeypatch.setattr(server, "_wire_callbacks", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_provider_credentials_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_session_cwd", lambda *a, **k: "/tmp")
+        monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+        monkeypatch.setattr(server, "make_stream_renderer", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+        monkeypatch.setattr(server, "_voice_cfg_dict", lambda: {})
+        monkeypatch.setattr(server, "_load_interim_assistant_messages", lambda: False)
+        monkeypatch.setattr(server, "_hud_surface_note", lambda *a, **k: "")
+        monkeypatch.setattr(server, "_pending_reaction_notes", lambda *a: "")
+        monkeypatch.setattr(server, "_prepend_note", lambda msg, note: msg if not note else f"{note}\n{msg}")
+        monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+        monkeypatch.setattr(server, "record_turn_start", lambda *a, **k: None)
+        monkeypatch.setattr(server, "clear_turn_marker", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_session_home", lambda *a: types.SimpleNamespace())
+        monkeypatch.setattr(server, "_retire_turn_marker", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_set_session_not_running", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_get_usage", lambda *a, **k: {})
+        monkeypatch.setattr(server, "render_message", lambda *a, **k: None)
+
+        def run_conv(msg, **kwargs):
+            stream_cb = kwargs.get("stream_callback")
+            if stream_cb:
+                stream_cb("sunny")
+            return {"final_response": "sunny", "messages": []}
+
+        agent = types.SimpleNamespace(
+            clear_interrupt=lambda: None,
+            run_conversation=run_conv,
+            session_id="agent-sid",
+            valid_tool_names=set(),
+            model="test",
+            base_url="",
+            api_key="",
+            provider="",
+        )
+        session = _session(agent=agent, running=True, session_key="sk")
+        server._sessions["sid-corr"] = session
+        try:
+            server._run_prompt_submit(
+                "rid",
+                "sid-corr",
+                session,
+                "delegate text",
+                voice_live_turn={
+                    "surface": "voice-live",
+                    "delegation_id": "item_abc",
+                    "delegation_turn_id": "turn-1",
+                },
+            )
+        finally:
+            server._sessions.pop("sid-corr", None)
+
+        deltas = [args for args in emitted if len(args) >= 3 and args[0] == "message.delta"]
+        completes = [args for args in emitted if len(args) >= 3 and args[0] == "message.complete"]
+        assert deltas and deltas[0][2]["delegation_id"] == "item_abc"
+        assert deltas[0][2]["delegation_turn_id"] == "turn-1"
+        assert deltas[0][2]["text"] == "sunny"
+        assert completes and completes[0][2]["delegation_turn_id"] == "turn-1"
+        assert completes[0][2]["delegation_id"] == "item_abc"
+
     def test_plain_turn_still_begins_server_tts(self, monkeypatch):
         begin_calls = []
 

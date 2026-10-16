@@ -47,6 +47,28 @@ class TestAdmission:
 
         assert committed == {"surface": "voice-live", "voice_context": "User: hi"}
 
+    def test_a_live_turn_commits_delegation_ids(self):
+        committed = admit_surface({
+            "surface": "voice-live",
+            "delegation_id": "item_abc",
+            "delegation_turn_id": "turn-1",
+        })
+
+        assert committed["delegation_id"] == "item_abc"
+        assert committed["delegation_turn_id"] == "turn-1"
+
+    @pytest.mark.parametrize("surface", [None, "hud"])
+    def test_delegation_ids_off_the_live_surface_are_refused(self, surface):
+        params = {"delegation_id": "item_abc", "delegation_turn_id": "turn-1"}
+        if surface is not None:
+            params["surface"] = surface
+        with pytest.raises(SurfaceAdmissionError):
+            admit_surface(params)
+
+    def test_a_malformed_delegation_id_is_refused(self):
+        with pytest.raises(SurfaceAdmissionError):
+            admit_surface({"surface": "voice-live", "delegation_id": "has space"})
+
     def test_an_oversized_transcript_is_clipped_to_the_limit(self):
         committed = admit_surface(
             {"surface": "voice-live", "voice_context": "x" * (VOICE_CONTEXT_LIMIT + 500)}
@@ -134,6 +156,20 @@ class TestSubmitSurfaceFields:
             "surface": "voice-live",
             "voice_context": "User: hi",
             "voice_turn": True,
+        }
+
+    def test_delegation_ids_are_forwarded_with_the_live_surface(self):
+        forwarded = submit_surface_fields({
+            "text": "hello",
+            "surface": "voice-live",
+            "delegation_id": "item_abc",
+            "delegation_turn_id": "turn-1",
+        })
+
+        assert forwarded == {
+            "surface": "voice-live",
+            "delegation_id": "item_abc",
+            "delegation_turn_id": "turn-1",
         }
 
     def test_a_submit_with_none_of_them_forwards_nothing(self):

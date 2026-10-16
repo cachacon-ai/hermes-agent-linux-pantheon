@@ -13736,6 +13736,23 @@ def _start_usage_ticker(
     return stop, thread
 
 
+def live_delegation_correlation(voice_live_turn: dict | None) -> dict:
+    """Ids to copy onto ``message.delta`` and ``message.complete``.
+
+    Those events otherwise carry only the reply text. A client that has more
+    than one turn in flight cannot tell which delegation a chunk belongs to
+    unless the turn that produced it is named on the event.
+    """
+    if not isinstance(voice_live_turn, dict):
+        return {}
+    correlated: dict = {}
+    for key in ("delegation_id", "delegation_turn_id"):
+        value = voice_live_turn.get(key)
+        if isinstance(value, str) and value:
+            correlated[key] = value
+    return correlated
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -14119,7 +14136,7 @@ def _run_prompt_submit(
             def _stream(delta):
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
-                payload = {"text": delta}
+                payload = {"text": delta, **live_delegation_correlation(voice_live_turn)}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
                 if tts_queue is not None and isinstance(delta, str):
@@ -14372,6 +14389,7 @@ def _run_prompt_submit(
             if _artifacts and not str(raw or "").strip():
                 raw = "Generated " + ", ".join(a["name"] for a in _artifacts) + "."
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            payload.update(live_delegation_correlation(voice_live_turn))
             if _artifacts:
                 payload["artifacts"] = _artifacts
                 payload["source_delivery_id"] = _artifacts[0]["source_delivery_id"]

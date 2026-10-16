@@ -26,7 +26,24 @@ from __future__ import annotations
 
 SURFACES = frozenset({"hud", "voice-live"})
 VOICE_CONTEXT_LIMIT = 6000
-_SUBMIT_FIELDS = ("surface", "voice_context", "interrupted", "voice_turn")
+_SUBMIT_FIELDS = (
+    "surface",
+    "voice_context",
+    "interrupted",
+    "voice_turn",
+    "delegation_id",
+    "delegation_turn_id",
+)
+
+
+def _safe_delegation_token(value: object) -> bool:
+    """Pantheon delegation ids are opaque tokens, not free text."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and value == value.strip()
+        and all(ch.isalnum() or ch in "-_" for ch in value)
+    )
 
 
 class SurfaceAdmissionError(ValueError):
@@ -53,7 +70,12 @@ def admit_surface(params):
     ``voice-live`` surface, which is a client smuggling model input past the
     persisted row rather than a transcript.
     """
-    surface, context, interrupted, voice_turn = (params.get(key) for key in _SUBMIT_FIELDS)
+    surface = params.get("surface")
+    context = params.get("voice_context")
+    interrupted = params.get("interrupted")
+    voice_turn = params.get("voice_turn")
+    delegation_id = params.get("delegation_id")
+    delegation_turn_id = params.get("delegation_turn_id")
     # Type-check before the membership test: an unhashable surface (list/dict) makes
     # ``in SURFACES`` raise TypeError instead of refusing the submit.
     if surface is not None and (not isinstance(surface, str) or surface not in SURFACES):
@@ -64,6 +86,13 @@ def admit_surface(params):
         raise SurfaceAdmissionError("invalid_params")
     if any(flag is not None and type(flag) is not bool for flag in (interrupted, voice_turn)):
         raise SurfaceAdmissionError("invalid_params")
+    for value in (delegation_id, delegation_turn_id):
+        if value is None:
+            continue
+        # Same rule as the transcript: these ids name one live delegation.
+        # On any other surface they would let a client tag a turn it does not own.
+        if surface != "voice-live" or not _safe_delegation_token(value):
+            raise SurfaceAdmissionError("invalid_params")
     committed: dict = {}
     if surface:
         committed["surface"] = surface
@@ -73,6 +102,10 @@ def admit_surface(params):
         committed["interrupted"] = True
     if voice_turn:
         committed["voice_turn"] = True
+    if delegation_id:
+        committed["delegation_id"] = delegation_id
+    if delegation_turn_id:
+        committed["delegation_turn_id"] = delegation_turn_id
     return committed
 
 
