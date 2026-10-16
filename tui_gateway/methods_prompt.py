@@ -297,14 +297,20 @@ def normalize_prompt_clock_context(raw) -> str | None:
     return None
 
 
-def admit_prompt_surface(params) -> tuple[str, dict | None, str | None]:
+def admit_prompt_surface(params) -> tuple[str | None, dict | None, str | None]:
     """Admit the per-turn client surface of a ``prompt.submit`` request.
 
     Returns ``(client_surface, voice_live_turn, refusal)``:
-    ``client_surface`` is mirrored on the session for the existing HUD note seam,
-    ``voice_live_turn`` is the committed surface dict of a live-voice turn (``None``
-    for every other surface) and ``refusal`` is the invalid-params message to
-    refuse the whole submit with, or ``None`` when it admits.
+    ``client_surface`` is ``"hud"`` or ``"voice-live"`` when that surface was
+    admitted, ``""`` when the client explicitly pinned the app window, and
+    ``None`` when the submit did not pin a surface (field omitted, or a name
+    this fork does not know). The caller mirrors ``""`` for the ``None`` case
+    so a stale HUD marker still clears, and threads the original value into
+    the turn so an unpinned submit does not stamp ``client_surface`` onto the
+    queued envelope. ``voice_live_turn`` is the committed surface dict of a
+    live-voice turn (``None`` for every other surface) and ``refusal`` is the
+    invalid-params message to refuse the whole submit with, or ``None`` when
+    it admits.
 
     A surface is a fact about ONE turn, so ``voice_live_turn`` is returned for the
     caller to thread into that turn only — never parked on mutable session state,
@@ -330,6 +336,12 @@ def admit_prompt_surface(params) -> tuple[str, dict | None, str | None]:
 
     params = dict(params)
     raw_surface = params.get("surface")
+    # Explicit ``surface: ""`` is the app-window pin. Omitting the field, or
+    # sending a name this fork does not know, is "not pinned". Coercing both
+    # to ``""`` made every plain ``prompt.submit`` look like an explicit
+    # app-window turn and stamped ``client_surface: ""`` onto queued envelopes
+    # that never named a surface (fork #29, 3ae4e0a512).
+    explicit_app_window = False
     if raw_surface is not None:
         # Type-check BEFORE the membership test: ``["hud"] not in SURFACES`` is a
         # TypeError (unhashable), not a tolerated unknown surface. A non-string is
@@ -339,7 +351,10 @@ def admit_prompt_surface(params) -> tuple[str, dict | None, str | None]:
             return "", None, "invalid surface fields: surface must be a string"
         if raw_surface not in SURFACES:
             # Deliberate fork divergence (see the docstring): an unknown surface
-            # NAME is tolerated and read as "no surface".
+            # NAME is tolerated and read as "no surface". ``""`` is not a member
+            # of SURFACES either; admit_surface would refuse it, so clear it and
+            # remember the explicit app-window pin ourselves.
+            explicit_app_window = raw_surface == ""
             params["surface"] = None
     context = params.get("voice_context")
     try:
@@ -358,7 +373,12 @@ def admit_prompt_surface(params) -> tuple[str, dict | None, str | None]:
             f"{VOICE_CONTEXT_LIMIT} characters",
         )
     voice_live_turn = committed if committed.get("surface") == "voice-live" else None
-    return str(committed.get("surface") or ""), voice_live_turn, None
+    surface_name = committed.get("surface")
+    if surface_name:
+        return str(surface_name), voice_live_turn, None
+    if explicit_app_window:
+        return "", voice_live_turn, None
+    return None, voice_live_turn, None
 
 
 @method("prompt.submit")
@@ -534,7 +554,9 @@ def _(rid, params: dict) -> dict:
     client_surface, voice_live_turn, surface_refusal = admit_prompt_surface(params)
     if surface_refusal is not None:
         return _err(rid, 4004, surface_refusal)
-    session["client_surface"] = client_surface
+    # None = not pinned. The mirror still clears (a stale "hud" must not
+    # stick), but the queued envelope only stores a surface the client sent.
+    session["client_surface"] = "" if client_surface is None else client_surface
     has_truncation = (
         truncate_user_ordinal is not None
         or params.get("truncate_before_row_id") is not None
