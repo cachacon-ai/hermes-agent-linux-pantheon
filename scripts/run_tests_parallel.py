@@ -987,9 +987,13 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
 
     # --files: explicit file list from the CI generate job — skip discovery.
-    if args.files:
+    # An explicit empty list must not fall through to full-tree discovery.
+    if args.files is not None:
         files = [repo_root / f for f in _split_pathspec(args.files)]
         roots = []
+        if not files:
+            print("No test files in --files list; nothing to run", file=sys.stderr)
+            return 0
     else:
         # Resolve discovery roots: positional path args override --paths if any
         # were supplied, otherwise --paths (which itself defaults to 'tests').
@@ -1022,6 +1026,7 @@ def main() -> int:
                     "files": ":".join(_format_file(f, repo_root) for f in bucket),
                 }
                 for i, bucket in enumerate(slices)
+                if bucket
             ]
         }
         # Print to stdout so the CI step can capture it with $().
