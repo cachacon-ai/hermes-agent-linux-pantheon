@@ -14851,7 +14851,7 @@ def test_session_delete_refuses_active_session(monkeypatch):
     called: list[str] = []
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **kwargs):
             called.append(sid)
             return True
 
@@ -14902,7 +14902,7 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **kwargs):
             return False
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -14917,7 +14917,7 @@ def test_session_delete_returns_4007_when_missing(monkeypatch):
 
 def test_session_delete_propagates_db_exception(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **kwargs):
             raise RuntimeError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -14938,7 +14938,7 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     captured: dict = {}
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **kwargs):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
             return True
@@ -15159,7 +15159,7 @@ def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path
         def __init__(self, db_path=None):
             captured["db_path"] = db_path
 
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **kwargs):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
             return True

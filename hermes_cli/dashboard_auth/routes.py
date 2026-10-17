@@ -107,10 +107,9 @@ def _redirect_uri(request: Request) -> str:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    from hermes_cli.dashboard_auth.request_utils import client_ip
+
+    return client_ip(request)
 
 
 def _provider_pkce_segments(cookie_payload: dict[str, str]) -> dict[str, str]:
@@ -665,10 +664,8 @@ def _validate_post_login_target(raw: str) -> str:
 # password we verify locally, so it's a credential-stuffing target. A
 # simple in-process sliding-window limiter per client IP raises the cost
 # of online guessing without any external dependency. It is intentionally
-# best-effort: process-local (resets on restart), and behind a trusting
-# proxy the IP is the proxy's unless X-Forwarded-For is set — which is why
-# this is defence-in-depth on top of the provider's own constant-time
-# verify, not the only line of defence.
+# best-effort: process-local (resets on restart). Uses the ASGI peer;
+# trusted proxy normalization must happen upstream.
 
 _PW_RATE_MAX_ATTEMPTS = 10
 _PW_RATE_WINDOW_SEC = 60.0

@@ -810,11 +810,23 @@ def cmd_sessions(args, sessions_parser=None):
                         db.close()
                         return
                 sessions_dir = get_hermes_home() / "sessions"
-                if db.delete_session(
-                    resolved_session_id,
-                    sessions_dir=sessions_dir,
-                    expected_delete_ids=delete_target_ids,
-                ):
+                from hermes_state import SessionActiveWriteGuardError
+
+                try:
+                    deleted = db.delete_session(
+                        resolved_session_id,
+                        sessions_dir=sessions_dir,
+                        expected_delete_ids=delete_target_ids,
+                        exclude_active_write_guards=True,
+                    )
+                except SessionActiveWriteGuardError as exc:
+                    print(
+                        f"Exported, but session '{resolved_session_id}' was "
+                        f"not deleted because it is active: {exc}"
+                    )
+                    db.close()
+                    return
+                if deleted:
                     delegate_count = len(delete_target_ids) - 1
                     delegate_suffix = (
                         ""
@@ -888,7 +900,21 @@ def cmd_sessions(args, sessions_parser=None):
         elif _pinned_note:
             print(f"Warning: deleting a pinned session '{resolved_session_id}'.")
         sessions_dir = get_hermes_home() / "sessions"
-        if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
+        from hermes_state import SessionActiveWriteGuardError
+
+        try:
+            deleted = db.delete_session(
+                resolved_session_id,
+                sessions_dir=sessions_dir,
+                exclude_active_write_guards=True,
+            )
+        except SessionActiveWriteGuardError as exc:
+            print(
+                f"Cannot delete session '{resolved_session_id}' while it is "
+                f"active: {exc}"
+            )
+            return 1
+        if deleted:
             print(f"Deleted session '{resolved_session_id}'.")
         else:
             print(f"Session '{args.session_id}' not found.")

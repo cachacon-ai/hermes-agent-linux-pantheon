@@ -33,7 +33,11 @@ from hermes_cli.web_models import (
     SessionPrune,
     SessionRename,
 )
-from hermes_state import is_malformed_db_error, is_transient_sqlite_error
+from hermes_state import (
+    SessionActiveWriteGuardError,
+    is_malformed_db_error,
+    is_transient_sqlite_error,
+)
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -564,7 +568,9 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     def _delete() -> int:
         db = _open_session_db_for_profile(body.profile, read_only=False)
         try:
-            return db.delete_sessions(body.ids)
+            return db.delete_sessions(
+                body.ids, exclude_active_write_guards=True
+            )
         finally:
             db.close()
 
@@ -885,12 +891,23 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
                 cleanup=getattr(db,'flush_artifact_cleanup',None)
                 if callable(cleanup): cleanup()
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            db.delete_session(sid, exclude_active_write_guards=True)
             return {"ok": True}
+        except SessionActiveWriteGuardError as exc:
+            return exc
         finally:
             db.close()
 
-    return await asyncio.to_thread(_delete)
+    try:
+        result = await asyncio.to_thread(_delete)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception("DELETE /api/sessions/%s failed", session_id)
+        raise HTTPException(status_code=500, detail="Session deletion failed") from exc
+    if isinstance(result, SessionActiveWriteGuardError):
+        raise HTTPException(status_code=409, detail=str(result))
+    return result
 
 
 @manage_router.post("/api/sessions/owner-backfill")

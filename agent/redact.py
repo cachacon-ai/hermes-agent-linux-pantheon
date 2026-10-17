@@ -1090,6 +1090,11 @@ _FILE_READ_COMMANDS = frozenset({
     "cat", "head", "tail", "type", "bat", "less", "more", "nl",
     "zcat", "tac", "view", "batcat",
 })
+_SECRET_BEARING_FILE_BASENAMES = frozenset({
+    ".bashrc", ".bash_profile", ".bash_login", ".profile",
+    ".zshrc", ".zprofile", ".zlogin", ".zshenv",
+})
+_TEXT_FILE_READ_COMMANDS = frozenset({"grep", "awk", "sed"})
 
 # Basenames that are treated as ``.env`` files for redaction purposes are
 # imported at module top as ``_ENV_FILE_BASENAMES`` (see the
@@ -1133,6 +1138,46 @@ def _command_reads_env_file(command: str | None) -> bool:
             arg = arg.strip("\"'")
             basename = arg.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
             if basename.lower() in _ENV_FILE_BASENAMES:
+                return True
+    return False
+
+
+def _is_secret_bearing_file_arg(arg: str) -> bool:
+    """Recognize explicit Hermes config and standard shell startup paths."""
+    path = arg.strip("\"'").replace("\\", "/")
+    if "$" in path:
+        return False
+    parts = [part.lower() for part in path.split("/") if part]
+    if not parts:
+        return False
+    if parts[-1] in _SECRET_BEARING_FILE_BASENAMES:
+        return True
+    return parts[-1] == "config.yaml" and ".hermes" in parts[:-1]
+
+
+def _command_reads_secret_bearing_file(command: str | None) -> bool:
+    """True for direct stdout reads of known secret-bearing config files."""
+    if not command or not isinstance(command, str):
+        return False
+    for seg in re.split(r"[|;&]+", command):
+        seg = seg.strip()
+        if not seg:
+            continue
+        tokens = seg.split()
+        if not tokens:
+            continue
+        reader = tokens[0].rsplit("/", 1)[-1].lower()
+        if reader in _FILE_READ_COMMANDS:
+            if any(
+                _is_secret_bearing_file_arg(arg)
+                for arg in tokens[1:]
+                if not arg.startswith("-")
+            ):
+                return True
+            continue
+        if reader in _TEXT_FILE_READ_COMMANDS:
+            positional = [arg for arg in tokens[1:] if not arg.startswith("-")]
+            if any(_is_secret_bearing_file_arg(arg) for arg in positional[1:]):
                 return True
     return False
 
@@ -1189,7 +1234,11 @@ def redact_terminal_output(
     if not output:
         return output
     cmd = command or ""
-    code_file = not (is_env_dump_command(cmd) or _command_reads_env_file(cmd))
+    code_file = not (
+        is_env_dump_command(cmd)
+        or _command_reads_env_file(cmd)
+        or _command_reads_secret_bearing_file(cmd)
+    )
     return redact_sensitive_text(output, force=force, code_file=code_file)
 
 

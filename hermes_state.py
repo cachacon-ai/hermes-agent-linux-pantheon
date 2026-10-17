@@ -4357,6 +4357,10 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class SessionActiveWriteGuardError(RuntimeError):
+    """Raised when an active turn lease or compression lock rejects session deletion."""
+
+
 class StateDbReplacedError(RuntimeError):
     """The state.db path no longer names the file this SessionDB opened.
 
@@ -12586,6 +12590,26 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         ):
             raise CompressionSessionClosedError(session_id)
 
+    def _write_guards_reject(self, conn, sid: str, **kwargs) -> bool:
+        """True when a live turn lease or compression lock protects ``sid``.
+
+        Expired or dead-holder guards are reclaimed inside
+        :meth:`_check_transcript_write_guards` as a side effect.
+        """
+        try:
+            self._check_transcript_write_guards(
+                conn,
+                sid,
+                compression_lock_holder=None,
+                turn_lease_holder=None,
+                reject_active_turn_lease=True,
+                reject_active_compression_lock=True,
+                **kwargs,
+            )
+        except (SessionCompressionInProgressError, SessionTurnLeaseLostError):
+            return True
+        return False
+
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
         """Decode a ``display_metadata`` column into the dict every reader expects.
@@ -15504,6 +15528,7 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         session_id: str,
         sessions_dir: Optional[Path] = None,
         expected_delete_ids: Optional[List[str]] = None,
+        exclude_active_write_guards: bool = False,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -15518,8 +15543,10 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         lets export-before-delete callers fail closed if a new delegate appears
         after they materialize their archive. The delegate tree is re-walked
         inside the write transaction on purpose (TOCTOU guard); the cost is
-        accepted for correctness. Returns True if the session was found and
-        deleted.
+        accepted for correctness. With ``exclude_active_write_guards``, raises
+        :class:`SessionActiveWriteGuardError` if the row is protected by an
+        active turn lease or compression lock. Returns True if the session was
+        found and deleted.
         """
         removed_delegate_ids: List[str] = []
         expected_ids = (
@@ -15532,6 +15559,14 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
             )
             if cursor.fetchone() is None:
                 return False
+            if exclude_active_write_guards and self._write_guards_reject(
+                conn,
+                session_id,
+                allow_closed_compression_parent=True,
+            ):
+                raise SessionActiveWriteGuardError(
+                    f"session '{session_id}' has an active turn lease or compression lock"
+                )
             if expected_ids is not None:
                 actual_ids = {
                     session_id,
@@ -15618,6 +15653,7 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         self,
         session_ids: List[str],
         sessions_dir: Optional[Path] = None,
+        exclude_active_write_guards: bool = False,
     ) -> int:
         """Delete every session in *session_ids* in a single transaction.
 
@@ -15666,6 +15702,18 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
             existing = [row["id"] for row in cursor.fetchall()]
             if not existing:
                 return 0
+
+            if exclude_active_write_guards:
+                active_ids = {
+                    sid
+                    for sid in existing
+                    if self._write_guards_reject(
+                        conn, sid, allow_closed_compression_parent=True
+                    )
+                }
+                existing = [sid for sid in existing if sid not in active_ids]
+                if not existing:
+                    return 0
 
             existing_placeholders = ",".join("?" * len(existing))
             self._artifact_before_session_delete_on_conn(conn,[*existing,*_collect_delegate_child_ids(conn,existing)])
