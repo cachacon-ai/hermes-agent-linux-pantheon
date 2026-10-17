@@ -191,8 +191,9 @@ def test_subscription_hangup_posts_realtime_url_and_treats_gone_as_closed(
     assert req.get_full_url() == (
         "https://api.openai.com/v1/realtime/calls/rtc_close_fixture/hangup"
     )
-    assert req.headers["Authorization"] == f"Bearer {token}"
-    assert req.headers["ChatGPT-Account-Id"] == "account-fixture"
+    headers = {name.lower(): value for name, value in req.header_items()}
+    assert headers["authorization"] == f"Bearer {token}"
+    assert headers["chatgpt-account-id"] == "account-fixture"
 
 
 def _write_auth_store(hermes_home, payload):
