@@ -1087,7 +1087,17 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
         future.result(timeout=grace)
         return True
     except concurrent.futures.TimeoutError:
-        return False
+        # ``concurrent.futures.TimeoutError`` IS the builtin ``TimeoutError``
+        # on 3.11+, and ``Future.result`` RE-RAISES the exception the worker
+        # stored — so a worker that exited BY RAISING TimeoutError (the #76354
+        # F6 pre-start stale-job skip in ``_fence_gated_worker``) arrives here
+        # indistinguishable from a grace expiry unless we ask the future.
+        # A settled future means the worker thread is gone and provably holds
+        # no provider call, which is the "exited" case this function promises;
+        # only a still-pending future is a genuine orphan. Getting this wrong
+        # orphans a worker that already left: a phantom teardown warning plus
+        # a durable lease retained (#97488) that never gets released.
+        return future.done()
     except concurrent.futures.CancelledError:
         # Never started; nothing can be in flight.
         return True
@@ -1641,6 +1651,12 @@ def run_compress_context_with_progress_timeout(
                 handled_exit = True
                 return result
             except concurrent.futures.TimeoutError:
+                if future.done():
+                    # Worker-raised TimeoutError, not a wait expiry (see
+                    # :func:`_join_cancelled_worker`): the attempt is already
+                    # over. Re-polling a settled future would hot-spin — and
+                    # INFO-flood "still streaming" — until the total ceiling.
+                    break
                 waited = time.monotonic() - wait_started
                 since_progress = fence.seconds_since_progress()
                 remaining_ceiling = ceiling - waited
@@ -1768,6 +1784,14 @@ def run_compress_context_with_progress_timeout(
                     handled_exit = True
                     return result
                 except concurrent.futures.TimeoutError:
+                    if future.done():
+                        # The worker exited by RAISING TimeoutError inside its
+                        # commit (see :func:`_join_cancelled_worker`). It has
+                        # unwound, so no commit is in flight and there is
+                        # nothing left to wait for: stop the overrun loop
+                        # instead of re-raising the same settled exception
+                        # forever (an escalating log flood that never ends).
+                        break
                     # Fence progress (commit-phase touch_progress) is
                     # informative only — the commit must complete regardless;
                     # loop and re-report with the updated overrun window.
