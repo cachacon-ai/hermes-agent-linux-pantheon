@@ -78,6 +78,7 @@ jobs:
     uses: ./.github/workflows/tests.yml
     with:
       python_mode: ${{ needs.detect.outputs.pantheon_python_scope == 'false' && 'full' || '' }}
+      slice_count: ${{ vars.CI_TEST_SLICE_COUNT != '' && fromJSON(vars.CI_TEST_SLICE_COUNT) || 4 }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the

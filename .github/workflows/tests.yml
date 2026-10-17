@@ -10,6 +10,13 @@ on:
         required: false
         type: string
         default: ""
+      slice_count:
+        description: >-
+          Parallel Linux pytest shards (1 = single job, no matrix). Forks on
+          standard runners typically use 4; upstream 96-core runners use 1.
+        required: false
+        type: number
+        default: 4
   schedule:
     # Overridable via repository variable CI_PYTHON_FULL_CRON (default 06:00 UTC).
     - cron: "0 6 * * *"
@@ -34,18 +41,121 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
-    #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
+  generate:
+    name: Generate test slices
+    if: inputs.slice_count >= 2
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Configure Python test CI env
+        env:
+          INPUT_PYTHON_MODE: ${{ inputs.python_mode }}
+          WORKFLOW_DISPATCH_PYTHON_MODE: ${{ github.event.inputs.python_mode }}
+          REPO_CI_PYTHON_MODE: ${{ vars.CI_PYTHON_MODE }}
+          REPO_CI_PYTHON_TEST_PATHS: ${{ vars.CI_PYTHON_TEST_PATHS }}
+          REPO_CI_PYTHON_EXTRA_ARGS: ${{ vars.CI_PYTHON_EXTRA_ARGS }}
+        run: scripts/ci/configure_python_test_ci_env.sh
+
+      - name: Restore duration cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations
+          restore-keys: |
+            test-durations-
+
+      - name: Generate test slices
+        id: matrix
+        run: |
+          MATRIX=$(scripts/ci/generate_python_test_slices.sh "${{ inputs.slice_count }}")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  test-shard:
+    name: Run tests shard ${{ matrix.slice.index }}/${{ inputs.slice_count }}
+    needs: generate
+    if: inputs.slice_count >= 2
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
-    # Upstream uses a 96-core runner (~2 min). On ubuntu-latest (4 vCPU) the
-    # suite needs more wall time; override with vars.CI_TEST_TIMEOUT_MINUTES.
+    timeout-minutes: ${{ vars.CI_TEST_TIMEOUT_MINUTES != '' && fromJSON(vars.CI_TEST_TIMEOUT_MINUTES) || 120 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install ripgrep (prebuilt binary)
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run tests (shard ${{ matrix.slice.index }}/${{ inputs.slice_count }})
+        if: matrix.slice.files != ''
+        run: |
+          source .venv/bin/activate
+          extra=()
+          if [[ -n "${CI_PYTHON_EXTRA_ARGS:-}" ]]; then
+            # shellcheck disable=SC2206
+            extra=(${CI_PYTHON_EXTRA_ARGS})
+          fi
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' "${extra[@]}"
+      - name: Skip empty shard
+        if: matrix.slice.files == ''
+        run: echo "No test files in this shard; skipping."
+        env:
+          HERMES_TEST_WORKERS: ${{ vars.CI_TEST_WORKERS || '4' }}
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          CI_PYTHON_EXTRA_ARGS: ${{ vars.CI_PYTHON_EXTRA_ARGS }}
+
+      - name: Upload per-slice durations
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-durations-slice-${{ matrix.slice.index }}
+          path: test_durations.json
+          retention-days: 1
+
+  test:
+    name: Tests (single runner)
+    if: inputs.slice_count < 2
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: ${{ vars.CI_TEST_TIMEOUT_MINUTES != '' && fromJSON(vars.CI_TEST_TIMEOUT_MINUTES) || 120 }}
     steps:
       - name: Checkout code
@@ -68,16 +178,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
         with:
-          # Pin the uv version: unpinned, setup-uv resolves "latest" by
-          # fetching a manifest from raw.githubusercontent.com on EVERY job —
-          # a transient fetch failure fails the whole job (2026-07-28 slice-5
-          # incident). Pinned, the binary downloads directly; no manifest hop.
           version: "0.9.28"
-          # Persist uv's download/wheel cache (~/.cache/uv) across runs.
-          # Keyed on the dependency manifests, so the cache is reused until
-          # pyproject.toml or uv.lock changes. `uv sync` still runs every
-          # time, but resolves from the warm cache instead of re-downloading
-          # and re-building wheels.
           enable-cache: true
           cache-dependency-glob: |
             pyproject.toml
@@ -89,80 +190,96 @@ jobs:
           command: uv python install 3.11
 
       - name: Install dependencies
-        # `uv sync --locked` installs the exact pinned set from uv.lock (and
-        # fails if the lock is out of sync with pyproject.toml), giving a
-        # reproducible env. It also creates .venv itself, so no separate
-        # `uv venv` step is needed.
-        #
-        # The trailing extras beyond all/dev are the lazy-install features
-        # (tools/lazy_deps.py) that tests exercise for real: provider.anthropic,
-        # stt/tts.mistral, image.fal, terminal.modal, terminal.daytona,
-        # memory.hindsight, search.parallel. The hermetic test env forbids
-        # mid-run pip installs (HERMES_DISABLE_LAZY_INSTALLS=1 in
-        # tests/conftest.py), so the SDKs those tests need must be in the
-        # venv up front — resolved from uv.lock like everything else, which
-        # also honors the exact supply-chain pins these extras carry.
         uses: ./.github/actions/retry
         with:
           command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
-        # Optimized for CI: prunes pre-built wheels that are cheap to
-        # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
+      - name: Configure Python test CI env
+        env:
+          INPUT_PYTHON_MODE: ${{ inputs.python_mode }}
+          WORKFLOW_DISPATCH_PYTHON_MODE: ${{ github.event.inputs.python_mode }}
+          REPO_CI_PYTHON_MODE: ${{ vars.CI_PYTHON_MODE }}
+          REPO_CI_PYTHON_TEST_PATHS: ${{ vars.CI_PYTHON_TEST_PATHS }}
+          REPO_CI_PYTHON_EXTRA_ARGS: ${{ vars.CI_PYTHON_EXTRA_ARGS }}
+        run: scripts/ci/configure_python_test_ci_env.sh
+
       - name: Run tests
-        # Per-file isolation via scripts/run_tests.sh: each test file runs
-        # in its own freshly-spawned `python -m pytest <file>` subprocess
-        # with bounded parallelism. No xdist, no shared workers, no
-        # module-level state leakage between files.
-        #
-        # CI_PYTHON_MODE (repository variable): full | pantheon | paths.
-        # Pantheon path list: scripts/ci/pantheon_python_test_paths.txt.
-        # Scheduled and workflow_dispatch runs default to full; PRs default to
-        # pantheon when the variable is unset (see scripts/ci/run_python_tests_ci.sh).
         run: |
           source .venv/bin/activate
-          if [[ -n "${{ inputs.python_mode }}" ]]; then
-            export CI_PYTHON_MODE="${{ inputs.python_mode }}"
-          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
-            export CI_PYTHON_MODE=full
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            export CI_PYTHON_MODE="${{ github.event.inputs.python_mode || 'full' }}"
-          elif [[ -n "${{ vars.CI_PYTHON_MODE }}" ]]; then
-            export CI_PYTHON_MODE="${{ vars.CI_PYTHON_MODE }}"
-          fi
-          export CI_PYTHON_TEST_PATHS="${{ vars.CI_PYTHON_TEST_PATHS }}"
-          export CI_PYTHON_EXTRA_ARGS="${{ vars.CI_PYTHON_EXTRA_ARGS }}"
           scripts/ci/run_python_tests_ci.sh
         env:
-          # This is the maximum number of test FILES that run together.
-          # run_tests_parallel.py starts one pytest subprocess for each file
-          # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
-          #
-          # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
-          # two repetitions for each value. See run 32549672063:
-          #
-          #     workers   x cores   mean
-          #        48       0.5x    138s
-          #        96       1.0x    126s   <- fastest
-          #       144       1.5x    132s
-          #       192       2.0x    132s
-          #       240       2.5x    140s
-          #       288       3.0x    142s
-          #
-          # One worker for each core wins. The curve is shallow: 126s to 142s
-          # across a 6x range. The suite has sufficient concurrency at this
-          # size. The remaining time is the slowest files plus the setup.
-          # Workers above the core count only add contention.
-          # Upstream sets vars.CI_TEST_WORKERS=96 on the large runner; forks
-          # default to 4 parallel test files on standard hosted runners.
           HERMES_TEST_WORKERS: ${{ vars.CI_TEST_WORKERS || '4' }}
-          # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+  test-gate:
+    name: Run tests
+    needs:
+      - test
+      - test-shard
+    # One need is always skipped (single-runner vs sharded). Run the gate anyway.
+    if: |
+      always() && (
+        (inputs.slice_count < 2 && needs.test.result != 'skipped') ||
+        (inputs.slice_count >= 2 && needs.test-shard.result != 'skipped')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require pytest lane green
+        run: |
+          if [[ "${{ inputs.slice_count }}" -lt 2 ]]; then
+            result="${{ needs.test.result }}"
+            if [[ "$result" != "success" ]]; then
+              echo "::error::Single-runner tests result: $result"
+              exit 1
+            fi
+            echo "Single-runner tests passed"
+          else
+            result="${{ needs.test-shard.result }}"
+            if [[ "$result" != "success" ]]; then
+              echo "::error::Test shards result: $result"
+              exit 1
+            fi
+            echo "All ${{ inputs.slice_count }} test shards passed"
+          fi
+
+  save-durations:
+    name: Save test duration cache
+    needs: test-shard
+    if: inputs.slice_count >= 2 && needs.test-shard.result == 'success' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download all slice durations
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: test-durations-slice-*
+          path: durations
+
+      - name: Merge into single durations file
+        run: |
+          python3 -c "
+          import json, glob
+          merged = {}
+          for f in glob.glob('durations/*/test_durations.json'):
+              with open(f) as fh:
+                  merged.update(json.load(fh))
+          with open('test_durations.json', 'w') as fh:
+              json.dump(merged, fh, indent=2, sort_keys=True)
+              fh.write('\n')
+          print(f'Merged {len(merged)} file durations')
+          "
+
+      - name: Save merged duration cache
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-${{ github.run_id }}
 
   e2e:
     runs-on: ubuntu-latest
@@ -188,16 +305,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
         with:
-          # Pin the uv version: unpinned, setup-uv resolves "latest" by
-          # fetching a manifest from raw.githubusercontent.com on EVERY job —
-          # a transient fetch failure fails the whole job (2026-07-28 slice-5
-          # incident). Pinned, the binary downloads directly; no manifest hop.
           version: "0.9.28"
-          # Persist uv's download/wheel cache (~/.cache/uv) across runs.
-          # Keyed on the dependency manifests, so the cache is reused until
-          # pyproject.toml or uv.lock changes. `uv sync` still runs every
-          # time, but resolves from the warm cache instead of re-downloading
-          # and re-building wheels.
           enable-cache: true
           cache-dependency-glob: |
             pyproject.toml
@@ -207,22 +315,11 @@ jobs:
         run: uv python install 3.11
 
       - name: Install dependencies
-        # `uv sync --locked` installs the exact pinned set from uv.lock (and
-        # fails if the lock is out of sync with pyproject.toml), giving a
-        # reproducible env. It also creates .venv itself, so no separate
-        # `uv venv` step is needed.
-        #
-        # Same extras as the test job's sync above: the hermetic test env
-        # forbids mid-run pip installs (HERMES_DISABLE_LAZY_INSTALLS=1 in
-        # tests/conftest.py), so lazy-install SDKs exercised by tests must be
-        # in the venv up front.
         uses: ./.github/actions/retry
         with:
           command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
-        # Optimized for CI: prunes pre-built wheels that are cheap to
-        # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
       - name: Run e2e tests

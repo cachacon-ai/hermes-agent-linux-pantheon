@@ -11,6 +11,7 @@ Upstream Hermes CI assumes Nous Research org-hosted **larger runners** (`ubuntu-
 | `CI_WINDOWS_RUNNER` | `windows-latest` | `windows-latest` | `windows-latest-32-core` |
 | `CI_TEST_WORKERS` | `4` | `4` (matches standard 4 vCPU Linux runner) | `96` on the 96-core test runner |
 | `CI_TEST_TIMEOUT_MINUTES` | `120` | `120` or higher if the suite is still tight | `30` on the 96-core runner |
+| `CI_TEST_SLICE_COUNT` | `4` | `4` on standard `ubuntu-latest` (parallel shards) | `1` (single 96-core job, no matrix) |
 | `CI_PRIMARY_REPOSITORY` | automation **off** | Set to `owner/repo` only when you want publish/deploy/skills automation on that repo | `NousResearch/hermes-agent` |
 | `CI_PYTHON_MODE` | PRs: `pantheon`; push: `full` (see below) | `pantheon` | `full` (or unset — upstream runs the whole suite) |
 | `CI_PYTHON_TEST_PATHS` | ignored unless `CI_PYTHON_MODE=paths` | Newline or comma-separated roots/files for `scripts/run_tests.sh` | — |
@@ -44,7 +45,9 @@ PRs that touch only `website/` (and other `_PY_SKIP` trees) already skip the Pyt
 
 The main pytest lane (`.github/workflows/tests.yml`) defaults to **120 minutes** timeout and **4** parallel test-file workers on standard `ubuntu-latest`. Upstream runs the same workflow with `CI_LINUX_RUNNER=ubuntu-latest-96-core`, `CI_TEST_WORKERS=96`, and `CI_TEST_TIMEOUT_MINUTES=30`.
 
-If a fork run times out, raise `CI_TEST_TIMEOUT_MINUTES` (for example `180`) or lower `CI_TEST_WORKERS` to reduce contention. There is no matrix sharding in the current workflow; adding sharding would be a separate change.
+If a fork run times out, raise `CI_TEST_TIMEOUT_MINUTES` (for example `180`) or lower `CI_TEST_WORKERS` to reduce contention.
+
+**Sharding:** when `CI_TEST_SLICE_COUNT` is greater than 1 (default **4** on forks), `.github/workflows/tests.yml` runs the Linux pytest lane as parallel matrix shards. A lightweight `Generate test slices` job uses `test_durations.json` (Actions cache) and LPT balancing via `scripts/run_tests_parallel.py --generate-slices` (empty LPT buckets are omitted from the matrix). Each shard runs `scripts/run_tests.sh --files …` with the same env as the monolithic job. Exactly one GitHub check is named **Run tests**: the **`test-gate`** job, which passes when either the monolithic **`test`** job (`CI_TEST_SLICE_COUNT=1`, job name **Tests (single runner)**) or all **`test-shard`** matrix legs succeed. Sharded runs skip **Tests (single runner)** so branch protection never sees a skipped **Run tests**. An explicit empty `--files` list exits successfully without re-discovering the full suite.
 
 ## Workflows affected by runner variables
 
