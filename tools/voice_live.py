@@ -517,7 +517,6 @@ def create_webrtc_session(
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-            payload["auth"] = "api"
     except urllib.error.HTTPError as exc:
         # Log status + category only. The upstream body is untrusted and can echo the key,
         # so it is neither logged nor put in the exception the route logs.
@@ -526,7 +525,9 @@ def create_webrtc_session(
         raise VoiceLiveUpstreamError(
             f"GPT-Live session creation rejected (status {exc.code}, {category})"
         ) from None
-    return _validate_session_answer(payload)
+    validated = _validate_session_answer(payload)
+    validated["auth"] = "api"
+    return validated
 
 
 def _normalize_vendor_session_id(session_id: str) -> str:

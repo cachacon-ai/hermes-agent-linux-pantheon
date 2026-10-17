@@ -3825,8 +3825,6 @@ def run_conversation(
                                 _soft_fields = {"message": str(_err_obj)} if _err_obj else {}
                             _soft_fields = {k: v for k, v in _soft_fields.items() if isinstance(v, str) and v.strip()}
                             if _soft_fields:
-                                from agent.error_classifier import FailoverReason, classify_api_error
-
                                 class _CodexSoftFailure(Exception):
                                     def __init__(self, error: dict) -> None:
                                         super().__init__(error.get("message") or "")

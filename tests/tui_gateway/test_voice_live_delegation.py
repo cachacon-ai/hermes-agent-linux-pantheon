@@ -257,7 +257,7 @@ class TestVendorAnswerValidation:
         payload = {"session": {"id": "live_x"}, "transport": {"type": "webrtc", "sdp": "v=0\r\n"}}
         self._install(monkeypatch, payload)
 
-        assert voice_live.create_webrtc_session("v=0 offer") == payload
+        assert voice_live.create_webrtc_session("v=0 offer") == {**payload, "auth": "api"}
 
 
 class TestSessionClose:
