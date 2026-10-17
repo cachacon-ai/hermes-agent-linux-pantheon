@@ -5518,13 +5518,12 @@ async def get_voice_live_status(profile: Optional[str] = None):
 
     with http_failure("GPT-Live status resolution failed", 500, "GPT-Live status failed"):
         result = await _run_config_scoped(profile, resolve_gpt_live_status)
-    # Upstream reports ``available``; the fork reports ``configured`` so the
-    # client cannot read this as an entitlement check — it only says whether a
-    # key resolved. ``reason`` is dropped for the same reason: it is a hint, not
-    # a contract.
     return {
         "ok": True,
         "configured": bool(result.get("available")),
+        "available": bool(result.get("available")),
+        "auth": str(result.get("auth") or "api"),
+        "reason": result.get("reason"),
         "mode": str(result.get("mode") or "chained"),
         "model": str(result.get("model") or ""),
         "voice": str(result.get("voice") or ""),
@@ -5543,9 +5542,11 @@ async def create_voice_live_session(
     the session it belongs to (surface ``voice-live``).
     """
     from tools.voice_live import (
+        VoiceLiveAuthMismatchError,
         VoiceLiveDisabledError,
         VoiceLiveHistoryError,
         VoiceLiveMissingKeyError,
+        VoiceLiveUpstreamError,
         create_webrtc_session,
     )
 
@@ -5557,7 +5558,10 @@ async def create_voice_live_session(
         raise HTTPException(status_code=400, detail="An SDP offer is required")
     try:
         result = await _run_config_scoped(
-            profile, lambda: create_webrtc_session(sdp, payload.history)
+            profile,
+            lambda: create_webrtc_session(
+                sdp, payload.history, expected_auth=payload.expected_auth
+            ),
         )
     except json.JSONDecodeError as exc:
         # A 200 whose body is not JSON is a failed session, NOT a missing key —
@@ -5579,6 +5583,21 @@ async def create_voice_live_session(
         # No key resolves for this profile. Not a vendor failure: the client
         # falls back to the chained STT -> TTS engine permanently.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except VoiceLiveAuthMismatchError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "expected_auth_mismatch",
+                "expected_auth": exc.expected_auth,
+                "configured_auth": exc.configured_auth,
+            },
+        ) from exc
+    except VoiceLiveUpstreamError:
+        _log.warning("GPT-Live session creation failed: upstream rejection")
+        raise HTTPException(
+            status_code=502, detail="GPT-Live session creation failed"
+        ) from None
     except HTTPException:
         raise  # an unknown ?profile= is the scope's own 404, not a fallback
     except Exception as exc:

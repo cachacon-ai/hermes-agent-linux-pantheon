@@ -2019,6 +2019,9 @@ DEFAULT_CONFIG = {
         # operator opts in by setting this to "gpt-live".
         "voice_chat_mode": "chained",  # chained | gpt-live
         "gpt_live": {
+            "auth": "api",
+            "subscription_model": "gpt-live-1-codex",
+            "subscription_voice": "cove",
             "model": "gpt-live-1",
             "voice": "marin",
             "instructions": "",

@@ -304,6 +304,9 @@ class PooledCredential:
     def runtime_base_url(self) -> Optional[str]:
         if self.provider == "nous":
             return self.inference_base_url or self.base_url
+        if self.provider == "openai-codex":
+            override = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+            return override or self.base_url
         return self.base_url
 
 
@@ -2313,6 +2316,18 @@ class CredentialPool:
         if not token:
             return False
         try:
+            fresh = auth_mod._refresh_expired_codex_probe_token(token, entry.refresh_token)
+            if fresh:
+                old = next((e for e in self._entries if e.id == entry.id), entry)
+                entry = replace(
+                    old,
+                    access_token=fresh.get("access_token") or old.access_token,
+                    refresh_token=fresh.get("refresh_token") or old.refresh_token,
+                    last_refresh=fresh.get("last_refresh") or old.last_refresh,
+                )
+                self._replace_entry(old, entry)
+                self._sync_device_code_entry_to_auth_store(entry)
+                token = entry.access_token or token
             return bool(
                 auth_mod._probe_codex_quota_restored(
                     token,
@@ -2367,6 +2382,8 @@ class CredentialPool:
         with self._lock:
             return self._select_unlocked()
 
+    _REFRESH_SWEEP_SPACING_SECONDS = 0.5
+
     def _refresh_pending_entries(self, pending: List[tuple]) -> None:
         """Refresh deferred single-use-token entries outside the lock.
 
@@ -2374,7 +2391,9 @@ class CredentialPool:
         (which can block for 20+ seconds) and then merged into the pool.
         On failure the entry is silently skipped.
         """
-        for entry, sync_fn in pending:
+        for index, entry in enumerate(pending):
+            if index:
+                time.sleep(self._REFRESH_SWEEP_SPACING_SECONDS)
             # _refresh_entry merges the refreshed entry into the pool
             # internally. Its mutation primitives (_replace_entry, _persist)
             # are self-locking, and the quarantine paths inside
@@ -2507,8 +2526,13 @@ class CredentialPool:
                     ):
                         continue
                 if clear_expired:
-                    cleared = replace(
+                    # The probe may have rotated this row's single-use token pair (#8ec0f627ec).
+                    live_row = next(
+                        (e for e in self._entries if e.id == entry.id),
                         entry,
+                    )
+                    cleared = replace(
+                        live_row,
                         last_status=STATUS_OK,
                         last_status_at=None,
                         last_error_code=None,
@@ -2516,7 +2540,7 @@ class CredentialPool:
                         last_error_message=None,
                         last_error_reset_at=None,
                     )
-                    self._replace_entry(entry, cleared)
+                    self._replace_entry(live_row, cleared)
                     entry = cleared
                     cleared_any = True
             if refresh and self._entry_needs_refresh(entry):

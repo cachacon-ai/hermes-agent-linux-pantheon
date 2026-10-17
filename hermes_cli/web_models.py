@@ -107,6 +107,7 @@ class AudioTranscriptionRequest(BaseModel):
 class VoiceLiveSessionRequest(BaseModel):
     sdp: str
     history: Optional[list[dict[str, Any]]] = None
+    expected_auth: Optional[Literal["api", "subscription"]] = None
 
 
 class VoiceLiveSessionCloseRequest(BaseModel):
