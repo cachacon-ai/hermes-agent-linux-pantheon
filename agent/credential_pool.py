@@ -2391,7 +2391,7 @@ class CredentialPool:
         (which can block for 20+ seconds) and then merged into the pool.
         On failure the entry is silently skipped.
         """
-        for index, entry in enumerate(pending):
+        for index, (entry, _sync_fn) in enumerate(pending):
             if index:
                 time.sleep(self._REFRESH_SWEEP_SPACING_SECONDS)
             # _refresh_entry merges the refreshed entry into the pool
