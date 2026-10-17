@@ -4607,7 +4607,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        deleted = await asyncio.to_thread(db.delete_session, session_id)
+        from hermes_state import SessionActiveWriteGuardError
+
+        try:
+            deleted = await asyncio.to_thread(
+                db.delete_session,
+                session_id,
+                exclude_active_write_guards=True,
+            )
+        except SessionActiveWriteGuardError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="session_active_turn"),
+                status=409,
+            )
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":

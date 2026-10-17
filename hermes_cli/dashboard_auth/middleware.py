@@ -87,10 +87,9 @@ def _path_is_public(path: str) -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    from hermes_cli.dashboard_auth.request_utils import client_ip
+
+    return client_ip(request)
 
 
 def _ordered_session_providers(

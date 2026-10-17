@@ -448,6 +448,28 @@ class TestCallbackHandlerIsolation:
         assert result["error"] == "access_denied"
 
 
+class TestCallbackHandlerErrorEscaping:
+    """Hostile ``error`` query params must be HTML-escaped in the callback body."""
+
+    def test_hostile_error_is_escaped_in_response_body(self):
+        from urllib.parse import quote
+
+        HandlerClass, result = _make_callback_handler()
+
+        handler = HandlerClass.__new__(HandlerClass)
+        handler.path = "/callback?error=" + quote("<script>alert(1)</script>")
+        handler.wfile = BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.do_GET()
+
+        body = handler.wfile.getvalue().decode("utf-8")
+        assert "<script>" not in body
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
+        assert result["error"] == "<script>alert(1)</script>"
+
+
 # ---------------------------------------------------------------------------
 # TOCTOU port reservation (#22161)
 # ---------------------------------------------------------------------------

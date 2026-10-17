@@ -1548,8 +1548,16 @@ def _(rid, params: dict) -> dict:
             sessions_dir = Path(profile_home) / "sessions"
         else:
             sessions_dir = get_hermes_home() / "sessions"
+        from hermes_state import SessionActiveWriteGuardError
+
         try:
-            deleted = db.delete_session(target, sessions_dir=sessions_dir)
+            deleted = db.delete_session(
+                target,
+                sessions_dir=sessions_dir,
+                exclude_active_write_guards=True,
+            )
+        except SessionActiveWriteGuardError:
+            return _err(rid, 4023, "cannot delete an active session")
         except Exception as e:
             return _err(rid, 5036, f"delete failed: {e}")
         if not deleted:
