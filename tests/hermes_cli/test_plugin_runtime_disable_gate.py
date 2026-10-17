@@ -198,9 +198,12 @@ class TestPluginApiRuntimeGate:
         async def receive():
             return {"type": "websocket.connect"}
 
+        async def send(msg):
+            sent.append(msg)
+
         with patch.object(web_server, "_get_dashboard_plugins", return_value=[{"name": "hot", "source": "user"}]), \
              patch("hermes_cli.web_server_plugin_gate._plugin_enable_sets_here", return_value=(set(), set())):
-            await gate(scope, receive, lambda msg: sent.append(msg))
+            await gate(scope, receive, send)
 
         assert sent == [{"type": "websocket.close", "code": 1008}]
         assert "app_called" not in sent
