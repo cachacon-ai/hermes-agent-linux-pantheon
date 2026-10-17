@@ -116,9 +116,12 @@ def _prime_compress_path_once() -> None:
     Every attempt goes through ``propagate_context_to_thread``, whose
     ``_callback_api()`` lazily imports ``tools.thread_context`` and then
     ``tools.terminal_tool`` (tools/thread_context.py:43-61). That import is
-    charged to whichever attempt pays it first, and on a cold, loaded machine it
-    is enormous: measured 22.7s with 4 CPU-bound burner threads in a fresh
-    process, 0.000s once warm.
+    charged to whichever attempt pays it first. Unloaded it is cheap (~0.13s,
+    ``python -X importtime``), but CPU-bound threads contending for the GIL
+    inflate it enormously. Measured on a 10-core Mac in a fresh process with 4
+    CPU-bound burner threads: the import alone took 22.7s, and a separate probe
+    timed the whole first (cold) attempt at 17.9s versus ~2.5s for every warm
+    attempt after it. It costs 0.000s once warm.
 
     The budgets below (0.2s-4s ceilings) start at the fence, so a cold process
     can expire the deadline before the pool thread reaches its first bytecode —
@@ -282,7 +285,7 @@ class TestWorkerTeardownOnCeiling:
         # PRECONDITION, not a flake symptom: this test exercises the
         # TOTAL-CEILING path, and that path is the only one that joins
         # (the idle-stall path deliberately skips the join —
-        # conversation_compression.py:1787-1792). Assert the worker actually
+        # conversation_compression.py:1811-1816). Assert the worker actually
         # ran and the attempt ended on the ceiling, so a start-race or a
         # path mix-up reports itself instead of masquerading as a missing
         # join. On a loaded box the pool thread can miss the window entirely
