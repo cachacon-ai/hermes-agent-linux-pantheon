@@ -53,32 +53,44 @@ def _patch_chain(chain):
 
 
 class _StalledSummaryWorker:
-    """A compression worker whose first attempt streams nothing at all.
+    """A compression worker whose unpinned (primary) attempt streams nothing.
 
     Mirrors the reported shape: the provider holds the connection open, so the
     worker never calls ``fence.touch_progress()`` and the host's idle budget
-    lapses. ``stall_attempts`` controls how many attempts hang; any later
-    attempt commits a real summary.
+    lapses.
+
+    The stall keys on the attempt's ROUTE, never on how many times the worker has
+    been called. When the host is starved enough to poison the fence before the
+    pool thread starts, ``_fence_gated_worker`` skips the primary job entirely
+    so a stale job never burns an LLM call (#76354 F6) — and the retry's pinned
+    invocation is then the FIRST one this worker ever sees. Counting
+    invocations there stalls the very attempt the contract is about and makes
+    "exactly two invocations" unreachable, even though production is behaving
+    correctly.
+
+    ``stall_pinned`` additionally hangs the pinned fallback, for the "this route
+    is unhealthy too" case.
     """
 
-    def __init__(self, compressed, *, stall_attempts=1):
+    def __init__(self, compressed, *, stall_pinned=False):
         self.compressed = compressed
-        self.stall_attempts = stall_attempts
+        self.stall_pinned = stall_pinned
         self.routes = []
         self.fences = []
         self._lock = threading.Lock()
         self.release = threading.Event()
 
     @property
-    def attempts(self):
-        return len(self.routes)
+    def pinned(self):
+        """Attempts that ran with a pinned fallback route, in order."""
+        return [route for route in self.routes if route is not None]
 
     def __call__(self, fence: CompressionCommitFence):
         with self._lock:
-            self.routes.append(take_pinned_summary_route())
+            route = take_pinned_summary_route()
+            self.routes.append(route)
             self.fences.append(fence)
-            attempt = len(self.routes)
-        if attempt <= self.stall_attempts:
+        if route is None or self.stall_pinned:
             # Connection open, zero tokens, zero fence progress.
             self.release.wait(timeout=10)
             return ([{"role": "assistant", "content": "late"}], "late-prompt")
@@ -120,10 +132,11 @@ def test_stalled_summary_attempts_configured_fallback_chain():
     finally:
         worker.release.set()
 
-    assert worker.attempts == 2, "the aborted stall must be retried once"
-    assert worker.routes[0] is None, "the primary attempt is never pinned"
-    pinned = worker.routes[1]
-    assert pinned is not None, "the retry must carry the configured fallback route"
+    assert len(worker.pinned) == 1, "the aborted stall must be retried exactly once"
+    assert all(route is None for route in worker.routes[:-1]), (
+        "the primary attempt is never pinned"
+    )
+    pinned = worker.pinned[0]
     assert pinned["provider"] == "custom"
     assert pinned["model"] == "backup-summarizer"
     assert msgs == compressed, "the fallback attempt's compression must be published"
@@ -160,9 +173,13 @@ def test_retry_runs_on_a_host_published_fence():
 
     assert msgs == compressed
     assert len(minted) == 1, "exactly one fence is minted for the one retry"
-    assert worker.fences[1] is minted[0]
-    assert worker.fences[1] is not worker.fences[0]
-    assert worker.fences[0].is_cancelled, "the aborted attempt stays cancelled"
+    assert worker.fences[-1] is minted[0], "the retry runs on the minted fence"
+    assert all(f is not minted[0] for f in worker.fences[:-1]), (
+        "the retry must not reuse the aborted attempt's fence"
+    )
+    assert all(f.is_cancelled for f in worker.fences[:-1]), (
+        "the aborted attempt stays cancelled"
+    )
 
 
 def test_hard_interrupt_suppresses_the_fallback_attempt():
@@ -189,7 +206,7 @@ def test_hard_interrupt_suppresses_the_fallback_attempt():
     finally:
         worker.release.set()
 
-    assert worker.attempts == 1
+    assert not worker.pinned, "an explicit stop must not start a fallback summary"
     assert msgs is original
     assert prompt == "degraded-prompt"
     assert len(timeouts) == 1
@@ -205,7 +222,7 @@ def test_no_fallback_chain_configured_degrades_without_retry():
     finally:
         worker.release.set()
 
-    assert worker.attempts == 1, "nothing to fall back to — do not burn a retry"
+    assert not worker.pinned, "nothing to fall back to — do not burn a retry"
     assert msgs is original
     assert prompt == "degraded-prompt"
     assert len(timeouts) == 1
@@ -214,7 +231,7 @@ def test_no_fallback_chain_configured_degrades_without_retry():
 def test_fallback_that_also_stalls_degrades_after_one_attempt():
     original = [{"role": "user", "content": "keep-me"}]
     worker = _StalledSummaryWorker(
-        [{"role": "user", "content": "unused"}], stall_attempts=2
+        [{"role": "user", "content": "unused"}], stall_pinned=True
     )
     timeouts = []
     entry = dict(CHAIN_ENTRY, timeout=0.05)
@@ -224,7 +241,7 @@ def test_fallback_that_also_stalls_degrades_after_one_attempt():
     finally:
         worker.release.set()
 
-    assert worker.attempts == 2, "the fallback is attempted once, not in a loop"
+    assert len(worker.pinned) == 1, "the fallback is attempted once, not in a loop"
     assert msgs is original, "no messages may be dropped when both routes stall"
     assert prompt == "degraded-prompt"
     assert len(timeouts) == 1, "the degrade must be reported exactly once"
