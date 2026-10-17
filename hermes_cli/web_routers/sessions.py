@@ -900,6 +900,8 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
 
     try:
         result = await asyncio.to_thread(_delete)
+    except HTTPException:
+        raise
     except Exception as exc:
         _log.exception("DELETE /api/sessions/%s failed", session_id)
         raise HTTPException(status_code=500, detail="Session deletion failed") from exc

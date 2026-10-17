@@ -15560,7 +15560,9 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
             if cursor.fetchone() is None:
                 return False
             if exclude_active_write_guards and self._write_guards_reject(
-                conn, session_id
+                conn,
+                session_id,
+                allow_closed_compression_parent=True,
             ):
                 raise SessionActiveWriteGuardError(
                     f"session '{session_id}' has an active turn lease or compression lock"
@@ -15703,7 +15705,11 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
 
             if exclude_active_write_guards:
                 active_ids = {
-                    sid for sid in existing if self._write_guards_reject(conn, sid)
+                    sid
+                    for sid in existing
+                    if self._write_guards_reject(
+                        conn, sid, allow_closed_compression_parent=True
+                    )
                 }
                 existing = [sid for sid in existing if sid not in active_ids]
                 if not existing:

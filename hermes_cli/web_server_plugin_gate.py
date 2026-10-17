@@ -8,7 +8,6 @@ from typing import Any, Optional
 from starlette import status
 from starlette._utils import get_route_path
 
-from hermes_cli.config import cfg_get, load_config_readonly
 from hermes_constants import (
     get_hermes_home,
     get_process_hermes_home,
@@ -42,15 +41,11 @@ def _launch_profile_scope():
 
 def _plugin_enable_sets_here() -> tuple[set, set]:
     try:
-        config = load_config_readonly()
+        from hermes_cli.plugins_cmd import _get_disabled_set, _get_enabled_set
+
+        return _get_enabled_set(), _get_disabled_set()
     except Exception:
-        config = {}
-    enabled = cfg_get(config, "plugins", "enabled", default=[])
-    disabled = cfg_get(config, "plugins", "disabled", default=[])
-    return (
-        set(enabled) if isinstance(enabled, list) else set(),
-        set(disabled) if isinstance(disabled, list) else set(),
-    )
+        return set(), set()
 
 
 def _plugin_consent_withheld(plugin: dict[str, Any]) -> bool:
