@@ -16,6 +16,7 @@ import pytest
 
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
+    CODEX_RATE_LIMITED_CODE,
     AuthError,
     _codex_usage_probe_url,
     _is_codex_rate_limit_shaped,
@@ -216,6 +217,36 @@ def _pool_only_rate_limited_store(now=None):
             ]
         },
     }
+
+
+def test_read_only_resolver_skips_quota_probe_and_auth_write(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _write_auth_store(hermes_home, _pool_only_rate_limited_store())
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    monkeypatch.setattr(
+        auth_mod,
+        "_probe_codex_pool_entry_quota_restored",
+        lambda *a, **k: pytest.fail("quota probe must not run when read_only=True"),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "clear_codex_pool_quota_cooldowns",
+        lambda *a, **k: pytest.fail("cooldown clear must not run when read_only=True"),
+    )
+    saves = []
+
+    def _track_save(store, *a, **k):
+        saves.append(store)
+        pytest.fail("auth store must not be written when read_only=True")
+
+    monkeypatch.setattr(auth_mod, "_save_auth_store", _track_save)
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials(read_only=True)
+
+    assert exc_info.value.code == CODEX_RATE_LIMITED_CODE
+    assert saves == []
 
 
 def test_resolver_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):

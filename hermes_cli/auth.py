@@ -4853,25 +4853,28 @@ def resolve_codex_runtime_credentials(
             # redeemed, plan upgraded, window reset upstream).  The persisted
             # ``last_error_reset_at`` can be days in the future while the
             # account is already usable again — see issue #43747.
-            if _probe_codex_pool_entry_quota_restored(pool_rate_limit):
-                logger.info(
-                    "Codex quota restored upstream — clearing stale pool cooldown(s)."
-                )
-                clear_codex_pool_quota_cooldowns()
-                pool_token = _pool_codex_access_token()
-                if pool_token:
-                    base_url = (
-                        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
-                        or DEFAULT_CODEX_BASE_URL
+            # Read-only callers (GPT-Live /status, doctor) must not probe or
+            # rewrite auth.json — report the stored cooldown as-is (#68004).
+            if not read_only:
+                if _probe_codex_pool_entry_quota_restored(pool_rate_limit):
+                    logger.info(
+                        "Codex quota restored upstream — clearing stale pool cooldown(s)."
                     )
-                    return {
-                        "provider": "openai-codex",
-                        "base_url": base_url,
-                        "api_key": pool_token,
-                        "source": "credential_pool",
-                        "last_refresh": None,
-                        "auth_mode": "chatgpt",
-                    }
+                    clear_codex_pool_quota_cooldowns()
+                    pool_token = _pool_codex_access_token()
+                    if pool_token:
+                        base_url = (
+                            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                            or DEFAULT_CODEX_BASE_URL
+                        )
+                        return {
+                            "provider": "openai-codex",
+                            "base_url": base_url,
+                            "api_key": pool_token,
+                            "source": "credential_pool",
+                            "last_refresh": None,
+                            "auth_mode": "chatgpt",
+                        }
             reset_at = pool_rate_limit.get("reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
                 remaining = int(reset_at - time.time())

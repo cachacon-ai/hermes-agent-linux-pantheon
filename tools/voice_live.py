@@ -222,19 +222,47 @@ def _live_model_voice(live: dict[str, Any], auth: str) -> tuple[str, str]:
 def _subscription_credentials(
     *, refresh_if_expiring: bool = True, read_only: bool = False,
 ) -> tuple[str, str]:
-    from hermes_cli.auth import AuthError, _decode_jwt_claims, resolve_codex_runtime_credentials
+    from hermes_cli.auth import (
+        CODEX_RATE_LIMITED_CODE,
+        AuthError,
+        _decode_jwt_claims,
+        resolve_codex_runtime_credentials,
+    )
 
     try:
         credentials = resolve_codex_runtime_credentials(
             refresh_if_expiring=refresh_if_expiring,
             read_only=read_only,
         )
-    except AuthError:
+    except AuthError as exc:
+        if read_only and getattr(exc, "code", None) == CODEX_RATE_LIMITED_CODE:
+            raise ValueError(str(exc)) from None
         raise ValueError(
             "GPT-Live subscription needs a working Codex sign-in on the Hermes host. "
             "Run `hermes auth` and choose OpenAI Codex."
         ) from None
     token = str(credentials.get("api_key") or "").strip()
+    if read_only:
+        from hermes_cli.auth import (
+            CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+            _codex_access_token_is_expiring,
+        )
+
+        if not token:
+            raise ValueError(
+                "GPT-Live subscription needs a working Codex sign-in on the Hermes host. "
+                "Run `hermes auth` and choose OpenAI Codex."
+            )
+        if _codex_access_token_is_expiring(token, 0):
+            raise ValueError(
+                "GPT-Live subscription: Codex access token is expired. "
+                "Run `hermes auth` to sign in again."
+            )
+        if _codex_access_token_is_expiring(token, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS):
+            raise ValueError(
+                "GPT-Live subscription: Codex access token is expiring soon. "
+                "Run `hermes auth` to refresh, or retry after runtime refresh."
+            )
     claims = _decode_jwt_claims(token).get("https://api.openai.com/auth", {})
     account = claims.get("chatgpt_account_id") if isinstance(claims, dict) else None
     if (

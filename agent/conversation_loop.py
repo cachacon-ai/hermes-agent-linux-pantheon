@@ -925,6 +925,62 @@ def _billing_failure_result(
     }
 
 
+def _try_codex_soft_failure_pool_recovery(agent, response, retry) -> bool:
+    """Rotate the credential pool on codex_responses failed/cancelled soft failures.
+
+    Returns True when pool recovery succeeded and the conversation loop should retry.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses" or response is None:
+        return False
+    _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
+    if _codex_resp_status not in {"failed", "cancelled"}:
+        return False
+    _err_obj = getattr(response, "error", None)
+    if isinstance(_err_obj, dict):
+        _soft_fields = {k: v for k, v in _err_obj.items() if isinstance(v, str) and v.strip()}
+    elif _err_obj is not None and (hasattr(_err_obj, "code") or hasattr(_err_obj, "message")):
+        _soft_fields = {
+            "code": getattr(_err_obj, "code", None),
+            "message": getattr(_err_obj, "message", None),
+        }
+    else:
+        _soft_fields = {"message": str(_err_obj)} if _err_obj else {}
+    _soft_fields = {k: v for k, v in _soft_fields.items() if isinstance(v, str) and v.strip()}
+    if not _soft_fields:
+        return False
+
+    class _CodexSoftFailure(Exception):
+        def __init__(self, error: dict) -> None:
+            super().__init__(error.get("message") or "")
+            self.body = {"error": error}
+
+    _soft_exc = _CodexSoftFailure(_soft_fields)
+    _soft = classify_api_error(
+        _soft_exc,
+        provider=getattr(agent, "provider", "") or "",
+        model=getattr(agent, "model", "") or "",
+    )
+    _soft_ctx = agent._extract_api_error_context(_soft_exc)
+    if _soft.reason in (
+        FailoverReason.rate_limit,
+        FailoverReason.billing,
+    ) or _soft.is_auth:
+        _recovered, retry.has_retried_429 = agent._recover_with_credential_pool(
+            status_code=None,
+            has_retried_429=retry.has_retried_429,
+            classified_reason=_soft.reason,
+            error_context=_soft_ctx,
+            billing_unverified=_soft.billing_unverified,
+        )
+        if _recovered:
+            agent._buffer_status(
+                f"🔄 Codex soft failure ({_soft.reason.value}) — "
+                "switched pool credential, retrying..."
+            )
+            return True
+    return False
+
+
 def _print_billing_or_entitlement_guidance(
     agent,
     *,
@@ -3810,52 +3866,8 @@ def run_conversation(
                     
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
-                    if agent.api_mode == "codex_responses" and response is not None:
-                        _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
-                        if _codex_resp_status in {"failed", "cancelled"}:
-                            _err_obj = getattr(response, "error", None)
-                            if isinstance(_err_obj, dict):
-                                _soft_fields = {k: v for k, v in _err_obj.items() if isinstance(v, str) and v.strip()}
-                            elif _err_obj is not None and (hasattr(_err_obj, "code") or hasattr(_err_obj, "message")):
-                                _soft_fields = {
-                                    "code": getattr(_err_obj, "code", None),
-                                    "message": getattr(_err_obj, "message", None),
-                                }
-                            else:
-                                _soft_fields = {"message": str(_err_obj)} if _err_obj else {}
-                            _soft_fields = {k: v for k, v in _soft_fields.items() if isinstance(v, str) and v.strip()}
-                            if _soft_fields:
-                                class _CodexSoftFailure(Exception):
-                                    def __init__(self, error: dict) -> None:
-                                        super().__init__(error.get("message") or "")
-                                        self.body = {"error": error}
-
-                                _soft_exc = _CodexSoftFailure(_soft_fields)
-                                _soft = classify_api_error(
-                                    _soft_exc,
-                                    provider=getattr(agent, "provider", "") or "",
-                                    model=getattr(agent, "model", "") or "",
-                                    base_url=str(getattr(agent, "base_url", "") or ""),
-                                    api_key=getattr(agent, "api_key", None),
-                                )
-                                _soft_ctx = agent._extract_api_error_context(_soft_exc)
-                                if _soft.reason in (
-                                    FailoverReason.rate_limit,
-                                    FailoverReason.billing,
-                                ) or _soft.is_auth:
-                                    _recovered, _retry.has_retried_429 = agent._recover_with_credential_pool(
-                                        status_code=None,
-                                        has_retried_429=_retry.has_retried_429,
-                                        classified_reason=_soft.reason,
-                                        error_context=_soft_ctx,
-                                        billing_unverified=_soft.billing_unverified,
-                                    )
-                                    if _recovered:
-                                        agent._buffer_status(
-                                            f"🔄 Codex soft failure ({_soft.reason.value}) — "
-                                            "switched pool credential, retrying..."
-                                        )
-                                        continue
+                    if _try_codex_soft_failure_pool_recovery(agent, response, _retry):
+                        continue
 
                     retry_count += 1
                     
