@@ -153,7 +153,7 @@ jobs:
           retention-days: 1
 
   test:
-    name: ${{ inputs.slice_count < 2 && 'Run tests' || 'Tests (single runner)' }}
+    name: Tests (single runner)
     if: inputs.slice_count < 2
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: ${{ vars.CI_TEST_TIMEOUT_MINUTES != '' && fromJSON(vars.CI_TEST_TIMEOUT_MINUTES) || 120 }}
@@ -217,20 +217,36 @@ jobs:
           NOUS_API_KEY: ""
 
   test-gate:
-    name: ${{ inputs.slice_count >= 2 && 'Run tests' || 'Tests (sharded gate unused)' }}
-    needs: test-shard
-    if: always() && inputs.slice_count >= 2
+    name: Run tests
+    needs:
+      - test
+      - test-shard
+    # One need is always skipped (single-runner vs sharded). Run the gate anyway.
+    if: |
+      always() && (
+        (inputs.slice_count < 2 && needs.test.result != 'skipped') ||
+        (inputs.slice_count >= 2 && needs.test-shard.result != 'skipped')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require all shards green
+      - name: Require pytest lane green
         run: |
-          result="${{ needs.test-shard.result }}"
-          if [[ "$result" != "success" ]]; then
-            echo "::error::Test shards result: $result"
-            exit 1
+          if [[ "${{ inputs.slice_count }}" -lt 2 ]]; then
+            result="${{ needs.test.result }}"
+            if [[ "$result" != "success" ]]; then
+              echo "::error::Single-runner tests result: $result"
+              exit 1
+            fi
+            echo "Single-runner tests passed"
+          else
+            result="${{ needs.test-shard.result }}"
+            if [[ "$result" != "success" ]]; then
+              echo "::error::Test shards result: $result"
+              exit 1
+            fi
+            echo "All ${{ inputs.slice_count }} test shards passed"
           fi
-          echo "All ${{ inputs.slice_count }} test shards passed"
 
   save-durations:
     name: Save test duration cache
