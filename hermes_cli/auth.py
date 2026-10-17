@@ -4792,8 +4792,13 @@ def resolve_codex_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store.
+
+    ``read_only=True`` (status / doctor / GPT-Live preflight) reports stored state as-is:
+    no Codex CLI adoption, no token refresh, and no auth-store write — and it wins over
+    ``force_refresh`` (#68004).
 
     Falls back to the credential pool when the singleton (``providers.openai-codex.tokens``)
     has no usable access_token but the pool (``credential_pool.openai-codex``) does. This
@@ -4809,11 +4814,15 @@ def resolve_codex_runtime_credentials(
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
+        if (
+            not read_only
+            and getattr(exc, "relogin_required", False)
+            and getattr(exc, "code", None) in {
+                "codex_auth_missing_access_token",
+                "codex_auth_missing_refresh_token",
+                "codex_auth_invalid_shape",
+            }
+        ):
             imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
@@ -4844,29 +4853,28 @@ def resolve_codex_runtime_credentials(
             # redeemed, plan upgraded, window reset upstream).  The persisted
             # ``last_error_reset_at`` can be days in the future while the
             # account is already usable again — see issue #43747.
-            stale_token = str(pool_rate_limit.get("access_token") or "").strip()
-            if stale_token and _probe_codex_quota_restored(
-                stale_token,
-                base_url=pool_rate_limit.get("base_url"),
-            ):
-                logger.info(
-                    "Codex quota restored upstream — clearing stale pool cooldown(s)."
-                )
-                clear_codex_pool_quota_cooldowns()
-                pool_token = _pool_codex_access_token()
-                if pool_token:
-                    base_url = (
-                        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
-                        or DEFAULT_CODEX_BASE_URL
+            # Read-only callers (GPT-Live /status, doctor) must not probe or
+            # rewrite auth.json — report the stored cooldown as-is (#68004).
+            if not read_only:
+                if _probe_codex_pool_entry_quota_restored(pool_rate_limit):
+                    logger.info(
+                        "Codex quota restored upstream — clearing stale pool cooldown(s)."
                     )
-                    return {
-                        "provider": "openai-codex",
-                        "base_url": base_url,
-                        "api_key": pool_token,
-                        "source": "credential_pool",
-                        "last_refresh": None,
-                        "auth_mode": "chatgpt",
-                    }
+                    clear_codex_pool_quota_cooldowns()
+                    pool_token = _pool_codex_access_token()
+                    if pool_token:
+                        base_url = (
+                            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                            or DEFAULT_CODEX_BASE_URL
+                        )
+                        return {
+                            "provider": "openai-codex",
+                            "base_url": base_url,
+                            "api_key": pool_token,
+                            "source": "credential_pool",
+                            "last_refresh": None,
+                            "auth_mode": "chatgpt",
+                        }
             reset_at = pool_rate_limit.get("reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
                 remaining = int(reset_at - time.time())
@@ -4898,8 +4906,8 @@ def resolve_codex_runtime_credentials(
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
 
-    should_refresh = bool(force_refresh)
-    if (not should_refresh) and refresh_if_expiring:
+    should_refresh = False if read_only else bool(force_refresh)
+    if (not should_refresh) and refresh_if_expiring and not read_only:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
@@ -4908,8 +4916,8 @@ def resolve_codex_runtime_credentials(
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
 
-            should_refresh = bool(force_refresh)
-            if (not should_refresh) and refresh_if_expiring:
+            should_refresh = False if read_only else bool(force_refresh)
+            if (not should_refresh) and refresh_if_expiring and not read_only:
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
             if should_refresh:
@@ -4956,6 +4964,10 @@ def _is_codex_rate_limit_shaped(
 CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300  # 5 minutes
 _codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
 _codex_quota_probe_lock = threading.Lock()
+
+
+def _codex_quota_probe_cache_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
 
 def _codex_usage_probe_url(base_url: Optional[str]) -> str:
@@ -5014,7 +5026,7 @@ def _probe_codex_quota_restored(
     # keeps hermetic test fixtures with dummy tokens offline).
     if not _decode_jwt_claims(token):
         return None
-    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    cache_key = _codex_quota_probe_cache_key(token)
     now = time.monotonic()
     with _codex_quota_probe_lock:
         cached = _codex_quota_probe_cache.get(cache_key)
@@ -5062,6 +5074,58 @@ def _probe_codex_quota_restored(
     with _codex_quota_probe_lock:
         _codex_quota_probe_cache[cache_key] = (now, result)
     return result
+
+
+def _refresh_expired_codex_probe_token(
+    access_token: Any,
+    refresh_token: Any,
+    *,
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """Refresh an expired access token before a quota probe (#89415)."""
+    token = str(access_token or "").strip()
+    refresh = str(refresh_token or "").strip()
+    if not token or not refresh or not _codex_access_token_is_expiring(token, 0):
+        return None
+    cache_key = _codex_quota_probe_cache_key(token)
+    now = time.monotonic()
+    with _codex_quota_probe_lock:
+        cached = _codex_quota_probe_cache.get(cache_key)
+        if cached is not None and (now - cached[0]) < min_interval_seconds:
+            return None
+    try:
+        return refresh_codex_oauth_pure(token, refresh)
+    except Exception:
+        logger.debug("Codex pre-probe token refresh failed", exc_info=True)
+        with _codex_quota_probe_lock:
+            _codex_quota_probe_cache[cache_key] = (now, None)
+        return None
+
+
+def _probe_codex_pool_entry_quota_restored(entry: Dict[str, Any]) -> Optional[bool]:
+    """Run ``_probe_codex_quota_restored`` for a pool row, refreshing an expired token first."""
+    token = str(entry.get("access_token") or "").strip()
+    fresh = _refresh_expired_codex_probe_token(token, entry.get("refresh_token"))
+    if fresh:
+        token = str(fresh.get("access_token") or "").strip()
+        try:
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+                pool = auth_store.get("credential_pool")
+                entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+                if isinstance(entries, list):
+                    for disk_entry in entries:
+                        if not isinstance(disk_entry, dict):
+                            continue
+                        if disk_entry.get("id") == entry.get("id"):
+                            disk_entry.update(fresh)
+                            _save_auth_store(auth_store)
+                            break
+        except Exception:
+            logger.debug("Failed to persist refreshed Codex pool tokens", exc_info=True)
+    if not token:
+        return None
+    return _probe_codex_quota_restored(token, base_url=entry.get("base_url"))
 
 
 def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
@@ -5177,12 +5241,14 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
             if reset_at is not None and reset_at <= now:
                 continue
             return {
+                "id": entry.get("id"),
                 "label": entry.get("label"),
                 "last_refresh": entry.get("last_refresh"),
                 "reset_at": reset_at,
                 "reason": entry.get("last_error_reason"),
                 "message": entry.get("last_error_message"),
                 "access_token": token.strip(),
+                "refresh_token": entry.get("refresh_token"),
                 "base_url": entry.get("base_url"),
             }
     except Exception:
@@ -7684,7 +7750,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
         from agent.credential_pool import load_pool
         pool = load_pool("openai-codex")
         if pool and pool.has_credentials():
-            entry = pool.select()
+            entry = pool.peek()
             if entry is not None:
                 api_key = (
                     getattr(entry, "runtime_api_key", None)
@@ -7718,9 +7784,9 @@ def get_codex_auth_status() -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Fall back to legacy provider state
+    # Fall back to legacy provider state (read-only — never refresh or adopt CLI tokens).
     try:
-        creds = resolve_codex_runtime_credentials()
+        creds = resolve_codex_runtime_credentials(read_only=True)
         return {
             "logged_in": True,
             "auth_store": str(_auth_file_path()),
@@ -7743,7 +7809,7 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
 
         pool = load_pool("xai-oauth")
         if pool and pool.has_credentials():
-            entry = pool.select()
+            entry = pool.peek()
             if entry is not None:
                 api_key = (
                     getattr(entry, "runtime_api_key", None)
@@ -7765,7 +7831,7 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
         pass
 
     try:
-        creds = resolve_xai_oauth_runtime_credentials()
+        creds = resolve_xai_oauth_runtime_credentials(refresh_if_expiring=False)
         return {
             "logged_in": True,
             "auth_store": str(_auth_file_path()),

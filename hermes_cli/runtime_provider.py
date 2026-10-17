@@ -517,7 +517,16 @@ def _resolve_runtime_from_pool_entry(
     api_mode = "chat_completions"
     if provider == "openai-codex":
         api_mode = "codex_responses"
-        base_url = base_url or DEFAULT_CODEX_BASE_URL
+        env_override = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+        if env_override:
+            base_url = env_override
+        else:
+            base_url = base_url or DEFAULT_CODEX_BASE_URL
+            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            if cfg_provider == "openai-codex":
+                cfg_base = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+                if cfg_base and base_url in ("", DEFAULT_CODEX_BASE_URL):
+                    base_url = cfg_base
     elif provider == "xai-oauth":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_XAI_OAUTH_BASE_URL

@@ -28,7 +28,9 @@ import re
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,12 @@ LIVE_HISTORY_PART_TYPES = frozenset({"text", "input_text"})
 DEFAULT_LIVE_MODEL = "gpt-live-1"
 DEFAULT_LIVE_VOICE = "marin"
 DEFAULT_LIVE_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_SUBSCRIPTION_MODEL = "gpt-live-1-codex"
+DEFAULT_SUBSCRIPTION_VOICE = "cove"
+CODEX_LIVE_URL = (
+    "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
+)
+SUBSCRIPTION_REALTIME_HANGUP_BASE = "https://api.openai.com/v1/realtime/calls"
 # Vendor session ids are opaque tokens (e.g. ``live_u2_…``). Restrict to one URL path
 # segment so an authenticated hangup cannot be redirected by ``/``, ``?``, ``#``, or
 # encoded separators in the request body.
@@ -166,6 +174,17 @@ class VoiceLiveMissingKeyError(ValueError):
     """No OpenAI key resolves for this profile. The client falls back to chained mode."""
 
 
+class VoiceLiveAuthMismatchError(VoiceLiveError):
+    """``expected_auth`` on the session request does not match ``voice.gpt_live.auth``."""
+
+    def __init__(self, *, expected_auth: str, configured_auth: str) -> None:
+        self.expected_auth = expected_auth
+        self.configured_auth = configured_auth
+        super().__init__(
+            "GPT-Live auth mode changed after preflight; no session was started"
+        )
+
+
 def ensure_gpt_live_mode(voice: Optional[dict[str, Any]] = None) -> str:
     """Refuse unless the profile actually selected ``gpt-live``.
 
@@ -180,6 +199,82 @@ def ensure_gpt_live_mode(voice: Optional[dict[str, Any]] = None) -> str:
             "to use GPT-Live"
         )
     return mode
+
+
+def _live_auth(live: dict[str, Any]) -> str:
+    auth = str(live.get("auth", "api")).strip().lower()
+    if auth in {"api", "api_key"}:
+        return "api"
+    if auth == "subscription":
+        return "subscription"
+    raise ValueError("voice.gpt_live.auth must be api or subscription")
+
+
+def _live_model_voice(live: dict[str, Any], auth: str) -> tuple[str, str]:
+    if auth == "subscription":
+        return (
+            str(live.get("subscription_model") or DEFAULT_SUBSCRIPTION_MODEL),
+            str(live.get("subscription_voice") or DEFAULT_SUBSCRIPTION_VOICE),
+        )
+    return str(live.get("model") or DEFAULT_LIVE_MODEL), str(live.get("voice") or DEFAULT_LIVE_VOICE)
+
+
+def _subscription_credentials(
+    *, refresh_if_expiring: bool = True, read_only: bool = False,
+) -> tuple[str, str]:
+    from hermes_cli.auth import (
+        CODEX_RATE_LIMITED_CODE,
+        AuthError,
+        _decode_jwt_claims,
+        resolve_codex_runtime_credentials,
+    )
+
+    try:
+        credentials = resolve_codex_runtime_credentials(
+            refresh_if_expiring=refresh_if_expiring,
+            read_only=read_only,
+        )
+    except AuthError as exc:
+        if read_only and getattr(exc, "code", None) == CODEX_RATE_LIMITED_CODE:
+            raise ValueError(str(exc)) from None
+        raise ValueError(
+            "GPT-Live subscription needs a working Codex sign-in on the Hermes host. "
+            "Run `hermes auth` and choose OpenAI Codex."
+        ) from None
+    token = str(credentials.get("api_key") or "").strip()
+    if read_only:
+        from hermes_cli.auth import (
+            CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+            _codex_access_token_is_expiring,
+        )
+
+        if not token:
+            raise ValueError(
+                "GPT-Live subscription needs a working Codex sign-in on the Hermes host. "
+                "Run `hermes auth` and choose OpenAI Codex."
+            )
+        if _codex_access_token_is_expiring(token, 0):
+            raise ValueError(
+                "GPT-Live subscription: Codex access token is expired. "
+                "Run `hermes auth` to sign in again."
+            )
+        if _codex_access_token_is_expiring(token, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS):
+            raise ValueError(
+                "GPT-Live subscription: Codex access token is expiring soon. "
+                "Run `hermes auth` to refresh, or retry after runtime refresh."
+            )
+    claims = _decode_jwt_claims(token).get("https://api.openai.com/auth", {})
+    account = claims.get("chatgpt_account_id") if isinstance(claims, dict) else None
+    if (
+        not token
+        or not isinstance(account, str)
+        or not account.strip()
+        or any(c in token + account for c in "\r\n")
+    ):
+        raise ValueError(
+            "GPT-Live subscription needs Codex OAuth with an account identity"
+        )
+    return token, account.strip()
 
 
 def _resolve_credentials(live: dict[str, Any]) -> tuple[str, str]:
@@ -200,18 +295,30 @@ def live_instructions(live: Optional[dict[str, Any]] = None) -> str:
 
 
 def resolve_gpt_live_status() -> dict[str, Any]:
-    """Non-secret readiness verdict for the client: which mode is selected and whether GPT-Live
-    can start (a key resolves). Never returns the key."""
+    """Non-secret readiness verdict for the client. Never returns credentials."""
     voice = _voice_section()
-    mode = voice_chat_mode(voice)
     live = _live_section(voice)
-    api_key, _base = _resolve_credentials(live)
+    reason = None
+    try:
+        auth = _live_auth(live)
+        if auth == "subscription":
+            _subscription_credentials(refresh_if_expiring=False, read_only=True)
+        elif not _resolve_credentials(live)[0]:
+            reason = "no OpenAI API key (set OPENAI_API_KEY or voice.gpt_live.api_key)"
+    except ValueError as exc:
+        reason = str(exc)
+        raw = str(live.get("auth", "api")).strip().lower()
+        auth = "subscription" if raw == "subscription" else "api"
+    else:
+        auth = _live_auth(live)
+    model, selected_voice = _live_model_voice(live, auth)
     return {
-        "mode": mode,
-        "available": bool(api_key),
-        "reason": None if api_key else "no OpenAI API key (set OPENAI_API_KEY or voice.gpt_live.api_key)",
-        "model": str(live.get("model") or DEFAULT_LIVE_MODEL),
-        "voice": str(live.get("voice") or DEFAULT_LIVE_VOICE),
+        "mode": voice_chat_mode(voice),
+        "auth": auth,
+        "available": reason is None,
+        "reason": reason,
+        "model": model,
+        "voice": selected_voice,
     }
 
 
@@ -287,19 +394,25 @@ def normalize_session_history(history: Optional[list]) -> list[dict[str, Any]]:
     return pruned
 
 
-def build_session_config(history: Optional[list] = None) -> dict[str, Any]:
-    """The ``session`` object for ``POST /v1/live/sessions`` (client delegation, WebRTC — the
-    transport negotiates the audio format, so none is set)."""
-    live = _live_section()
+def build_session_config(
+    history: Optional[list] = None,
+    *,
+    live: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """The ``session`` object for Live session creation (API or subscription)."""
+    live = _live_section() if live is None else live
+    auth = _live_auth(live)
+    model, selected_voice = _live_model_voice(live, auth)
     config: dict[str, Any] = {
-        "model": str(live.get("model") or DEFAULT_LIVE_MODEL),
+        "model": model,
         "instructions": live_instructions(live),
-        "audio": {"output": {"voice": str(live.get("voice") or DEFAULT_LIVE_VOICE)}},
+        "audio": {"output": {"voice": selected_voice}},
         "delegation": {"type": "client"},
     }
     normalized = normalize_session_history(history)
     if normalized:
-        config["input"] = normalized
+        history_key = "initial_items" if auth == "subscription" else "input"
+        config[history_key] = normalized
     return config
 
 
@@ -343,7 +456,55 @@ def _vendor_error_category(status: int) -> str:
     return "rejected"
 
 
-def create_webrtc_session(sdp_offer: str, history: Optional[list] = None) -> dict[str, Any]:
+def _create_subscription_session(sdp_offer: str, config: dict[str, Any]) -> dict[str, Any]:
+    token, account = _subscription_credentials()
+    try:
+        with httpx.Client(timeout=30, follow_redirects=False) as client:
+            response = client.post(
+                CODEX_LIVE_URL,
+                json={"sdp": sdp_offer, "session": config},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "ChatGPT-Account-Id": account,
+                    "OpenAI-Alpha": "quicksilver=v2",
+                },
+            )
+    except httpx.RequestError:
+        raise VoiceLiveUpstreamError("GPT-Live subscription connection failed") from None
+    if not response.is_success:
+        category = _vendor_error_category(int(response.status_code))
+        logger.warning(
+            "GPT-Live subscription session creation rejected: status=%s category=%s",
+            response.status_code,
+            category,
+        )
+        raise VoiceLiveUpstreamError(
+            f"GPT-Live subscription session creation rejected (status {response.status_code}, {category})",
+            upstream_status=int(response.status_code),
+        )
+    sdp = response.text
+    call_id = urlparse(response.headers.get("Location", "")).path.rstrip("/").rsplit("/", 1)[-1]
+    call_id_pattern = (
+        r"rtc_[A-Za-z0-9_-]+|"
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    )
+    if not sdp.lstrip().startswith("v=0") or not re.fullmatch(call_id_pattern, call_id or ""):
+        raise VoiceLiveProtocolError("GPT-Live subscription returned an invalid WebRTC answer")
+    payload = {
+        "auth": "subscription",
+        "session": {"id": call_id},
+        "transport": {"type": "webrtc", "sdp": sdp},
+    }
+    return _validate_session_answer(payload)
+
+
+def create_webrtc_session(
+    sdp_offer: str,
+    history: Optional[list] = None,
+    *,
+    expected_auth: Optional[str] = None,
+) -> dict[str, Any]:
     """Exchange the renderer's SDP offer for the Live session answer.
 
     Raises ``VoiceLiveMissingKeyError`` (no key for this profile),
@@ -356,13 +517,26 @@ def create_webrtc_session(sdp_offer: str, history: Optional[list] = None) -> dic
     # chained install must not start — or bill — a live session even when a key resolves.
     ensure_gpt_live_mode()
     live = _live_section()
+    auth = _live_auth(live)
+    if expected_auth is not None:
+        if expected_auth not in {"api", "subscription"}:
+            raise VoiceLiveHistoryError("Invalid expected GPT-Live auth mode")
+        if auth != expected_auth:
+            raise VoiceLiveAuthMismatchError(
+                expected_auth=expected_auth,
+                configured_auth=auth,
+            )
+    config = build_session_config(history, live=live)
+    if auth == "subscription":
+        result = _create_subscription_session(sdp_offer, config)
+        return result
     api_key, base_url = _resolve_credentials(live)
     if not api_key:
         raise VoiceLiveMissingKeyError(
             "GPT-Live needs an OpenAI API key (OPENAI_API_KEY or voice.gpt_live.api_key)"
         )
     body = json.dumps({
-        "session": build_session_config(history),
+        "session": config,
         "transport": {"type": "webrtc", "sdp": sdp_offer},
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -379,7 +553,9 @@ def create_webrtc_session(sdp_offer: str, history: Optional[list] = None) -> dic
         raise VoiceLiveUpstreamError(
             f"GPT-Live session creation rejected (status {exc.code}, {category})"
         ) from None
-    return _validate_session_answer(payload)
+    validated = _validate_session_answer(payload)
+    validated["auth"] = "api"
+    return validated
 
 
 def _normalize_vendor_session_id(session_id: str) -> str:
@@ -400,6 +576,12 @@ def _vendor_session_hangup_url(base_url: str, session_id: str) -> str:
     return f"{base_url.rstrip('/')}/live/sessions/{segment}/hangup"
 
 
+def _subscription_realtime_hangup_url(session_id: str) -> str:
+    vendor_id = _normalize_vendor_session_id(session_id)
+    segment = quote(vendor_id, safe="")
+    return f"{SUBSCRIPTION_REALTIME_HANGUP_BASE}/{segment}/hangup"
+
+
 def close_live_session(session_id: str) -> dict[str, Any]:
     """End a vendor Live session server-side.
 
@@ -414,18 +596,31 @@ def close_live_session(session_id: str) -> dict[str, Any]:
     ensure_gpt_live_mode()
 
     live = _live_section()
-    api_key, base_url = _resolve_credentials(live)
-    if not api_key:
-        raise VoiceLiveMissingKeyError(
-            "GPT-Live needs an OpenAI API key (OPENAI_API_KEY or voice.gpt_live.api_key)"
+    auth = _live_auth(live)
+    if auth == "subscription":
+        token, account = _subscription_credentials()
+        req = urllib.request.Request(
+            _subscription_realtime_hangup_url(session_id),
+            data=b"",
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "ChatGPT-Account-Id": account,
+                "Accept": "*/*",
+            },
         )
-
-    req = urllib.request.Request(
-        _vendor_session_hangup_url(base_url, session_id),
-        data=b"",
-        method="POST",
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "*/*"},
-    )
+    else:
+        api_key, base_url = _resolve_credentials(live)
+        if not api_key:
+            raise VoiceLiveMissingKeyError(
+                "GPT-Live needs an OpenAI API key (OPENAI_API_KEY or voice.gpt_live.api_key)"
+            )
+        req = urllib.request.Request(
+            _vendor_session_hangup_url(base_url, session_id),
+            data=b"",
+            method="POST",
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "*/*"},
+        )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             status = int(getattr(resp, "status", 200) or 200)

@@ -925,6 +925,62 @@ def _billing_failure_result(
     }
 
 
+def _try_codex_soft_failure_pool_recovery(agent, response, retry) -> bool:
+    """Rotate the credential pool on codex_responses failed/cancelled soft failures.
+
+    Returns True when pool recovery succeeded and the conversation loop should retry.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses" or response is None:
+        return False
+    _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
+    if _codex_resp_status not in {"failed", "cancelled"}:
+        return False
+    _err_obj = getattr(response, "error", None)
+    if isinstance(_err_obj, dict):
+        _soft_fields = {k: v for k, v in _err_obj.items() if isinstance(v, str) and v.strip()}
+    elif _err_obj is not None and (hasattr(_err_obj, "code") or hasattr(_err_obj, "message")):
+        _soft_fields = {
+            "code": getattr(_err_obj, "code", None),
+            "message": getattr(_err_obj, "message", None),
+        }
+    else:
+        _soft_fields = {"message": str(_err_obj)} if _err_obj else {}
+    _soft_fields = {k: v for k, v in _soft_fields.items() if isinstance(v, str) and v.strip()}
+    if not _soft_fields:
+        return False
+
+    class _CodexSoftFailure(Exception):
+        def __init__(self, error: dict) -> None:
+            super().__init__(error.get("message") or "")
+            self.body = {"error": error}
+
+    _soft_exc = _CodexSoftFailure(_soft_fields)
+    _soft = classify_api_error(
+        _soft_exc,
+        provider=getattr(agent, "provider", "") or "",
+        model=getattr(agent, "model", "") or "",
+    )
+    _soft_ctx = agent._extract_api_error_context(_soft_exc)
+    if _soft.reason in (
+        FailoverReason.rate_limit,
+        FailoverReason.billing,
+    ) or _soft.is_auth:
+        _recovered, retry.has_retried_429 = agent._recover_with_credential_pool(
+            status_code=None,
+            has_retried_429=retry.has_retried_429,
+            classified_reason=_soft.reason,
+            error_context=_soft_ctx,
+            billing_unverified=_soft.billing_unverified,
+        )
+        if _recovered:
+            agent._buffer_status(
+                f"🔄 Codex soft failure ({_soft.reason.value}) — "
+                "switched pool credential, retrying..."
+            )
+            return True
+    return False
+
+
 def _print_billing_or_entitlement_guidance(
     agent,
     *,
@@ -3810,6 +3866,9 @@ def run_conversation(
                     
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
+                    if _try_codex_soft_failure_pool_recovery(agent, response, _retry):
+                        continue
+
                     retry_count += 1
                     
                     # Eager fallback: empty/malformed responses are a common
@@ -5286,6 +5345,36 @@ def run_conversation(
                             force=True,
                         )
                         continue
+
+                if (
+                    agent.api_mode == "codex_responses"
+                    and status_code == 401
+                    and not _retry.invalid_encrypted_content_retry_attempted
+                    and bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
+                ):
+                    reason = (error_context or {}).get("reason")
+                    if isinstance(reason, str) and reason.strip().lower() == "token_expired":
+                        if any(
+                            isinstance(_m, dict)
+                            and _m.get("role") == "assistant"
+                            and isinstance(_m.get("codex_reasoning_items"), list)
+                            and _m.get("codex_reasoning_items")
+                            for _m in messages
+                        ):
+                            _retry.invalid_encrypted_content_retry_attempted = True
+                            replay_stats = agent._disable_codex_reasoning_replay(messages)
+                            agent._vprint(
+                                f"{agent.log_prefix}⚠️  Stale Codex reasoning rejected (token_expired) — "
+                                f"stripped {replay_stats['items']} item(s), retrying...",
+                                force=True,
+                            )
+                            logger.warning(
+                                "%sCodex token_expired reasoning recovery: stripped %d items from %d messages",
+                                agent.log_prefix,
+                                replay_stats["items"],
+                                replay_stats["messages"],
+                            )
+                            continue
 
                 recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
                     status_code=status_code,

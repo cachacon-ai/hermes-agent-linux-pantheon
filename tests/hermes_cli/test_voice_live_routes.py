@@ -141,7 +141,9 @@ class TestStatus:
         raw = auth_client.get("/api/audio/voice-live/status").text
 
         assert FAKE_KEY not in raw
-        assert "available" not in raw  # not an entitlement check
+        body = json.loads(raw)
+        assert body.get("auth") == "api"
+        assert "reason" in body
 
     def test_profile_scope_reaches_the_worker_thread(self, auth_client, tmp_path):
         """``asyncio.to_thread`` copies the request context; ``run_in_executor`` does not.
@@ -200,6 +202,24 @@ class TestSessionExchange:
 
         assert resp.status_code == 503
         assert "API key" in resp.json()["detail"]
+
+    def test_expected_auth_mismatch_returns_structured_409(self, auth_client, monkeypatch, no_vendor):
+        from tools import voice_live
+
+        _install_voice(monkeypatch, voice_chat_mode="gpt-live")
+        monkeypatch.setattr(voice_live, "_live_auth", lambda _live: "subscription")
+
+        resp = auth_client.post(
+            "/api/audio/voice-live/session",
+            json={"sdp": self.OFFER, "expected_auth": "api"},
+        )
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "expected_auth_mismatch"
+        assert detail["expected_auth"] == "api"
+        assert detail["configured_auth"] == "subscription"
+        assert "preflight" in detail["message"]
 
     def test_successful_exchange_returns_the_vendor_answer(self, auth_client, monkeypatch):
         _install_voice(monkeypatch, voice_chat_mode="gpt-live")
