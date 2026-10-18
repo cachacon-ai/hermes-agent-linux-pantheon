@@ -1055,6 +1055,38 @@ class TestLaunchctlGatewayLifecycle:
         assert dangerous is True, cmd
         assert "launchd" in desc.lower()
 
+    def test_verb_and_label_deep_in_multiline_command_detected(self):
+        """The pattern is anchored at \\A for speed; both lookaheads span
+        newlines ([\\s\\S]*), so a verb and label far into a multi-line
+        command, in either order, must still match."""
+        filler = "\n".join(f"echo step-{i}" for i in range(200))
+        for cmd in (
+            f"{filler}\nlaunchctl bootout gui/501/ai.hermes.gateway",
+            f"label=ai.hermes.gateway\n{filler}\nlaunchctl kickstart -k \"gui/501/$label\"",
+        ):
+            dangerous, _, desc = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd[-80:]
+            assert "launchd" in desc.lower()
+
+    def test_launchd_pattern_is_linear_on_long_benign_commands(self):
+        """Unanchored, the two whole-remainder lookaheads re-ran from every
+        start position: O(n^2), ~2s for 1,000 segments and ~70s for the
+        4,000-segment benchmark in test_execution_flag_detection.py, which
+        pushed that file past the per-file CI timeout. Anchored, one search
+        is a single linear scan. The bound is loose on purpose (CI stalls)."""
+        import time
+        from tools.approval import DANGEROUS_PATTERNS_COMPILED
+
+        (pattern_re,) = [
+            p for p, d in DANGEROUS_PATTERNS_COMPILED
+            if d == "stop/restart hermes launchd service (kills running agents)"
+        ]
+        command = ";".join(f"printf segment-{i}" for i in range(4_000))
+        started = time.perf_counter()
+        assert pattern_re.search(command) is None
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.0, f"launchd pattern took {elapsed:.3f}s on 4k segments"
+
 
 class TestGitDestructiveOps:
     """git reset --hard, push --force, clean -f, branch -D can destroy
