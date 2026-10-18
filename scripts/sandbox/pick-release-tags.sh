@@ -14,22 +14,33 @@
 #
 # Usage:
 #   scripts/sandbox/pick-release-tags.sh [--count N] [--repo DIR]
+#                                        [--pattern ERE] [--merged REF]
 #
 #   --count   how many tags to emit (default 5, minimum 1). Fewer tags than
 #             requested emits all of them.
 #   --repo    repository to read tags from (default: this checkout).
+#   --pattern extended regex a tag name must match in full to count as a
+#             release (default: upstream's vYYYY.M.D[.N] scheme). A fork whose
+#             own versions are tagged differently passes its scheme here, e.g.
+#             '^known-good-linux-pantheon-[0-9]{4}-[0-9]{2}-[0-9]{2}$'.
+#   --merged  only consider tags whose commit is an ancestor of REF (e.g.
+#             HEAD), so every picked tag is something REF can update FROM.
+#             Needs history, not just tags (fetch-depth: 0).
 #
 # Reads tags from the local checkout, so it needs one fetched with tags
 # (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). A shallow
 # checkout has no tags and this exits non-zero rather than silently emitting an
 # empty matrix.
 #
-# Only vYYYY.M.D[.N] release tags are considered; the repo also carries
-# backup/* and one-off tags that are not releases.
+# By default only vYYYY.M.D[.N] release tags are considered; the repo also
+# carries backup/* and one-off tags that are not releases. --pattern swaps in
+# another naming scheme (forks), and is matched the same strict way.
 
 set -euo pipefail
 
 COUNT=5
+PATTERN='^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$'
+MERGED=""
 # Default to the repository containing this script, resolved through its real
 # path so a symlinked or copied script still reads the checkout it lives in
 # rather than whatever repo the caller happens to be standing in.
@@ -42,7 +53,13 @@ while [ "$#" -gt 0 ]; do
     --repo)
       [ "$#" -ge 2 ] || { echo 'error: --repo needs a value' >&2; exit 1; }
       REPO="$2"; shift 2 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    --pattern)
+      [ "$#" -ge 2 ] || { echo 'error: --pattern needs a value' >&2; exit 1; }
+      PATTERN="$2"; shift 2 ;;
+    --merged)
+      [ "$#" -ge 2 ] || { echo 'error: --merged needs a value' >&2; exit 1; }
+      MERGED="$2"; shift 2 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -50,6 +67,7 @@ case "$COUNT" in
   ''|*[!0-9]*) echo "error: --count must be a positive integer: $COUNT" >&2; exit 1 ;;
 esac
 [ "$COUNT" -ge 1 ] || { echo 'error: --count must be at least 1' >&2; exit 1; }
+[ -n "$PATTERN" ] || { echo 'error: --pattern must not be empty' >&2; exit 1; }
 
 # Resolve the script's own location through symlinks, then ask git which
 # worktree that path belongs to. Deriving the repo from the script rather than
@@ -66,15 +84,23 @@ fi
 
 # sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain
 # lexicographic sort gets wrong.
+#
+# `|| true` after grep: no match is "no release tags", reported below with a
+# useful message, not a bare pipefail exit.
+merged_args=()
+if [ -n "$MERGED" ]; then
+  git -C "$REPO" rev-parse --verify -q "$MERGED^{commit}" >/dev/null \
+    || { echo "error: --merged ref does not resolve: $MERGED" >&2; exit 1; }
+  merged_args=(--merged "$MERGED")
+fi
 mapfile -t tags < <(
-  git -C "$REPO" tag --list 'v*' \
-    | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+  { git -C "$REPO" tag --list "${merged_args[@]}" | grep -E -- "$PATTERN" || true; } \
     | sort -V
 )
 
 total="${#tags[@]}"
 if [ "$total" -eq 0 ]; then
-  echo "error: no release tags found in $REPO" >&2
+  echo "error: no release tags matching $PATTERN found in $REPO${MERGED:+ (merged into $MERGED)}" >&2
   echo '       A shallow clone has no tags: fetch with tags (actions/checkout' >&2
   echo '       with fetch-depth: 0, or fetch-tags: true).' >&2
   exit 1

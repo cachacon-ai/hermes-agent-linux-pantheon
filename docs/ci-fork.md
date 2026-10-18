@@ -16,6 +16,7 @@ Upstream Hermes CI assumes Nous Research org-hosted **larger runners** (`ubuntu-
 | `CI_PYTHON_MODE` | PRs: `pantheon`; push: `full` (see below) | `pantheon` | `full` (or unset — upstream runs the whole suite) |
 | `CI_PYTHON_TEST_PATHS` | ignored unless `CI_PYTHON_MODE=paths` | Newline or comma-separated roots/files for `scripts/run_tests.sh` | — |
 | `CI_PYTHON_EXTRA_ARGS` | ignored | Optional extra args forwarded to `run_tests.sh` (e.g. `-k pantheon`) | — |
+| `E2E_RELEASE_TAG_PATTERN` | `^known-good-linux-pantheon-[0-9]{4}-[0-9]{2}-[0-9]{2}$` | Leave unset; set only if the fork's version-tag scheme changes | — (upstream uses `vYYYY.M.D` tags) |
 | `CI_PYTHON_FULL_CRON` | `0 6 * * *` in workflow | Document only — edit `.github/workflows/tests.yml` `schedule` to match | — |
 
 Set variables under **Settings → Secrets and variables → Actions → Variables**.
@@ -58,3 +59,17 @@ If a fork run times out, raise `CI_TEST_TIMEOUT_MINUTES` (for example `180`) or 
 ## Primary-repository automation
 
 Jobs gated by `CI_PRIMARY_REPOSITORY` include Docker image build/publish, GitHub Pages docs deploy, and scheduled skills-index maintenance. Leave the variable **empty** on forks that should not push images or deploy Pages. Set it to the full repository name (e.g. `cachacon-ai/hermes-agent-linux-pantheon`) only when that repo owns the credentials and environments those jobs need.
+
+## Install & Update E2E (fork-native)
+
+`.github/workflows/install-e2e.yml` proves a real `curl | install.sh` install of one of the **fork's own version tags** can update to the tested commit and roll back again. Upstream picks `vYYYY.M.D` release tags, which this fork does not carry, so the fork picks tags matching `E2E_RELEASE_TAG_PATTERN` (default `known-good-linux-pantheon-YYYY-MM-DD`) that the tested commit descends from, and the sandbox fetches them from this repository instead of `NousResearch/hermes-agent`.
+
+Each leg (route `update` = `hermes update`, route `installer` = re-running the installer), all inside the bubblewrap sandbox on the runner:
+
+1. Installs the tag; checks `hermes --version`.
+2. Points the checkout's `origin` at this fork (as a fork checkout is configured), then starts `hermes gateway run` + `hermes serve` and requires `/api/health` `ok: true` and `/api/status` `gateway_running: true`.
+3. Creates the local snapshot branch `backup/ci-e2e-pre-<target12>-<YYYYMMDD>` at the installed commit and asserts it points there and never reaches the remote.
+4. Applies the route; requires HEAD = tested commit, origin unchanged, snapshot intact, the fork's modules (`tools.pantheon_tool`, `agent.pantheon_artifacts`, `tools.voice_live`) importable, the fork's dashboard route (`/api/audio/voice-live/status`) mounted, and the services healthy.
+5. Rolls back to the snapshot (`git reset --hard` + `uv pip install -e '.[all]'` into the same venv) and requires HEAD = tag, `hermes --version`, and healthy services again.
+
+Nothing is deployed, no production host or secret is used, and no ref is pushed. To add a new upgrade baseline, push a tag following the scheme (e.g. `known-good-linux-pantheon-2026-11-01`) on a commit in `main`'s history; the tag push also triggers the workflow.
