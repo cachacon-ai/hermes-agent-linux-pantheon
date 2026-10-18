@@ -33,8 +33,10 @@
 #                   tag like v2026.7.7, or a SHA reachable from main).
 #                   Default: refs/heads/main.
 #
-# Optional phases (all off by default, so upstream's invocation is unchanged;
-# the fork's workflow turns them on):
+#   --no-fork       ignore tests/install/fork-e2e.conf (upstream behaviour).
+#
+# Optional phases. Off in upstream; tests/install/fork-e2e.conf turns them all
+# on by default in this fork (and points the sandbox at the fork's repo):
 #   --origin-url    after the first install, point the checkout's `origin` at
 #                   URL (e.g. the fork's git@github.com:owner/repo.git), the
 #                   way a fork checkout is configured, so the update route
@@ -74,6 +76,24 @@ BACKUP_ENV=""
 SERVICES=false
 FORK_SURFACE=false
 ROLLBACK=false
+# Fork defaults (tests/install/fork-e2e.conf) apply unless --no-fork is given.
+# Resolved before parsing so explicit flags still win.
+FORK_CONF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fork-e2e.conf"
+USE_FORK=false
+[ -f "$FORK_CONF" ] && USE_FORK=true
+for arg in "$@"; do
+  [ "$arg" = --no-fork ] && USE_FORK=false
+done
+if [ "$USE_FORK" = true ]; then
+  # shellcheck source=fork-e2e.conf
+  . "$FORK_CONF"
+  export HERMES_DEV_SANDBOX_UPSTREAM="${HERMES_DEV_SANDBOX_UPSTREAM:-$FORK_UPSTREAM_URL}"
+  ORIGIN_URL="$FORK_ORIGIN_URL"
+  BACKUP_ENV="$FORK_BACKUP_ENV"
+  SERVICES="$FORK_SERVICES"
+  FORK_SURFACE="$FORK_SURFACE"
+  ROLLBACK="$FORK_ROLLBACK"
+fi
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --route)
@@ -92,6 +112,7 @@ while [ "$#" -gt 0 ]; do
     --services) SERVICES=true; shift ;;
     --fork-surface) FORK_SURFACE=true; shift ;;
     --rollback) ROLLBACK=true; shift ;;
+    --no-fork) shift ;;   # handled above
     -h|--help) sed -n '2,70p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac

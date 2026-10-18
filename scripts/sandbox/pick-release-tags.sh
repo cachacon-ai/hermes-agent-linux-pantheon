@@ -20,9 +20,9 @@
 #             requested emits all of them.
 #   --repo    repository to read tags from (default: this checkout).
 #   --pattern extended regex a tag name must match in full to count as a
-#             release (default: upstream's vYYYY.M.D[.N] scheme). A fork whose
-#             own versions are tagged differently passes its scheme here, e.g.
-#             '^known-good-linux-pantheon-[0-9]{4}-[0-9]{2}-[0-9]{2}$'.
+#             release (default here: the fork's own scheme,
+#             '^known-good-linux-pantheon-[0-9]{4}-[0-9]{2}-[0-9]{2}$', or
+#             $HERMES_E2E_TAG_PATTERN; upstream's is vYYYY.M.D[.N]).
 #   --merged  only consider tags whose commit is an ancestor of REF (e.g.
 #             HEAD), so every picked tag is something REF can update FROM.
 #             Needs history, not just tags (fetch-depth: 0).
@@ -32,14 +32,19 @@
 # checkout has no tags and this exits non-zero rather than silently emitting an
 # empty matrix.
 #
-# By default only vYYYY.M.D[.N] release tags are considered; the repo also
-# carries backup/* and one-off tags that are not releases. --pattern swaps in
-# another naming scheme (forks), and is matched the same strict way.
+# Only tags matching the pattern in full are considered (by default the fork's
+# known-good-linux-pantheon-YYYY-MM-DD scheme); the repo also carries backup/*
+# and one-off tags that are not releases.
 
 set -euo pipefail
 
 COUNT=5
-PATTERN='^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$'
+# Fork default: this repository's own version tags. Upstream's scheme is
+# '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' (pass it via --pattern); this fork
+# carries none of those tags, which is why the inherited E2E never picked one.
+# HERMES_E2E_TAG_PATTERN overrides without editing the workflow.
+FORK_TAG_PATTERN='^known-good-linux-pantheon-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+PATTERN="${HERMES_E2E_TAG_PATTERN:-$FORK_TAG_PATTERN}"
 MERGED=""
 # Default to the repository containing this script, resolved through its real
 # path so a symlinked or copied script still reads the checkout it lives in
