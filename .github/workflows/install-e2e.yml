@@ -45,6 +45,8 @@ on:
       # Release tags only: the repo also carries backup/* and one-off tags.
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+      # This fork's own version tags (see tests/install/fork-e2e.conf).
+      - 'known-good-linux-pantheon-*'
 
 permissions:
   contents: read
@@ -66,8 +68,11 @@ jobs:
       # This job only reads tag names and runs one script, so take the cheap
       # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
       # -- they are the whole input, and the default shallow checkout has none.
+      # fetch-depth: 0 because --merged HEAD needs ancestry, not just tag names;
+      # blob:none keeps that cheap.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          fetch-depth: 0
           filter: blob:none
           fetch-tags: true
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
@@ -75,7 +80,7 @@ jobs:
       - id: pick
         run: |
           set -euo pipefail
-          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
+          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}' --merged HEAD)"
           echo "Testing updates from: $tags"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 

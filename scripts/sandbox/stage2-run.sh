@@ -196,6 +196,14 @@ if [ "$DEV_SANDBOX_INTERACTIVE" = true ]; then
   dev_mounts=(--dev /dev)
 fi
 
+# Node gets the SANDBOX CA as its extra CA, like curl/git/Python get it via
+# CURL_CA_BUNDLE/SSL_CERT_FILE/GIT_SSL_CAINFO. Every HTTPS request through the
+# proxy is intercepted with a cert minted from that CA, and the official Node
+# binaries the installer downloads use their bundled Mozilla roots (they ignore
+# SSL_CERT_FILE), so pointing NODE_EXTRA_CA_CERTS at the real bundle made npm
+# reject every intercepted registry cert ("unable to verify the first
+# certificate"; the proxy logs SSLEOFError) and the installer's npm step fail.
+# Extra CAs add to Node's bundled roots, so direct connections still verify.
 exec bwrap \
   --unshare-pid \
   --die-with-parent --proc /proc --tmpfs /tmp \
@@ -216,7 +224,7 @@ exec bwrap \
   --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
   --setenv SSL_CERT_FILE /work/certs/ca.pem \
   --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
-  --setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem \
+  --setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem \
   --setenv OPENSSL_CONF /work/certs/openssl.cnf \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
   --setenv HTTPS_PROXY http://127.0.0.1:8080 \

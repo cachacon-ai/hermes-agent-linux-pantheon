@@ -22,6 +22,9 @@
 # Usage:
 #   tests/install/install-update-e2e.sh --route update|installer
 #                                       [--install-ref REF] [--keep]
+#                                       [--origin-url URL] [--backup-env NAME]
+#                                       [--services] [--fork-surface]
+#                                       [--rollback]
 #
 #   --route         which update path to exercise (required):
 #                     update     `hermes update`
@@ -29,6 +32,35 @@
 #   --install-ref   what to install first; anything git resolves (a branch, a
 #                   tag like v2026.7.7, or a SHA reachable from main).
 #                   Default: refs/heads/main.
+#
+#   --no-fork       ignore tests/install/fork-e2e.conf (upstream behaviour).
+#
+# Optional phases. Off in upstream; tests/install/fork-e2e.conf turns them all
+# on by default in this fork (and points the sandbox at the fork's repo):
+#   --origin-url    after the first install, point the checkout's `origin` at
+#                   URL (e.g. the fork's git@github.com:owner/repo.git), the
+#                   way a fork checkout is configured, so the update route
+#                   runs `hermes update`'s fork path. The sandbox's ssh shim
+#                   serves the fake remote for any github.com URL, so nothing
+#                   leaves the sandbox. Asserted unchanged after the update.
+#   --backup-env    before updating, create the local branch
+#                   backup/<NAME>-pre-<target12>-<YYYYMMDD> at the installed
+#                   commit (the production pre-upgrade snapshot practice) and
+#                   assert it exists, points at the pre-upgrade commit, and is
+#                   never pushed to the remote. Local to the sandbox only.
+#   --services      after install and after the update, start the long-running
+#                   services (`hermes gateway run` and the dashboard backend
+#                   `hermes serve`) and require /api/health ok and
+#                   /api/status gateway_running before stopping them.
+#   --fork-surface  after the update, require the fork's own surface at the
+#                   target: its modules import in the venv and its dashboard
+#                   routes are mounted (HERMES_E2E_FORK_MODULES /
+#                   HERMES_E2E_FORK_ROUTES override the lists).
+#   --rollback      after the update passes, roll the checkout back to the
+#                   pre-upgrade commit (via the --backup-env ref, else the
+#                   installed SHA), reinstall its dependencies into the same
+#                   venv, and require HEAD, `hermes --version` and (with
+#                   --services) the service health checks to pass again.
 #
 # Requires a CLEAN worktree: every dev-sandbox invocation re-derives fake main
 # from the working copy, so uncommitted changes move the update target between
@@ -39,6 +71,29 @@ set -euo pipefail
 ROUTE=""
 INSTALL_REF="refs/heads/main"
 KEEP=false
+ORIGIN_URL=""
+BACKUP_ENV=""
+SERVICES=false
+FORK_SURFACE=false
+ROLLBACK=false
+# Fork defaults (tests/install/fork-e2e.conf) apply unless --no-fork is given.
+# Resolved before parsing so explicit flags still win.
+FORK_CONF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fork-e2e.conf"
+USE_FORK=false
+[ -f "$FORK_CONF" ] && USE_FORK=true
+for arg in "$@"; do
+  [ "$arg" = --no-fork ] && USE_FORK=false
+done
+if [ "$USE_FORK" = true ]; then
+  # shellcheck source=fork-e2e.conf
+  . "$FORK_CONF"
+  export HERMES_DEV_SANDBOX_UPSTREAM="${HERMES_DEV_SANDBOX_UPSTREAM:-$FORK_UPSTREAM_URL}"
+  ORIGIN_URL="$FORK_ORIGIN_URL"
+  BACKUP_ENV="$FORK_BACKUP_ENV"
+  SERVICES="$FORK_SERVICES"
+  FORK_SURFACE="$FORK_SURFACE"
+  ROLLBACK="$FORK_ROLLBACK"
+fi
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --route)
@@ -48,7 +103,17 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { echo 'error: --install-ref needs a value' >&2; exit 1; }
       INSTALL_REF="$2"; shift 2 ;;
     --keep) KEEP=true; shift ;;
-    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
+    --origin-url)
+      [ "$#" -ge 2 ] || { echo 'error: --origin-url needs a value' >&2; exit 1; }
+      ORIGIN_URL="$2"; shift 2 ;;
+    --backup-env)
+      [ "$#" -ge 2 ] || { echo 'error: --backup-env needs a value' >&2; exit 1; }
+      BACKUP_ENV="$2"; shift 2 ;;
+    --services) SERVICES=true; shift ;;
+    --fork-surface) FORK_SURFACE=true; shift ;;
+    --rollback) ROLLBACK=true; shift ;;
+    --no-fork) shift ;;   # handled above
+    -h|--help) sed -n '2,70p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -56,6 +121,10 @@ case "$ROUTE" in
   update|installer) ;;
   '') echo 'error: --route is required (update or installer)' >&2; exit 1 ;;
   *) echo "error: unknown route: $ROUTE (want update or installer)" >&2; exit 1 ;;
+esac
+case "$BACKUP_ENV" in
+  ''|*[!A-Za-z0-9._-]*)
+    [ -z "$BACKUP_ENV" ] || { echo "error: --backup-env must be [A-Za-z0-9._-]+: $BACKUP_ENV" >&2; exit 1; } ;;
 esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -246,9 +315,155 @@ require_hermes_works() {
   ok "hermes runs $when"
 }
 
+# ── optional fork-aware phases ─────────────────────────────────────────────
+# Default fork surface: modules and dashboard routes the fork added on top of
+# upstream (Pantheon tool/artifacts, GPT-Live voice). Overridable so the list
+# can follow the fork without editing this script.
+FORK_MODULES="${HERMES_E2E_FORK_MODULES:-tools.pantheon_tool agent.pantheon_artifacts tools.voice_live}"
+FORK_ROUTES="${HERMES_E2E_FORK_ROUTES:-/api/audio/voice-live/status}"
+SERVICE_PORT="${HERMES_E2E_SERVICE_PORT:-9119}"
+
+sandbox_origin() { in_sandbox "cd $INSTALL_DIR && git remote get-url origin" | tr -d '[:space:]'; }
+
+set_origin() {
+  [ -n "$ORIGIN_URL" ] || return 0
+  in_sandbox "cd $INSTALL_DIR && git remote set-url origin '$ORIGIN_URL'" \
+    || fail "could not point origin at $ORIGIN_URL"
+  [ "$(sandbox_origin)" = "$ORIGIN_URL" ] || fail "origin is not $ORIGIN_URL after set-url"
+  ok "origin -> $ORIGIN_URL"
+}
+
+require_origin_kept() {
+  local what="$1" got
+  [ -n "$ORIGIN_URL" ] || return 0
+  got="$(sandbox_origin)"
+  [ "$got" = "$ORIGIN_URL" ] || fail "$what rewrote origin to $got (wanted $ORIGIN_URL)"
+  ok "$what kept origin at $ORIGIN_URL"
+}
+
+BACKUP_REF=""
+create_backup_ref() {
+  local base="$1" target="$2" got
+  [ -n "$BACKUP_ENV" ] || return 0
+  BACKUP_REF="backup/${BACKUP_ENV}-pre-${target:0:12}-$(date -u +%Y%m%d)"
+  in_sandbox "cd $INSTALL_DIR && git branch '$BACKUP_REF' '$base'" \
+    || fail "could not create backup ref $BACKUP_REF"
+  require_backup_ref "$base" 'before the update'
+}
+
+require_backup_ref() {
+  local base="$1" when="$2" got
+  [ -n "$BACKUP_REF" ] || return 0
+  got="$(in_sandbox "cd $INSTALL_DIR && git rev-parse --verify -q 'refs/heads/$BACKUP_REF^{commit}'" | tr -d '[:space:]')"
+  [ "$got" = "$base" ] \
+    || fail "backup ref $BACKUP_REF is '${got:-missing}' $when, wanted pre-upgrade $base"
+  # Snapshot refs stay local: the remote must never learn about them.
+  if in_sandbox "git --git-dir=$FAKE_REMOTE show-ref" | grep -qF "refs/heads/$BACKUP_REF"; then
+    fail "backup ref $BACKUP_REF reached the remote $when"
+  fi
+  ok "backup ref $BACKUP_REF -> ${base:0:12} $when (local only)"
+}
+
+# Start the long-running services inside ONE sandbox invocation (each
+# invocation is its own pid namespace, so anything backgrounded dies with it),
+# wait for them to report healthy, then stop them. The gateway runs with no
+# messaging platforms configured, which it supports (cron-only mode).
+# Proxy env is set inside the sandbox, so curl must bypass it for loopback.
+# $1: label, $2: "fork" to also require the fork's dashboard routes.
+require_services_healthy() {
+  local when="$1" surface="${2:-}" tag
+  [ "$SERVICES" = true ] || return 0
+  tag="services-$(printf '%s' "$when" | tr -c 'A-Za-z0-9' '-')"
+  local routes=""
+  [ "$surface" = fork ] && routes="$FORK_ROUTES"
+  if ! in_sandbox "
+    set -u
+    port=$SERVICE_PORT
+    logdir=/work/logs/$tag
+    mkdir -p \"\$logdir\"
+    hermes gateway run >\"\$logdir/gateway.log\" 2>&1 & gw=\$!
+    hermes serve --host 127.0.0.1 --port \"\$port\" >\"\$logdir/serve.log\" 2>&1 & sv=\$!
+    stop() { kill \$gw \$sv 2>/dev/null; wait \$gw \$sv 2>/dev/null || true; }
+    dump() {
+      echo '--- gateway.log (tail) ---'; tail -n 80 \"\$logdir/gateway.log\"
+      echo '--- serve.log (tail) ---'; tail -n 80 \"\$logdir/serve.log\"
+    }
+    trap stop EXIT
+    get() { curl -fsS --noproxy '*' --max-time 5 \"http://127.0.0.1:\$port\$1\"; }
+    health=''
+    for _ in \$(seq 1 180); do
+      health=\$(get /api/health 2>/dev/null) && break
+      health=''
+      kill -0 \$sv 2>/dev/null || break
+      sleep 1
+    done
+    [ -n \"\$health\" ] || { echo 'dashboard backend never answered /api/health'; dump; exit 1; }
+    echo \"    /api/health: \$health\"
+    printf '%s' \"\$health\" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"ok\") is True else 1)' \
+      || { echo '/api/health did not report ok:true'; dump; exit 1; }
+    running=''
+    for _ in \$(seq 1 180); do
+      status=\$(get /api/status 2>/dev/null) || status=''
+      if [ -n \"\$status\" ] && printf '%s' \"\$status\" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"gateway_running\") is True else 1)'; then
+        running=yes; break
+      fi
+      kill -0 \$gw 2>/dev/null || break
+      sleep 1
+    done
+    [ -n \"\$running\" ] || { echo 'gateway never reported running via /api/status'; echo \"last /api/status: \$status\"; dump; exit 1; }
+    printf '%s' \"\$status\" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(\"    /api/status: version=%s gateway_running=%s gateway_state=%s\" % (d.get(\"version\"), d.get(\"gateway_running\"), d.get(\"gateway_state\")))'
+    for route in $routes; do
+      code=\$(curl -sS --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' \"http://127.0.0.1:\$port\$route\") || code=000
+      case \"\$code\" in
+        404|000|5??) echo \"fork route \$route answered \$code (not mounted / broken)\"; dump; exit 1 ;;
+        *) echo \"    fork route \$route answered \$code (mounted)\" ;;
+      esac
+    done
+  "; then
+    collect_sandbox_logs "$tag"
+    fail "services unhealthy $when"
+  fi
+  ok "gateway + dashboard backend healthy $when"
+}
+
+require_fork_surface() {
+  local when="$1" mod
+  [ "$FORK_SURFACE" = true ] || return 0
+  for mod in $FORK_MODULES; do
+    in_sandbox "cd $INSTALL_DIR && ./venv/bin/python -c 'import $mod'" \
+      || fail "fork module $mod does not import $when"
+  done
+  ok "fork modules import $when: $FORK_MODULES"
+}
+
+# Roll back the way an operator does: reset to the snapshot, reinstall that
+# commit's dependencies into the same venv with the managed uv (the command
+# `hermes update` and install.sh's fallback tier use), relaunch.
+rollback_to_base() {
+  local base="$1" target ref head
+  target="${BACKUP_REF:-$base}"
+  step "ROLLBACK: $target (${base:0:12}) from the updated checkout"
+  if ! in_sandbox "
+    set -e
+    cd $INSTALL_DIR
+    git reset --hard '$target'
+    uv=\"\${HERMES_HOME:-\$HOME/.hermes}/bin/uv\"
+    [ -x \"\$uv\" ] || uv=\$(command -v uv)
+    VIRTUAL_ENV=$INSTALL_DIR/venv \"\$uv\" pip install -e '.[all]'
+  " 2>&1 | tee "$LOG_DIR/rollback.log"; then
+    collect_sandbox_logs rollback
+    fail "rollback to $target failed"
+  fi
+  head="$(sandbox_head)"
+  [ "$head" = "$base" ] || fail "rollback left HEAD at $head, wanted $base"
+  ok "rolled back to ${base:0:12}"
+  require_hermes_works 'after rollback'
+  require_services_healthy 'after rollback'
+}
+
 # ── install the earlier Hermes ─────────────────────────────────────────────
-step "installing upstream $INSTALL_REF (real curl | install.sh: uv, Python, Node, venv)"
-install_in_sandbox "install of upstream $INSTALL_REF" "$INSTALL_REF" install
+step "installing $INSTALL_REF from $UPSTREAM_URL (real curl | install.sh: uv, Python, Node, venv)"
+install_in_sandbox "install of $INSTALL_REF" "$INSTALL_REF" install
 
 BASE="$(sandbox_head)"
 TARGET="$(sandbox_target)"
@@ -257,6 +472,9 @@ TARGET="$(sandbox_target)"
   || fail "install landed on the update target ($BASE); base and target must differ"
 ok "installed ${BASE:0:12}; update target is ${TARGET:0:12}"
 require_hermes_works 'after install'
+set_origin
+require_services_healthy 'after install'
+create_backup_ref "$BASE" "$TARGET"
 
 # ── apply exactly one update route ─────────────────────────────────────────
 case "$ROUTE" in
@@ -276,6 +494,7 @@ case "$ROUTE" in
     fi
     require_landed_on_target 'hermes update'
     require_hermes_works 'after hermes update'
+    require_origin_kept 'hermes update'
     ;;
   installer)
     step 'ROUTE: installer re-run over the existing checkout'
@@ -284,10 +503,21 @@ case "$ROUTE" in
     install_in_sandbox 'installer re-run' '' reinstall
     require_landed_on_target 'installer re-run'
     require_hermes_works 'after installer re-run'
+    require_origin_kept 'installer re-run'
     ;;
 esac
 
-printf '\n\033[1;32m✓ install/update E2E passed (route: %s, from: %s)\033[0m\n' \
-  "$ROUTE" "$INSTALL_REF"
+require_backup_ref "$BASE" "after $ROUTE"
+require_fork_surface "after $ROUTE"
+fork_routes=""
+[ "$FORK_SURFACE" = true ] && fork_routes=fork
+require_services_healthy "after $ROUTE" "$fork_routes"
+
+if [ "$ROLLBACK" = true ]; then
+  rollback_to_base "$BASE"
+fi
+
+printf '\n\033[1;32m✓ install/update E2E passed (route: %s, from: %s%s)\033[0m\n' \
+  "$ROUTE" "$INSTALL_REF" "$([ "$ROLLBACK" = true ] && echo ', rollback ok')"
 [ "$KEEP" = true ] && echo "  sandbox kept at $SANDBOX_ROOT"
 exit 0
