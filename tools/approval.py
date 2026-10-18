@@ -1164,7 +1164,13 @@ DANGEROUS_PATTERNS = [
     # an unrelated "hermes" mention now also matches) — for an approval gate
     # that's the correct direction to err: an extra approval prompt is
     # cheap, a missed one took down the whole gateway fleet.
-    (r'(?=[\s\S]*\blaunchctl\s+(?:stop|kickstart|bootout|unload|kill|disable|remove)\b)(?=[\s\S]*\b(?:hermes|ai\.hermes)\b)', "stop/restart hermes launchd service (kills running agents)"),
+    #
+    # Anchored at \A: both lookaheads scan to the end of the command, so an
+    # unanchored search re-ran them from every start position -- O(n^2) in
+    # command length (a 4,000-segment benign command spent ~70s here). Each
+    # lookahead already spans the whole remainder with [\s\S]*, so testing
+    # them once from the start matches exactly the same commands.
+    (r'\A(?=[\s\S]*\blaunchctl\s+(?:stop|kickstart|bootout|unload|kill|disable|remove)\b)(?=[\s\S]*\b(?:hermes|ai\.hermes)\b)', "stop/restart hermes launchd service (kills running agents)"),
     # File copy/move/edit into sensitive system paths (/etc/ and macOS
     # /private/etc/ mirror).
     (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
