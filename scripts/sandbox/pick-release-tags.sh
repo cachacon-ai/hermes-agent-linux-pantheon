@@ -20,9 +20,10 @@
 #             requested emits all of them.
 #   --repo    repository to read tags from (default: this checkout).
 #   --pattern extended regex a tag name must match in full to count as a
-#             release (default here: the fork's own scheme,
-#             '^known-good-linux-pantheon-[0-9]{4}-[0-9]{2}-[0-9]{2}$', or
-#             $HERMES_E2E_TAG_PATTERN; upstream's is vYYYY.M.D[.N]).
+#             release. Default: $HERMES_E2E_TAG_PATTERN if set; else the fork
+#             scheme '^known-good-linux-pantheon-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+#             when the repo carries tests/install/fork-e2e.conf; else
+#             upstream's vYYYY.M.D[.N].
 #   --merged  only consider tags whose commit is an ancestor of REF (e.g.
 #             HEAD), so every picked tag is something REF can update FROM.
 #             Needs history, not just tags (fetch-depth: 0).
@@ -32,19 +33,20 @@
 # checkout has no tags and this exits non-zero rather than silently emitting an
 # empty matrix.
 #
-# Only tags matching the pattern in full are considered (by default the fork's
-# known-good-linux-pantheon-YYYY-MM-DD scheme); the repo also carries backup/*
-# and one-off tags that are not releases.
+# Only tags matching the pattern in full are considered (upstream's
+# vYYYY.M.D[.N] by default, the fork's known-good-linux-pantheon-YYYY-MM-DD
+# scheme when tests/install/fork-e2e.conf is present); the repo also carries
+# backup/* and one-off tags that are not releases.
 
 set -euo pipefail
 
 COUNT=5
-# Fork default: this repository's own version tags. Upstream's scheme is
-# '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' (pass it via --pattern); this fork
-# carries none of those tags, which is why the inherited E2E never picked one.
-# HERMES_E2E_TAG_PATTERN overrides without editing the workflow.
+# Upstream's release scheme stays the default. A fork opts into its own
+# scheme by carrying tests/install/fork-e2e.conf (resolved below, once REPO is
+# known) or by setting HERMES_E2E_TAG_PATTERN; --pattern beats both.
+UPSTREAM_TAG_PATTERN='^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$'
 FORK_TAG_PATTERN='^known-good-linux-pantheon-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-PATTERN="${HERMES_E2E_TAG_PATTERN:-$FORK_TAG_PATTERN}"
+PATTERN=""
 MERGED=""
 # Default to the repository containing this script, resolved through its real
 # path so a symlinked or copied script still reads the checkout it lives in
@@ -72,7 +74,6 @@ case "$COUNT" in
   ''|*[!0-9]*) echo "error: --count must be a positive integer: $COUNT" >&2; exit 1 ;;
 esac
 [ "$COUNT" -ge 1 ] || { echo 'error: --count must be at least 1' >&2; exit 1; }
-[ -n "$PATTERN" ] || { echo 'error: --pattern must not be empty' >&2; exit 1; }
 
 # Resolve the script's own location through symlinks, then ask git which
 # worktree that path belongs to. Deriving the repo from the script rather than
@@ -85,6 +86,22 @@ if [ -z "$REPO" ]; then
   fi
   script_dir="$(cd "$(dirname "$script_path")" && pwd)"
   REPO="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$script_dir")"
+fi
+
+# Pattern precedence: --pattern, then HERMES_E2E_TAG_PATTERN, then the fork
+# scheme when the repo carries tests/install/fork-e2e.conf, else upstream's.
+# The conf is looked up in HEAD's tree as well as on disk: CI runs this from a
+# sparse, blobless checkout that contains only this script, and `git ls-tree`
+# reads trees, never blobs.
+if [ -z "$PATTERN" ]; then
+  if [ -n "${HERMES_E2E_TAG_PATTERN:-}" ]; then
+    PATTERN="$HERMES_E2E_TAG_PATTERN"
+  elif [ -f "$REPO/tests/install/fork-e2e.conf" ] \
+    || [ -n "$(git -C "$REPO" ls-tree --name-only HEAD -- tests/install/fork-e2e.conf 2>/dev/null)" ]; then
+    PATTERN="$FORK_TAG_PATTERN"
+  else
+    PATTERN="$UPSTREAM_TAG_PATTERN"
+  fi
 fi
 
 # sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain

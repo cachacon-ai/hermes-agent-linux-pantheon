@@ -63,7 +63,7 @@ Jobs gated by `CI_PRIMARY_REPOSITORY` include Docker image build/publish, GitHub
 
 `.github/workflows/install-e2e.yml` (unchanged from upstream) proves a real `curl | install.sh` install of an earlier version can update to the tested commit. Upstream picks `vYYYY.M.D` release tags, which this fork does not carry, so every run failed in **Pick release tags**. The fork-native behaviour lives in the scripts the workflow calls:
 
-- `scripts/sandbox/pick-release-tags.sh` defaults to the fork's own tag scheme, `known-good-linux-pantheon-YYYY-MM-DD` (override with `--pattern` or `HERMES_E2E_TAG_PATTERN`; `--merged REF` restricts to ancestors of REF).
+- `scripts/sandbox/pick-release-tags.sh` keeps upstream's `vYYYY.M.D` scheme as its default, and switches to the fork's own scheme, `known-good-linux-pantheon-YYYY-MM-DD`, when the repo carries `tests/install/fork-e2e.conf` (checked in HEAD's tree too, so CI's sparse checkout sees it). `HERMES_E2E_TAG_PATTERN` or `--pattern` override both; `--merged REF` restricts picks to ancestors of REF.
 - `tests/install/fork-e2e.conf`, when present, makes `tests/install/install-update-e2e.sh` run fork-native (`--no-fork` restores upstream behaviour).
 
 Each leg (route `update` = `hermes update`, route `installer` = re-running the installer), all inside the bubblewrap sandbox on the runner:
