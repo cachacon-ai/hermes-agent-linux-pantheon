@@ -2594,6 +2594,13 @@ def run_conversation(
                             wire = append_prompt_clock_to_multimodal_api_content(
                                 wire, _turn_clock
                             )
+                        _turn_file_delivery = (
+                            getattr(agent, "_turn_pantheon_file_delivery", "") or ""
+                        )
+                        if _turn_file_delivery:
+                            wire = append_prompt_clock_to_multimodal_api_content(
+                                wire, _turn_file_delivery
+                            )
                 api_msg["content"] = apply_send_time_user_injections(
                     wire,
                     pinned_context_block=_pinned_context_block,

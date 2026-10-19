@@ -436,3 +436,39 @@ def test_default_output_root_under_realistic_dot_hermes_profile_is_allowed(runti
     source=Path(agent._pantheon_turn_output_root)/'output.txt';source.write_text('result')
     result=dispatch(agent,'default','task-a',{'path':str(source)},native_environment=SimpleNamespace(cwd=str(workspace)))
     assert json.loads(result)['status']=='captured',result
+
+
+def test_file_delivery_hint_is_wire_only_and_stripped_from_history(runtime):
+    from agent.pantheon_artifacts import prepare_turn_output, stamp_file_delivery_wire
+    from tui_gateway.server import _history_to_messages
+
+    agent, db, _ = runtime
+    user_msg = {"role": "user", "content": "Hey! You have composio tools now yes?"}
+    note = prepare_turn_output(agent)
+    stamp_file_delivery_wire(user_msg, note)
+    assert "[Pantheon file delivery:" not in user_msg["content"]
+    assert note in user_msg["api_content"]
+
+    agent._persist_user_message_idx = 0
+    agent._persist_user_message_override = user_msg["content"]
+    agent._flush_messages_to_session_db([user_msg])
+    row = db.get_messages_as_conversation("source")[-1]
+    assert row["content"] == user_msg["content"]
+    assert note in row["api_content"]
+
+    legacy = {"role": "user", "content": f"{user_msg['content']}\n\n{note}"}
+    projected = _history_to_messages([legacy])
+    assert projected[0]["text"] == user_msg["content"]
+
+    multimodal = {
+        "role": "user",
+        "content": [{"type": "text", "text": user_msg["content"]}],
+    }
+    agent._turn_pantheon_file_delivery = note
+    from agent.conversation_loop import append_prompt_clock_to_multimodal_api_content
+
+    wire = append_prompt_clock_to_multimodal_api_content(
+        list(multimodal["content"]), note
+    )
+    assert note in wire[-1]["text"]
+    assert note not in multimodal["content"][0]["text"]

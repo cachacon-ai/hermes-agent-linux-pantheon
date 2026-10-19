@@ -10282,6 +10282,11 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
+        if role == "user":
+            from agent.pantheon_artifacts import project_user_content_for_display
+
+            projected = project_user_content_for_display(m.get("content"))
+            content_text = _coerce_message_text(projected)
         if role == "assistant" and not content_text.strip():
             from agent.pantheon_artifacts import reply_presentation
             content_text = reply_presentation(m)

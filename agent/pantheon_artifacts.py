@@ -1,6 +1,8 @@
 """Session-gated explicit publication and common response-commit integration."""
 from __future__ import annotations
 
+from typing import Any
+
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -9,6 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import uuid
@@ -386,10 +389,68 @@ def commit_response(agent,messages,history=None):
         agent._pantheon_pending_commit=None
 
 
+_FILE_DELIVERY_HINT_PREFIX = "[Pantheon file delivery:"
+_FILE_DELIVERY_HINT_SUFFIX = re.compile(
+    r"(?:\n\n)?\[Pantheon file delivery:.*?\]\s*$",
+    re.DOTALL,
+)
+
+
+def strip_file_delivery_hint(text: str) -> str:
+    """Remove the per-turn publication hint from user-visible transcript text."""
+    if not isinstance(text, str) or _FILE_DELIVERY_HINT_PREFIX not in text:
+        return text
+    stripped = _FILE_DELIVERY_HINT_SUFFIX.sub("", text).rstrip()
+    return stripped if stripped else text
+
+
+def project_user_content_for_display(content: Any) -> Any:
+    """Strip publication hints from history/display projections (incl. legacy rows)."""
+    if isinstance(content, str):
+        return strip_file_delivery_hint(content)
+    if isinstance(content, list):
+        projected = []
+        for part in content:
+            if not isinstance(part, dict):
+                projected.append(part)
+                continue
+            if part.get("type") not in {"text", "input_text", "output_text"}:
+                projected.append(part)
+                continue
+            text = part.get("text") or part.get("content") or ""
+            if isinstance(text, str) and text.strip().startswith(_FILE_DELIVERY_HINT_PREFIX):
+                continue
+            if isinstance(text, str):
+                cleaned = strip_file_delivery_hint(text)
+                if cleaned:
+                    projected.append({**part, "text": cleaned})
+            else:
+                projected.append(part)
+        return projected
+    return content
+
+
+def stamp_file_delivery_wire(user_msg: dict, publication_note: str) -> None:
+    """Put the publication hint on the API wire sidecar, not durable ``content``."""
+    if not publication_note:
+        return
+    original = user_msg.get("content")
+    if isinstance(original, str):
+        wire = original + ("\n\n" if original else "") + publication_note
+        user_msg["api_content"] = wire
+        return
+    if isinstance(original, list):
+        # Multimodal turns cannot use a string api_content sidecar; the turn
+        # prologue stages the note on the agent for send-time wire injection
+        # (see conversation_loop api_messages build).
+        return
+
+
 def reply_presentation(message):
     """Presentation fallback remains outside provider-visible content."""
     content=message.get('content') or ''
-    if isinstance(content,str) and content.strip(): return content
+    if isinstance(content,str) and content.strip():
+        return strip_file_delivery_hint(content)
     meta=message.get('display_metadata')
     return meta.get('pantheon_reply_preview','') if isinstance(meta,dict) else ''
 
