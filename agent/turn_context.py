@@ -768,6 +768,7 @@ def build_turn_context(
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
     agent._turn_prompt_clock = ""
+    agent._turn_pantheon_file_delivery = ""
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
@@ -918,18 +919,23 @@ def build_turn_context(
     # ``has_platform_message_id`` against this row.
     if persist_user_platform_id is not None:
         user_msg["platform_message_id"] = persist_user_platform_id
-    from agent.pantheon_artifacts import enabled as artifact_delivery_enabled, prepare_turn_output
+    from agent.pantheon_artifacts import (
+        enabled as artifact_delivery_enabled,
+        prepare_turn_output,
+        stamp_file_delivery_wire,
+    )
     if artifact_delivery_enabled(agent):
         _publication_note = prepare_turn_output(agent)
         _publication_original = user_msg.get("content")
         if persist_user_message is None:
             persist_user_message = _publication_original
             agent._persist_user_message_override = _publication_original
-        if isinstance(_publication_original, str):
-            user_msg["content"] = _publication_original + "\n\n" + _publication_note
-        elif isinstance(_publication_original, list):
-            user_msg["content"] = list(_publication_original) + [{"type":"text","text":_publication_note}]
-        user_message = user_msg["content"]
+        if _publication_note:
+            if isinstance(user_msg.get("content"), list):
+                agent._turn_pantheon_file_delivery = _publication_note
+            else:
+                stamp_file_delivery_wire(user_msg, _publication_note)
+        user_message = user_msg.get("content")
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -1720,8 +1726,11 @@ def build_turn_context(
         and messages[current_turn_user_idx].get("role") == "user"
     ):
         _turn_user_msg = messages[current_turn_user_idx]
+        _wire_base = _turn_user_msg.get("content", "")
+        if isinstance(_turn_user_msg.get("api_content"), str):
+            _wire_base = _turn_user_msg["api_content"]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""),
+            _wire_base,
             ext_prefetch_cache,
             plugin_user_context,
         )
