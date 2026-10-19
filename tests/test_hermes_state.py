@@ -2351,9 +2351,39 @@ class TestListSessionsRich:
         assert len(sessions) == 1
         assert "Help me refactor the auth module" in sessions[0]["preview"]
 
+    def test_preview_skips_soft_deleted_first_user_message(self, db):
+        db.create_session("s1", "cli")
+        first_id = db.append_message("s1", "user", "deleted opening turn")
+        db.append_message("s1", "user", "visible preview text")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET active = 0 WHERE id = ?",
+                (first_id,),
+            )
+            db._conn.commit()
+        (row,) = db.list_sessions_rich()
+        assert "visible preview text" in row["preview"]
+        assert "deleted opening turn" not in row["preview"]
 
-
-
+    def test_last_active_ignores_soft_deleted_latest_message(self, db):
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "older")
+        latest_id = db.append_message("s1", "assistant", "newest")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE session_id = ? AND role = ?",
+                (1_700_000_100.0, "s1", "user"),
+            )
+            db._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE id = ?",
+                (1_700_000_900.0, latest_id),
+            )
+            db._conn.execute(
+                "UPDATE messages SET active = 0 WHERE id = ?",
+                (latest_id,),
+            )
+            db._conn.commit()
+        assert db.list_sessions_rich()[0]["last_active"] == 1_700_000_100.0
 
     def test_last_active_prefers_session_activity_heartbeat(self, db):
         """Mid-turn agent heartbeats must advance last_active without new messages (#72016)."""
