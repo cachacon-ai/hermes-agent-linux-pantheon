@@ -68,6 +68,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_ELIGIBLE_SQL,
+    _PREVIEW_MESSAGE_VISIBLE_SQL,
     _PREVIEW_RAW_SELECT,
     _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL,
@@ -12186,6 +12187,7 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
                         (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                           AND {_PREVIEW_MESSAGE_VISIBLE_SQL}
                            AND {_PREVIEW_ELIGIBLE_SQL}
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
@@ -12210,6 +12212,7 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
                         (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                           AND {_PREVIEW_MESSAGE_VISIBLE_SQL}
                            AND {_PREVIEW_ELIGIBLE_SQL}
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
@@ -12250,14 +12253,12 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
                         (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                           AND {_PREVIEW_MESSAGE_VISIBLE_SQL}
                            AND {_PREVIEW_ELIGIBLE_SQL}
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    COALESCE(
-                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                        s.started_at
-                    ) AS last_active
+                    {_sql_session_last_active("s")} AS last_active
                 FROM sessions s
                 {prompt_join}
                 {pinned_where}
@@ -16989,6 +16990,7 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
                             (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                               AND {_PREVIEW_MESSAGE_VISIBLE_SQL}
                                AND {_PREVIEW_ELIGIBLE_SQL}
                              ORDER BY m.timestamp, m.id LIMIT 1),
                             ''
@@ -17021,6 +17023,7 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
                             (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                               AND {_PREVIEW_MESSAGE_VISIBLE_SQL}
                                AND {_PREVIEW_ELIGIBLE_SQL}
                              ORDER BY m.timestamp, m.id LIMIT 1),
                             ''

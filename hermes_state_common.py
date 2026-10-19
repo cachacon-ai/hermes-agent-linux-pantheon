@@ -127,9 +127,16 @@ _PREVIEW_FORCE_USER_REMAINDER_SQL = (
     f" + {len(_SUMMARY_END_MARKER)})"
 )
 
+def _sql_message_visible(alias: str) -> str:
+    """Transcript-visible rows: active turns plus compaction carriers."""
+    return f"({alias}.active = 1 OR {alias}.compacted = 1)"
+
+
 # Session preview subqueries select their first eligible user-authored content.
 # Pure compaction rows are ineligible; force-user-leading and merged carriers
 # remain eligible only when authentic content survives the wire boundary.
+_PREVIEW_MESSAGE_VISIBLE_SQL = _sql_message_visible("m")
+
 _PREVIEW_ELIGIBLE_SQL = (
     f"((NOT {_PREVIEW_STANDALONE_SUMMARY_SQL} AND NOT {_PREVIEW_MERGED_SUMMARY_SQL})"
     f" OR ({_PREVIEW_STANDALONE_SUMMARY_SQL}"
@@ -316,7 +323,8 @@ def _sql_session_last_active(alias: str = "s") -> str:
     """
     msg_max = (
         f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
-        f"WHERE _act_m.session_id = {alias}.id)"
+        f"WHERE _act_m.session_id = {alias}.id "
+        f"AND {_sql_message_visible('_act_m')})"
     )
     return (
         f"COALESCE("
@@ -333,7 +341,8 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     """Same freshest-of expression keyed by a session-id SQL expression."""
     msg_max = (
         f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
-        f"WHERE _act_m.session_id = {session_id_expr})"
+        f"WHERE _act_m.session_id = {session_id_expr} "
+        f"AND {_sql_message_visible('_act_m')})"
     )
     activity = (
         f"(SELECT last_activity_at FROM sessions _act_s "
