@@ -370,6 +370,11 @@ def _supports_adaptive_thinking(model: str) -> bool:
     return not any(v in m for v in _LEGACY_MANUAL_THINKING_CLAUDE_SUBSTRINGS)
 
 
+def _is_minimax_m31_flash_model(model: str) -> bool:
+    """Return True for MiniMax M3.1 Flash IDs, including provider-prefixed forms."""
+    return "minimax-m3.1-flash" in (model or "").lower()
+
+
 def _supports_xhigh_effort(model: str) -> bool:
     """Return True for models that accept the 'xhigh' adaptive effort level.
 
@@ -1109,8 +1114,9 @@ def build_anthropic_kwargs(
     # Map reasoning_config to Anthropic's thinking parameter.
     # Claude 4.6+ models use adaptive thinking + output_config.effort.
     # Older models use manual thinking with budget_tokens.
-    # MiniMax Anthropic-compat endpoints support thinking (manual mode only,
-    # not adaptive).  Haiku does NOT support extended thinking — skip entirely.
+    # MiniMax M3.1 Flash uses adaptive thinking + output_config.effort; older
+    # MiniMax Anthropic-compatible models use manual thinking. Haiku does NOT
+    # support extended thinking — skip entirely.
     #
     # Kimi / Moonshot models also use adaptive thinking: their
     # Anthropic-compatible endpoints (api.moonshot.cn/anthropic,
@@ -1125,7 +1131,20 @@ def build_anthropic_kwargs(
     # request "summarized" so the reasoning blocks stay populated — matching
     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
     if reasoning_config and isinstance(reasoning_config, dict):
-        if reasoning_config.get("enabled") is False:
+        if _is_minimax_m31_flash_model(model):
+            # M3.1 Flash always reasons. When the user has disabled reasoning,
+            # keep the required adaptive mode and lower effort to the minimum
+            # supported level rather than sending a request the API rejects.
+            effort = (
+                "low"
+                if reasoning_config.get("enabled") is False
+                else str(reasoning_config.get("effort", "medium")).lower()
+            )
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {
+                "effort": ADAPTIVE_EFFORT_MAP.get(effort, "medium"),
+            }
+        elif reasoning_config.get("enabled") is False:
             # "Thinking off". Adaptive models think by DEFAULT, so omitting the
             # parameter is not a disable — it silently leaves thinking on and
             # the user keeps paying for it. Send the disable explicitly.
