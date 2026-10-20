@@ -683,7 +683,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 def run_codex_app_server_turn(
     agent,
     *,
-    user_message: str,
+    user_message: Any,
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
@@ -797,6 +797,19 @@ def run_codex_app_server_turn(
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
+
+    # Native Codex deliberately receives the clean turn input rather than the
+    # provider message sidecar (which can include unrelated memory context).
+    # Add only this turn's publication instructions, after adapter negotiation
+    # may have disabled publication, and never mutate transcript/system data.
+    from agent.pantheon_artifacts import (
+        compose_file_delivery_wire,
+        enabled as artifacts_enabled,
+    )
+    if artifacts_enabled(agent):
+        user_message = compose_file_delivery_wire(
+            user_message, getattr(agent, "_turn_pantheon_file_delivery", "") or ""
+        )
 
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)

@@ -38,11 +38,13 @@ from agent.conversation_compression import (
     context_compression_timed_out,
     conversation_history_after_compression,
 )
+from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message
+from agent.pantheon_artifacts import compose_file_delivery_wire
 from agent.turn_context import (
     PreflightCompressionTimedOut,
     _compression_warrants_another_preflight_pass,
@@ -2272,6 +2274,7 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    pending_user_sidecar_backfill = False
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -2490,6 +2493,11 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        _current_user_anchor = (
+            messages[current_turn_user_idx]
+            if 0 <= current_turn_user_idx < len(messages)
+            else None
+        )
         # Drop legacy ghost rows from the incomplete #73146 else branch BEFORE
         # the alternation repair below: a hidden assistant placeholder whose
         # content/api_content is the raw interrupt scaffold. Replaying that as
@@ -2536,6 +2544,19 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        # Filtering/repair can drop or merge rows before the current user.
+        # Keep both wire composition and compaction's persistence override
+        # anchored to the resulting user row, rather than the old list index.
+        current_turn_user_idx = next(
+            (i for i, msg in enumerate(messages) if msg is _current_user_anchor),
+            -1,
+        )
+        if current_turn_user_idx < 0:
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+        agent._persist_user_message_idx = current_turn_user_idx
+
         api_messages = []
         for idx, msg in enumerate(messages):
 
@@ -2574,32 +2595,80 @@ def run_conversation(
             # into the clean transcript content.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 if isinstance(_api_content, str) and _api_content:
-                    # Sidecar carries prefetch/plugin only — pins are injected
+                    # Sidecar carries completed turn context; pins are injected
                     # fresh at send time and never persisted.
                     wire = strip_pinned_memory_from_api_copy(_api_content)
                 else:
-                    # Callers that bypass the prologue stamping: compose live.
-                    _composed = compose_user_api_content(
+                    # MoA and post-compaction rows have no complete sidecar.
+                    # Rebuild from the clean/merged content and the same staged
+                    # per-turn publication note before adding live context.
+                    _wire_base = compose_file_delivery_wire(
                         api_msg.get("content", ""),
+                        getattr(agent, "_turn_pantheon_file_delivery", "") or "",
+                    )
+                    _composed = compose_user_api_content(
+                        _wire_base,
                         _ext_prefetch_cache,
                         _plugin_user_context,
                     )
                     if _composed is not None:
                         wire = _composed
                     else:
-                        wire = api_msg.get("content")
+                        wire = _wire_base
+                    # A rewritten ordinary user row needs a fresh complete
+                    # sidecar for exact replay. MoA adds per-call guidance
+                    # below and must never persist this as exact wire state.
+                    if (
+                        not moa_config
+                        and isinstance(wire, str)
+                        and wire != msg.get("content")
+                    ):
+                        msg["api_content"] = wire
                     if isinstance(wire, list):
                         _turn_clock = getattr(agent, "_turn_prompt_clock", "") or ""
                         if _turn_clock:
                             wire = append_prompt_clock_to_multimodal_api_content(
                                 wire, _turn_clock
                             )
-                        _turn_file_delivery = (
-                            getattr(agent, "_turn_pantheon_file_delivery", "") or ""
-                        )
-                        if _turn_file_delivery:
-                            wire = append_prompt_clock_to_multimodal_api_content(
-                                wire, _turn_file_delivery
+                # Compaction can persist a surviving user row with no
+                # sidecar even when its complete live sidecar survived.
+                # Backfill both reuse and rebuild paths before final flush
+                # identity-skips the already-persisted compacted rows.
+                if (
+                    not moa_config
+                    and isinstance(wire, str)
+                    and isinstance(msg.get("api_content"), str)
+                    and pending_user_sidecar_backfill
+                ):
+                    pending_user_sidecar_backfill = False
+                    _db = getattr(agent, "_session_db", None)
+                    if _db is not None:
+                        try:
+                            _updated = _db.set_latest_user_api_content(
+                                agent.session_id, msg.get("content"), wire,
+                                row_id=msg.get("_row_id"),
+                            )
+                            _override = getattr(agent, "_persist_user_message_override", None)
+                            if (
+                                not _updated
+                                and _override is not None
+                                and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                            ):
+                                _updated = _db.set_latest_user_api_content(
+                                    agent.session_id, _override, wire,
+                                    row_id=msg.get("_row_id"),
+                                )
+                            if not _updated:
+                                logger.warning(
+                                    "post-compaction api_content backfill skipped: "
+                                    "current user row changed for session=%s",
+                                    agent.session_id or "none",
+                                )
+                        except Exception:
+                            logger.warning(
+                                "post-compaction api_content backfill failed "
+                                "for session=%s", agent.session_id or "none",
+                                exc_info=True,
                             )
                 api_msg["content"] = apply_send_time_user_injections(
                     wire,
@@ -3231,6 +3300,15 @@ def run_conversation(
                         final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                     _turn_exit_reason = "compaction_handoff_not_actionable"
                     break
+                # Compaction can replace/merge rows and drop api_content.
+                # Re-anchor after the handoff guard (which may restore the
+                # real ask), so the next projection rebuilds this turn's
+                # publication/recall/plugin context on the correct user row.
+                current_turn_user_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
+                )
+                agent._persist_user_message_idx = current_turn_user_idx
+                pending_user_sidecar_backfill = True
                 continue
         elif _provider_overflow_preflight and _compression_cooldown:
             # The provider already proved this request cannot fit, while the
@@ -7398,6 +7476,7 @@ def run_conversation(
                 messages, user_message
             )
             agent._persist_user_message_idx = current_turn_user_idx
+            pending_user_sidecar_backfill = True
             continue
 
         if _retry.restart_with_rebuilt_messages:
@@ -8318,6 +8397,7 @@ def run_conversation(
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
+                        pending_user_sidecar_backfill = True
                         if _should_skip_model_call_for_reference_handoff(
                             messages, user_message
                         ):
@@ -8330,6 +8410,10 @@ def run_conversation(
                                 final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                             _turn_exit_reason = "compaction_handoff_not_actionable"
                             break
+                        current_turn_user_idx = reanchor_current_turn_user_idx(
+                            messages, user_message
+                        )
+                        agent._persist_user_message_idx = current_turn_user_idx
                 elif agent.compression_enabled:
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so

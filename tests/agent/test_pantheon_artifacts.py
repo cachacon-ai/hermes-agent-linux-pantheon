@@ -472,3 +472,28 @@ def test_file_delivery_hint_is_wire_only_and_stripped_from_history(runtime):
     )
     assert note in wire[-1]["text"]
     assert note not in multimodal["content"][0]["text"]
+
+
+@pytest.mark.parametrize("content", ["hello", "", [
+    {"type": "text", "text": "hello"},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+]])
+def test_file_delivery_wire_composer_preserves_clean_input(content):
+    from copy import deepcopy
+    from agent.pantheon_artifacts import compose_file_delivery_wire
+    original = deepcopy(content)
+    result = compose_file_delivery_wire(content, "PUBLICATION-NOTE")
+    assert content == original
+    if isinstance(content, list):
+        assert result is not content
+        assert result[:-1] == original
+        assert result[-1] == {"type": "text", "text": "PUBLICATION-NOTE"}
+    else:
+        assert result == content + ("\n\n" if content else "") + "PUBLICATION-NOTE"
+    assert compose_file_delivery_wire(content, "") == content
+
+
+def test_file_delivery_wire_composer_does_not_strip_user_text():
+    from agent.pantheon_artifacts import compose_file_delivery_wire
+    original = "Please explain [Pantheon file delivery: old quoted instructions.]"
+    assert compose_file_delivery_wire(original, "CURRENT-NOTE") == original + "\n\nCURRENT-NOTE"

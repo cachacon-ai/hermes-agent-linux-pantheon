@@ -430,13 +430,29 @@ def project_user_content_for_display(content: Any) -> Any:
     return content
 
 
+def compose_file_delivery_wire(content: Any, publication_note: str) -> Any:
+    """Append per-turn publication guidance to a fresh provider input.
+
+    Callers own the once-only boundary: use clean/rebuilt content, or reuse an
+    already-complete sidecar verbatim. Never inspect or strip user text to dedup.
+    Multimodal parts are preserved and the durable list is never mutated.
+    """
+    if not publication_note:
+        return content
+    if isinstance(content, str):
+        return content + ("\n\n" if content else "") + publication_note
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": publication_note}]
+    return content
+
+
 def stamp_file_delivery_wire(user_msg: dict, publication_note: str) -> None:
     """Put the publication hint on the API wire sidecar, not durable ``content``."""
     if not publication_note:
         return
     original = user_msg.get("content")
     if isinstance(original, str):
-        wire = original + ("\n\n" if original else "") + publication_note
+        wire = compose_file_delivery_wire(original, publication_note)
         user_msg["api_content"] = wire
         return
     if isinstance(original, list):

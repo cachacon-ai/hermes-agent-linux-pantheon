@@ -922,7 +922,7 @@ def build_turn_context(
     from agent.pantheon_artifacts import (
         enabled as artifact_delivery_enabled,
         prepare_turn_output,
-        stamp_file_delivery_wire,
+        compose_file_delivery_wire,
     )
     if artifact_delivery_enabled(agent):
         _publication_note = prepare_turn_output(agent)
@@ -930,11 +930,10 @@ def build_turn_context(
         if persist_user_message is None:
             persist_user_message = _publication_original
             agent._persist_user_message_override = _publication_original
-        if _publication_note:
-            if isinstance(user_msg.get("content"), list):
-                agent._turn_pantheon_file_delivery = _publication_note
-            else:
-                stamp_file_delivery_wire(user_msg, _publication_note)
+        # Independent of the sidecar: compaction intentionally discards stale
+        # API bytes when it merges a summary into the current message. Keep the
+        # turn's guidance available to compose against the rebuilt content.
+        agent._turn_pantheon_file_delivery = _publication_note
         user_message = user_msg.get("content")
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
@@ -1726,38 +1725,54 @@ def build_turn_context(
         and messages[current_turn_user_idx].get("role") == "user"
     ):
         _turn_user_msg = messages[current_turn_user_idx]
-        _wire_base = _turn_user_msg.get("content", "")
-        if isinstance(_turn_user_msg.get("api_content"), str):
-            _wire_base = _turn_user_msg["api_content"]
+        _wire_base = compose_file_delivery_wire(
+            _turn_user_msg.get("content", ""),
+            getattr(agent, "_turn_pantheon_file_delivery", ""),
+        )
         _api_content = compose_user_api_content(
             _wire_base,
             ext_prefetch_cache,
             plugin_user_context,
         )
+        if _api_content is None and isinstance(_wire_base, str):
+            _api_content = _wire_base
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
-            # In-place preflight compaction has ALREADY inserted this turn's
-            # user row (archive_and_compact runs before prefetch/pre_llm_call
-            # can compose the sidecar), and the crash persist below identity-
-            # skips every compacted dict (they are all in the rebound
-            # conversation_history) — so the stamp would never reach the DB.
-            # Backfill it onto the freshly-inserted row directly. Rotation
-            # mode needs nothing here: its compacted copies flush to the
-            # child session after this stamp.
-            if _preflight_compressed and bool(
-                getattr(agent, "_last_compaction_in_place", False)
-            ):
+            # Both in-place and rotation compaction can commit these rows
+            # before prefetch/hooks compose their final API bytes. The normal
+            # flush skips committed copies, so backfill their exact sidecar.
+            # The run-level flag covers in-place; rotation stamps its newly
+            # committed child rows with the persistence marker.
+            if (bool(getattr(agent, "_last_compaction_in_place", False))
+                    or _turn_user_msg.get("_db_persisted")):
                 _db = getattr(agent, "_session_db", None)
                 if _db is not None:
                     try:
-                        _db.set_latest_user_api_content(
+                        _updated = _db.set_latest_user_api_content(
                             agent.session_id,
                             _turn_user_msg.get("content"),
                             _api_content,
+                            row_id=_turn_user_msg.get("_row_id"),
                         )
+                        if not _updated:
+                            from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
+
+                            _override = getattr(agent, "_persist_user_message_override", None)
+                            if (_override is not None
+                                    and not _turn_user_msg.get(COMPRESSED_SUMMARY_METADATA_KEY)):
+                                _updated = _db.set_latest_user_api_content(
+                                    agent.session_id, _override, _api_content,
+                                    row_id=_turn_user_msg.get("_row_id"),
+                                )
+                            if not _updated:
+                                logger.warning(
+                                    "compaction api_content backfill skipped: "
+                                    "current user row changed for session=%s",
+                                    agent.session_id or "none",
+                                )
                     except Exception:
                         logger.warning(
-                            "in-place compaction api_content backfill failed "
+                            "compaction api_content backfill failed "
                             "for session=%s",
                             agent.session_id or "none",
                             exc_info=True,
