@@ -638,7 +638,7 @@ class TestPrologueMoaAndInPlaceBackfill:
         assert msg["content"] == "hello"
         assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
         agent._session_db.set_latest_user_api_content.assert_called_once_with(
-            "sess-1", "hello", "hello\n\nPLUGIN-CTX"
+            "sess-1", "hello", "hello\n\nPLUGIN-CTX", row_id=None
         )
 
 

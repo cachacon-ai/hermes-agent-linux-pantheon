@@ -13626,7 +13626,8 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         return cols
 
     def set_latest_user_api_content(
-        self, session_id: str, content: Any, api_content: str
+        self, session_id: str, content: Any, api_content: str,
+        *, row_id: Optional[int] = None,
     ) -> int:
         """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row.
 
@@ -13637,14 +13638,28 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         never land in the DB and any reload would replay clean content,
         re-introducing the prompt-cache divergence the sidecar exists to close.
 
-        The ``content`` match is a defensive guard: if the newest active user
-        row is not the message the caller stamped (racing rewrite, unexpected
-        tail shape), nothing is written. Returns the number of rows updated
-        (0 or 1).
+        When ``row_id`` is supplied, target that exact active user row instead.
+        Compaction stamps fresh row identities; a synthetic todo user may be
+        newer than the actual request. A supplied identity never falls back to
+        another row. Session, role, active state and content must all match.
+        Without an identity, retain the legacy newest-user/content guard.
+        Returns the number of rows updated (0 or 1).
         """
+        if row_id is not None and (
+            isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0
+        ):
+            raise ValueError("row_id must be a positive integer")
         encoded = self._encode_content(content)
 
         def _do(conn):
+            if row_id is not None:
+                cursor = conn.execute(
+                    "UPDATE messages SET api_content = ? "
+                    "WHERE id = ? AND session_id = ? AND role = 'user' "
+                    "AND active = 1 AND content IS ?",
+                    (_scrub_surrogates(api_content), row_id, session_id, encoded),
+                )
+                return cursor.rowcount
             cursor = conn.execute(
                 "UPDATE messages SET api_content = ? WHERE id = ("
                 "SELECT id FROM messages "
