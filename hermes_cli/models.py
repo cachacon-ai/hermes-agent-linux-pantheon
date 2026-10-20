@@ -437,6 +437,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2-0905-preview",
     ],
     "minimax": [
+        "MiniMax-M3.1-Flash",
         "MiniMax-M3",
         "MiniMax-M2.7",
         "MiniMax-M2.5",
@@ -444,6 +445,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2",
     ],
     "minimax-oauth": [
+        "MiniMax-M3.1-Flash",
         "MiniMax-M3",
         "MiniMax-M2.7",
         "MiniMax-M2.7-highspeed",
@@ -4571,6 +4573,11 @@ _KEYLESS_STABLE_CACHE_PROVIDERS = frozenset({"opencode-free"})
 # better than stalling every picker surface (CLI, TUI, dashboard, gateway).
 _PROVIDER_MODELS_STALE_SERVE_MAX = 7 * 24 * 3600  # 7d
 
+# These catalogs are static, so include their contents in the disk-cache
+# fingerprint. Otherwise an existing stale-while-revalidate entry can hide a
+# newly shipped model for up to the 7-day stale-serving window.
+_STATIC_CATALOG_FINGERPRINT_PROVIDERS = frozenset({"minimax", "minimax-oauth"})
+
 # Providers with a background SWR refresh currently in flight — dedupes
 # concurrent refreshes so repeated picker opens during one refresh don't
 # stack threads or duplicate network calls.
@@ -4667,6 +4674,13 @@ def _credential_fingerprint(provider: str) -> str:
     # expiry — matching how the live catalog genuinely changes.
     if (provider or "").strip().lower() in _KEYLESS_STABLE_CACHE_PROVIDERS:
         return "keyless:" + (provider or "").strip().lower()
+
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider in _STATIC_CATALOG_FINGERPRINT_PROVIDERS:
+        parts.append(
+            "static_catalog="
+            + json.dumps(_PROVIDER_MODELS.get(normalized_provider, []), separators=(",", ":"))
+        )
 
     # Env vars from PROVIDER_REGISTRY for this slug
     try:
@@ -7212,7 +7226,7 @@ def validate_requested_model(
 
     # MiniMax providers don't expose a /models endpoint — validate against
     # the static catalog instead, similar to openai-codex.
-    if normalized in {"minimax", "minimax-cn"}:
+    if normalized in {"minimax", "minimax-oauth", "minimax-cn"}:
         try:
             catalog_models = provider_model_ids(normalized)
         except Exception:
