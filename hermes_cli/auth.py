@@ -2559,6 +2559,16 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         ):
             return True
 
+    # MiniMax's browser login is stored by Hermes itself, even before the
+    # first pool load seeds its legacy "oauth" source. Recognize that intent
+    # independently of the currently selected provider. Keep suppression and
+    # profile precedence in the existing auth readers; do not refresh tokens
+    # here (configuration intent is separate from credential usability).
+    if normalized == "minimax-oauth" and not is_source_suppressed(normalized, "oauth"):
+        state = get_provider_auth_state(normalized)
+        if state and has_usable_secret(state.get("access_token", "")):
+            return True
+
     # 4. Check persisted credential-pool entries that came from EXPLICIT flows
     # the user initiated inside Hermes (manual add / device-code / PKCE), plus
     # env-backed pool entries. This intentionally excludes ambient borrowed
@@ -2569,6 +2579,14 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 continue
             source = str(entry.get("source") or "").strip().lower()
             if not source:
+                continue
+            # "oauth" is Hermes-owned for MiniMax, not a generic assurance
+            # that an OAuth credential was deliberately configured in Hermes.
+            if normalized == "minimax-oauth" and source == "oauth":
+                if not is_source_suppressed(normalized, source) and has_usable_secret(
+                    entry.get("access_token", "")
+                ):
+                    return True
                 continue
             if source.startswith("env:"):
                 # A stale env-seeded pool entry survives in auth.json after
