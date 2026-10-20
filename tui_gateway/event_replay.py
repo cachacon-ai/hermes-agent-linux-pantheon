@@ -18,11 +18,12 @@ Design constraints honored:
   the buffer must not reset the counter, or the next event for that session
   re-starts at seq 1 under the same epoch — a client holding a high watermark
   would filter the new event out as "already seen" and silently miss it.
-  Counters are therefore bounded separately (_REPLAY_COUNTERS_MAX, oldest
-  evicted FIFO). If a counter itself must be dropped, the numbering for that
-  session restarts — unavoidable at that point — so the epoch is rotated to
-  make the reset observable to clients (they compare the epoch and reset
-  their watermarks on mismatch).
+  Counters are therefore bounded separately (_REPLAY_COUNTERS_MAX, least
+  recently used evicted first — a session that is still emitting refreshes
+  its position on every stamp). If a counter itself must be dropped, the
+  numbering for that session restarts — unavoidable at that point — so the
+  epoch is rotated to make the reset observable to clients (they compare the
+  epoch and reset their watermarks on mismatch).
 """
 
 from __future__ import annotations
@@ -59,8 +60,11 @@ _replay_lock = threading.Lock()
 # ``params`` dict (bare event: type/session_id/seq/payload) — the exact shape
 # the client's dispatch path consumes.
 _replay_buffers: "OrderedDict[str, deque]" = OrderedDict()
-# sid -> highest seq handed out so far. OrderedDict (insertion-ordered) so
-# the oldest counter can be evicted FIFO once _REPLAY_COUNTERS_MAX is hit.
+# sid -> highest seq handed out so far. OrderedDict, kept in LRU order (a
+# session is moved to the end on every stamp) so the least recently used
+# counter can be evicted once _REPLAY_COUNTERS_MAX is hit. First-seen order
+# would let a burst of brand-new session ids evict a long-lived session that
+# is still in use, restarting its numbering behind an epoch rotation.
 # Kept independent of _replay_buffers: a buffer eviction must not reset a
 # session's numbering.
 _replay_next_seq: "OrderedDict[str, int]" = OrderedDict()
@@ -79,7 +83,12 @@ def replay_epoch() -> str:
 
 
 def _bound_counters() -> None:
-    """Evict seq counters down to _REPLAY_COUNTERS_MAX, oldest first.
+    """Evict seq counters down to _REPLAY_COUNTERS_MAX, least recently used
+    first.
+
+    The ordering is LRU (see :data:`_replay_next_seq`): a session that keeps
+    emitting stays at the end of the map, so the counter dropped is the one
+    belonging to a session that has been quiet the longest.
 
     Dropping a counter means that session's numbering restarts at 1, which a
     client holding a high watermark cannot detect on its own. So the epoch is
@@ -118,6 +127,12 @@ def _stamp_event(obj: dict) -> None:
     with _replay_lock:
         seq = _replay_next_seq.get(sid, 0) + 1
         _replay_next_seq[sid] = seq
+        # LRU: re-stamping an existing sid must refresh its position, or a
+        # long-lived session (among the first ids ever seen) would be evicted
+        # by a burst of new ids while still in use — restarting its numbering
+        # behind an epoch rotation. move_to_end is a no-op for a fresh sid
+        # (already inserted at the end) and O(1) for an existing one.
+        _replay_next_seq.move_to_end(sid)
         params["seq"] = seq
         buf = _replay_buffers.get(sid)
         if buf is None:
@@ -140,11 +155,16 @@ def events_since(sid: str, last_seen: int) -> list[dict]:
     exactly what the client's dispatch path consumes. Returning the full
     JSON-RPC envelope here would make every replayed event fail the client's
     ``event.type`` gate and be silently dropped.
+
+    A negative ``last_seen`` is treated as 0 ("the client has seen nothing").
+    It is a malformed watermark, not a request for events before the epoch.
     """
     with _replay_lock:
         buf = _replay_buffers.get(sid or "")
         if not buf:
             return []
+        if last_seen < 0:
+            last_seen = 0
         return [event for seq, event in buf if seq > last_seen]
 
 
@@ -160,9 +180,16 @@ def is_truncated(sid: str, last_seen: int) -> bool:
       everything the client has not seen is gone. The seq counter survives
       the buffer eviction, so ``last_seen < latest_seq`` is the tell: the
       client is behind, and its replay window no longer exists.
+
+    A negative ``last_seen`` is treated as 0 ("the client has seen nothing").
+    Otherwise a malformed watermark reads as "the client is behind" for an
+    unknown session (``-1 < 0``) and reports truncation for a session that
+    never lost an event.
     """
     with _replay_lock:
         sid = sid or ""
+        if last_seen < 0:
+            last_seen = 0
         buf = _replay_buffers.get(sid)
         if not buf:
             # No buffer: either the session is unknown (nothing was ever

@@ -108,6 +108,10 @@ def test_session_count_bounded_with_fifo_eviction():
     stats = replay_stats()
     assert stats["sessions"] == event_replay._REPLAY_SESSIONS_MAX
     assert events_since("s0", 0) == []  # oldest session fully evicted
+    # The counter survived the buffer eviction, so the client behind it must
+    # be told it missed events — empty replay AND truncated=true.
+    assert latest_seq("s0") > 0
+    assert event_replay.is_truncated("s0", 0) is True
     assert latest_seq(f"s{event_replay._REPLAY_SESSIONS_MAX + 9}") == 1
 
 
@@ -216,6 +220,58 @@ def test_counters_are_bounded(monkeypatch):
     # Newest sessions keep their numbering; the oldest ones are dropped.
     assert latest_seq("s19") == 1
     assert latest_seq("s0") == 0
+
+
+def test_counter_eviction_is_lru_not_first_seen(monkeypatch):
+    """Re-stamping a session must refresh its position in the counter table.
+
+    The counter table is capped at _REPLAY_COUNTERS_MAX. With first-seen
+    ordering, a long-lived session (seen early, still emitting) gets evicted
+    by a burst of brand-new ids, and its numbering restarts behind an epoch
+    rotation. LRU keeps the counter of the session that is actually in use.
+    """
+    monkeypatch.setattr(event_replay, "_REPLAY_COUNTERS_MAX", 3)
+
+    event_replay._stamp_event(_frame("s1"))
+    event_replay._stamp_event(_frame("s2"))
+    event_replay._stamp_event(_frame("s3"))
+    # s1 emits again → it is the most recently used counter now.
+    event_replay._stamp_event(_frame("s1"))
+    assert latest_seq("s1") == 2
+
+    # A new id pushes the table over the cap → the LRU counter (s2) goes.
+    event_replay._stamp_event(_frame("s4"))
+
+    assert latest_seq("s2") == 0  # evicted: least recently used
+    assert latest_seq("s1") == 2  # survived: re-stamped, so recently used
+    assert latest_seq("s3") == 1
+    assert latest_seq("s4") == 1
+
+
+def test_negative_last_seen_is_treated_as_zero():
+    """A malformed negative watermark must not fake a truncation.
+
+    ``last_seen < 0`` used to read as "the client is behind" for an unknown
+    session (``-1 < 0``), so a garbage watermark produced truncated=true with
+    an empty replay and the client refetched history for a session that never
+    lost an event. Negative means "I have seen nothing" — exactly what 0 says.
+    """
+    # Unknown session: nothing was ever evicted → not truncated.
+    assert event_replay.is_truncated("nope", -1) is False
+    assert events_since("nope", -1) == []
+
+    # Known session whose buffer starts at seq 1: the client gets every
+    # event, so nothing is missing even with a garbage watermark.
+    event_replay._stamp_event(_frame("s1"))
+    assert event_replay.is_truncated("s1", -1) is False
+    assert [e["seq"] for e in events_since("s1", -1)] == [1]
+
+    # Evicted session: the client still missed seq 1 → truncated.
+    for i in range(event_replay._REPLAY_SESSIONS_MAX + 2):
+        event_replay._stamp_event(_frame(f"filler{i}"))
+
+    assert "s1" not in event_replay._replay_buffers  # buffer evicted
+    assert event_replay.is_truncated("s1", -1) is True
 
 
 def test_concurrent_stamping_never_drops_or_duplicates_seq():
