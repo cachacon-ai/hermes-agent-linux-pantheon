@@ -17,8 +17,13 @@ def test_real_prompt_submit_emits_exact_identity_and_canonical_reply_text(
     result = _finalize(agent, _turn())
     agent.run_conversation = lambda *_a, **_kw: result
     frames = []
-    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None:
-                        frames.append(server._event_frame(event, sid, payload)))
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None, **kwargs: frames.append(
+            server._event_frame(event, sid, payload, **kwargs)
+        ),
+    )
 
     server._run_prompt_submit("request", "runtime-session", _session(agent), "question")
 

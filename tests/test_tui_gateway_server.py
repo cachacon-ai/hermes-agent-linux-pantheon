@@ -457,7 +457,7 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
     )
     server._sessions["iso-sid"] = session
     emitted = []
-    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload)))
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None, **kwargs: emitted.append((event, sid, payload)))
 
     try:
         server._on_compute_host_turn_done(
@@ -728,7 +728,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
 
     def run_flag_off():
         events = []
-        monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: events.append((event, sid, payload)))
+        monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None, **kwargs: events.append((event, sid, payload)))
         monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": False}})
         server._sessions["sid"] = _session(
             agent=_Agent(), model_override={"model": "gold-model", "provider": "gold-provider"}
@@ -744,7 +744,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
 
     def run_flag_on():
         events = []
-        monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: events.append((event, sid, payload)))
+        monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None, **kwargs: events.append((event, sid, payload)))
         monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
 
         class _FakeSupervisor:
@@ -1228,7 +1228,7 @@ def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
     # …) silently drops every live tick on the client side.
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append((event_type, sid, payload))
     )
     snapshot = {"input": 1200, "total": 1280}
     monkeypatch.setattr(server, "_get_usage", lambda agent: dict(snapshot))
@@ -1259,7 +1259,7 @@ def test_usage_ticker_skips_unchanged_snapshots(monkeypatch):
     # Only a changed snapshot emits.
     events: list[dict] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append(payload)
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append(payload)
     )
     snapshot = {"input": 1200, "total": 1280}
     monkeypatch.setattr(server, "_get_usage", lambda agent: dict(snapshot))
@@ -1289,7 +1289,7 @@ def test_usage_ticker_baseline_sampled_before_thread_start(monkeypatch):
     that first growth so it never emits."""
     events: list[dict] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append(payload)
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append(payload)
     )
     snapshot = {"input": 1200, "total": 1280}
     monkeypatch.setattr(server, "_get_usage", lambda agent: dict(snapshot))
@@ -1324,7 +1324,7 @@ def test_usage_ticker_stop_join_prevents_late_ticks(monkeypatch):
     payload.usage unconditionally)."""
     events: list[str] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append(event_type)
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append(event_type)
     )
 
     in_snapshot = threading.Event()
@@ -1366,7 +1366,7 @@ def test_run_prompt_submit_never_ticks_after_message_complete(monkeypatch):
     events: list[str] = []
     tick_seen = threading.Event()
 
-    def _record_emit(event_type, sid, payload=None):
+    def _record_emit(event_type, sid, payload=None, **kwargs):
         events.append(event_type)
         if event_type == "session.usage":
             tick_seen.set()
@@ -1431,7 +1431,7 @@ def test_usage_ticker_unbounded_join_waits_out_blocked_emit(monkeypatch):
     in_emit = threading.Event()
     release = threading.Event()
 
-    def _stalled_emit(event_type, sid, payload):
+    def _stalled_emit(event_type, sid, payload, **kwargs):
         in_emit.set()
         release.wait(10.0)  # the stalled transport write
         order.append(event_type)
@@ -1501,7 +1501,7 @@ def test_run_prompt_submit_joins_ticker_without_timeout(monkeypatch):
 
     monkeypatch.setattr(server, "_start_usage_ticker", _spying_ticker)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_emit", lambda event_type, sid, payload=None: None)
+    monkeypatch.setattr(server, "_emit", lambda event_type, sid, payload=None, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
@@ -1577,7 +1577,7 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
 
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append((event_type, sid, payload))
     )
     monkeypatch.setitem(
         server._sessions,
@@ -1597,7 +1597,7 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
 def test_tui_tool_output_risk_event_exposes_metadata_without_raw_output(monkeypatch):
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append((event_type, sid, payload))
     )
     monkeypatch.setitem(
         server._sessions,
@@ -1634,7 +1634,7 @@ def test_tui_tool_output_risk_event_exposes_metadata_without_raw_output(monkeypa
 def test_tui_clarify_lifecycle_events_emit_when_tool_progress_off(monkeypatch):
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append((event_type, sid, payload))
     )
     monkeypatch.setitem(
         server._sessions,
@@ -1657,7 +1657,7 @@ def test_tui_clarify_lifecycle_events_emit_when_tool_progress_off(monkeypatch):
 def test_tui_non_interactive_tool_lifecycle_stays_hidden_when_tool_progress_off(monkeypatch):
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append((event_type, sid, payload))
     )
     monkeypatch.setitem(
         server._sessions,
@@ -1970,7 +1970,7 @@ def test_prompt_submit_typed_stop_phrase_ends_voice_chat(monkeypatch):
     calls = {"stop_continuous": 0}
     emitted = []
     monkeypatch.setattr(
-        server, "_emit", lambda event, sid, payload=None: emitted.append((event, payload))
+        server, "_emit", lambda event, sid, payload=None, **kwargs: emitted.append((event, payload))
     )
     monkeypatch.setitem(
         sys.modules,
@@ -2870,7 +2870,7 @@ def test_tool_start_ships_full_args(monkeypatch):
     # every client, so tool.start does too. There is no per-client gate.
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+        server, "_emit", lambda event_type, sid, payload, **kwargs: events.append((event_type, sid, payload))
     )
     long_command = "echo " + "y" * 200
     monkeypatch.setitem(
@@ -6962,7 +6962,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
 
         resp = server.handle_request(
@@ -7953,7 +7953,7 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
     emitted = []
     server._sessions["sid"] = _session(pending_title="stale")
     monkeypatch.setattr(server, "_get_db", lambda: db)
-    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
     try:
         resp = server.handle_request(
             {
@@ -8349,7 +8349,7 @@ def test_config_set_approval_mode_persists_three_way_value_and_emits_live_status
     # tools.approval resolver (load_config → env HERMES_HOME).
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     emitted = []
-    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
     server._sessions["sid"] = {"agent": object(), "session_key": "profile-session"}
 
     try:
@@ -8505,7 +8505,7 @@ def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):
         server, "_write_config_key", lambda path, value: writes.append((path, value))
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
-    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emits.append(args))
     monkeypatch.setattr(
         "hermes_cli.models.resolve_fast_mode_overrides",
         lambda _model_id, **_route: {"service_tier": "priority"},
@@ -8556,7 +8556,7 @@ def test_config_set_fast_status_is_non_mutating(monkeypatch):
     monkeypatch.setattr(
         server, "_write_config_key", lambda path, value: writes.append((path, value))
     )
-    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emits.append(args))
 
     try:
         resp = server.handle_request(
@@ -10378,7 +10378,7 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
     monkeypatch.setattr(
         server, "_session_info", lambda agent, *a: {"model": getattr(agent, "model", "?")}
     )
-    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emits.append(args))
     # Persistence now flows through the single owner (hermes_cli.personality),
     # never _write_config_key / agent.system_prompt.
     import hermes_cli.personality as personality_mod
@@ -12336,7 +12336,7 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: emits.append(a))
 
         resp = server.handle_request(
             {
@@ -12441,7 +12441,7 @@ def test_prompt_submit_merges_on_model_switch_marker(monkeypatch):
             monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
             monkeypatch.setattr(server, "_get_usage", lambda _a: {})
             monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-            monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+            monkeypatch.setattr(server, "_emit", lambda *a, **kw: emits.append(a))
 
             resp = server.handle_request(
                 {
@@ -12532,7 +12532,7 @@ def test_prompt_submit_merges_on_personality_pivot_marker(monkeypatch):
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
-        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: emits.append(a))
 
         resp = server.handle_request(
             {
@@ -12597,7 +12597,7 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda *a, **k: None)
@@ -12638,7 +12638,7 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: emits.append(a))
 
         resp = server.handle_request(
             {
@@ -12701,7 +12701,7 @@ def test_prompt_submit_snapshots_history_after_pending_model_switch(monkeypatch)
         monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda *_a: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: emits.append(a))
 
         server.handle_request(
             {"id": "1", "method": "prompt.submit", "params": {"session_id": "sid", "text": "hi"}}
@@ -12773,7 +12773,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
 
         resp = server.handle_request(
@@ -12942,7 +12942,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
 
         # ordinal=1 means "truncate before the 2nd-from-last real user turn"
@@ -13053,7 +13053,7 @@ def test_prompt_submit_truncate_translates_display_prefix_ordinal(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
 
         resp = server.handle_request(
@@ -14171,7 +14171,7 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
     monkeypatch.setattr(server, "_compress_session_history", _fake_compress)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", _fake_sync)
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
-    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
 
     session = _session(running=False)
     session["history"] = [
@@ -14300,7 +14300,7 @@ def test_session_compress_rpc_honors_here_argument(monkeypatch):
 
     monkeypatch.setattr(server, "_session_info", lambda *_a, **_kw: {"model": "x"})
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **kw: None)
-    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
     try:
         resp = server.handle_request(
@@ -14332,7 +14332,7 @@ def test_command_dispatch_compress_honors_here_argument(monkeypatch):
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a, **_kw: False)
     monkeypatch.setattr(server, "_session_info", lambda *_a, **_kw: {"model": "x"})
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **kw: None)
-    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
     try:
         resp = server.handle_request(
@@ -14362,7 +14362,7 @@ def test_mirror_slash_compress_honors_here_argument(monkeypatch):
 
     monkeypatch.setattr(server, "_session_info", lambda *_a, **_kw: {"model": "x"})
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **kw: None)
-    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
     warning = server._mirror_slash_side_effects("sid", session, "/compress here 1")
 
@@ -16497,7 +16497,7 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     monkeypatch.setattr(
         server,
         "_emit",
-        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+        lambda event, sid, payload=None, **kwargs: emitted.append((event, sid, payload or {})),
     )
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -16540,7 +16540,7 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     monkeypatch.setattr(
         server,
         "_emit",
-        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+        lambda event, sid, payload=None, **kwargs: emitted.append((event, sid, payload or {})),
     )
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -16709,7 +16709,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
 
-    def _emit(event, sid, payload=None):
+    def _emit(event, sid, payload=None, **kwargs):
         if event == "message.complete":
             done.set()
 
@@ -19352,7 +19352,7 @@ def test_reset_session_agent_clears_session_overrides(monkeypatch):
     monkeypatch.setattr(server, "_load_show_reasoning", lambda: True)
     monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
     monkeypatch.setattr(server, "_session_info", lambda *_args: {})
-    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
 
     server._reset_session_agent("sid", session)
@@ -21192,7 +21192,7 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
 
         resp = server.handle_request(
             {
@@ -21257,7 +21257,7 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: object())
         monkeypatch.setattr(
             server,
@@ -21635,7 +21635,7 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
 
     try:
         monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
 
         # Real production injection point — not a hand-written marker dict.
         server._apply_personality_to_session(
@@ -21755,7 +21755,7 @@ def test_prompt_submit_truncation_archives_instead_of_deleting(monkeypatch):
     try:
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_get_db", lambda: _StubDb())

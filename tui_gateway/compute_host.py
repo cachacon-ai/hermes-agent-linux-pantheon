@@ -602,6 +602,8 @@ class ComputeHost:
                 clock_context=clock_context,
                 voice_live_turn=voice_live_turn,
                 client_surface=client_surface,
+                submission_id=frame.get("submission_id"),
+                source_submission_id=frame.get("source_submission_id"),
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

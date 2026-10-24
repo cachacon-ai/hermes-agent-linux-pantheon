@@ -31,6 +31,52 @@ def _session(agent=None, **extra):
     }
 
 
+def test_run_event_context_adds_top_level_correlation_only_for_its_session(monkeypatch):
+    frames = []
+    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
+    token = server._current_run_event_correlation.set((
+        "sid-a",
+        {
+            "run_id": "run-a",
+            "submission_id": "submission-a",
+            "source_submission_id": "source-a",
+        },
+    ))
+    try:
+        server._emit("todo.updated", "sid-a", {"revision": 1})
+        server._emit("todo.updated", "sid-b", {"revision": 2})
+    finally:
+        server._current_run_event_correlation.reset(token)
+
+    assert frames[0]["params"]["run_id"] == "run-a"
+    assert frames[0]["params"]["submission_id"] == "submission-a"
+    assert frames[0]["params"]["source_submission_id"] == "source-a"
+    assert "run_id" not in frames[1]["params"]
+    assert "submission_id" not in frames[1]["params"]
+
+
+def test_prestart_failure_keeps_submission_without_claiming_a_run(monkeypatch):
+    frames = []
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload, **ids: frames.append((event, ids)))
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(server, "render_message", lambda *_args: "rendered")
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args: None)
+
+    session = _session()
+    server._start_inflight_turn(session, "accepted prompt", "submission-1", "source-1")
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot["submission_id"] == "submission-1"
+    assert snapshot["source_submission_id"] == "source-1"
+    assert "run_id" not in snapshot, "agent readiness has not crossed the execution boundary"
+
+    server._emit_terminal_turn_error("sid", session, RuntimeError("agent failed"), retire_marker=False)
+
+    assert frames == [(
+        "message.complete",
+        {"submission_id": "submission-1", "source_submission_id": "source-1"},
+    )]
+
+
 # ── _enqueue_prompt ────────────────────────────────────────────────────────
 
 def test_enqueue_pins_text_and_transport():
@@ -355,6 +401,202 @@ def test_busy_steer_mode_injects_when_accepted(monkeypatch):
 
     assert resp["result"]["status"] == "steered"
     assert session.get("queued_prompt") is None
+
+
+def test_correlated_steer_and_redirect_emit_run_link_with_active_run_ids(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload, **ids: emitted.append((event, sid, payload, ids)))
+
+    cases = [
+        ("steer", "steered", types.SimpleNamespace(steer=lambda _text: True)),
+        (
+            "interrupt",
+            "redirected",
+            types.SimpleNamespace(
+                _supports_active_turn_redirect=True,
+                redirect=lambda _text: True,
+            ),
+        ),
+    ]
+    for index, (mode, relation, agent) in enumerate(cases, start=1):
+        monkeypatch.setattr(server, "_load_busy_input_mode", lambda mode=mode: mode)
+        session = _session(agent=agent, running=True)
+        session["inflight_turn"] = {
+            "user": "first request",
+            "run_id": f"run-{index}",
+            "submission_id": f"run-{index}",
+            "source_submission_id": f"source-{index}",
+        }
+        response = server._handle_busy_submit(
+            f"r{index}", "sid", session, "correction", "ws-1",
+            submission_id=f"correction-{index}",
+            source_submission_id=f"correction-{index}",
+        )
+
+        assert response["result"]["status"] == relation
+        assert response["result"]["run_link_emitted"] is True
+        event, sid, payload, ids = emitted[-1]
+        assert (event, sid, payload) == ("run.link", "sid", {"relation": relation})
+        assert ids == {
+            "run_id": f"run-{index}",
+            "submission_id": f"correction-{index}",
+            "source_submission_id": f"correction-{index}",
+        }
+        assert not any(frame[0] == "message.start" for frame in emitted)
+
+
+def test_submit_during_terminal_teardown_queues_source_without_phantom_run(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    emitted = []
+    dispatched = []
+    agent = types.SimpleNamespace(
+        steer=lambda _text: (_ for _ in ()).throw(AssertionError("terminal run cannot accept a steer")),
+        interrupt=lambda: (_ for _ in ()).throw(AssertionError("terminal run should not be interrupted")),
+    )
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload, **ids: emitted.append((event, ids)))
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda rid, sid, session, text, **kwargs: dispatched.append((text, kwargs)))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    session = _session(agent=agent, running=True)
+    session["inflight_turn"] = {
+        "user": "first request",
+        "run_id": "run-1",
+        "submission_id": "run-1",
+        "source_submission_id": "source-1",
+        "terminal_emitted": True,
+    }
+
+    response = server._handle_busy_submit(
+        "r1", "sid", session, "next request", "ws-1",
+        submission_id="next-submission",
+        source_submission_id="next-submission",
+    )
+    assert response["result"]["status"] == "queued"
+    assert session["queued_prompt"]["submission_id"] == "next-submission"
+    assert session["queued_prompt"]["source_submission_id"] == "next-submission"
+    assert emitted == [], "a teardown-window send has no run.link or message.start"
+
+    session["running"] = False
+    assert server._drain_queued_prompt("drain", "sid", session) is True
+    assert dispatched[0][0] == "next request"
+    assert dispatched[0][1]["submission_id"] == "next-submission"
+    assert dispatched[0][1]["source_submission_id"] == "next-submission"
+
+
+def test_compute_host_terminal_relay_serializes_against_concurrent_busy_submit(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    frames = []
+    emitted = []
+    relay_entered = threading.Event()
+    release_relay = threading.Event()
+    submit_started = threading.Event()
+    submit_done = threading.Event()
+    results = []
+    errors = []
+    agent = types.SimpleNamespace(
+        steer=lambda _text: (_ for _ in ()).throw(AssertionError("terminal host run cannot be steered")),
+        interrupt=lambda: (_ for _ in ()).throw(AssertionError("terminal host run should not be interrupted")),
+    )
+    session = _session(agent=agent, running=True)
+    session["inflight_turn"] = {
+        "user": "host request",
+        "run_id": "host-run",
+        "submission_id": "host-run",
+        "source_submission_id": "host-source",
+    }
+    monkeypatch.setitem(server._sessions, "host-sid", session)
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload, **ids: emitted.append((event, sid, payload, ids)))
+
+    def blocked_write(frame):
+        relay_entered.set()
+        if not release_relay.wait(2):
+            raise AssertionError("test did not release terminal relay")
+        frames.append(frame)
+        return True
+
+    monkeypatch.setattr(server, "write_json", blocked_write)
+    terminal = {
+        "method": "event",
+        "params": {
+            "type": "message.complete",
+            "session_id": "host-sid",
+            "run_id": "host-run",
+            "submission_id": "host-run",
+            "source_submission_id": "host-source",
+            "payload": {"text": "Done"},
+        },
+    }
+
+    def relay():
+        try:
+            results.append(server._relay_compute_host_rpc(terminal))
+        except Exception as exc:  # surface worker-thread failures in the test thread
+            errors.append(exc)
+
+    def submit():
+        submit_started.set()
+        try:
+            results.append(server._handle_busy_submit(
+                "request-id", "host-sid", session, "follow-up", "ws-1",
+                submission_id="follow-up-submission",
+                source_submission_id="follow-up-submission",
+            ))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            submit_done.set()
+
+    relay_thread = threading.Thread(target=relay, daemon=True)
+    submit_thread = threading.Thread(target=submit, daemon=True)
+    relay_thread.start()
+    try:
+        assert relay_entered.wait(1), "terminal relay did not reach its forwarding boundary"
+        assert session["inflight_turn"]["terminal_emitted"] is True
+        submit_thread.start()
+        assert submit_started.wait(1)
+        assert not submit_done.wait(0.05), "busy submit must wait for terminal forwarding to commit"
+    finally:
+        release_relay.set()
+        relay_thread.join(2)
+        if submit_thread.ident is not None:
+            submit_thread.join(2)
+
+    assert not relay_thread.is_alive()
+    assert not submit_thread.is_alive()
+    assert errors == []
+    assert len(frames) == 1 and frames[0] == terminal
+    response = next(result for result in results if isinstance(result, dict) and result.get("result", {}).get("status"))
+    assert response["result"]["status"] == "queued"
+    assert session["queued_prompt"]["submission_id"] == "follow-up-submission"
+    assert session["queued_prompt"]["source_submission_id"] == "follow-up-submission"
+    assert emitted == [], "a terminal host run cannot receive a phantom run.link"
+
+
+def test_correlated_queued_prompts_keep_distinct_ids_and_drain_fifo(monkeypatch):
+    dispatched = []
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda rid, sid, session, text, **kwargs: dispatched.append((text, kwargs)),
+    )
+    session = _session(running=True)
+    session["inflight_turn"] = {"user": "active"}
+    server._enqueue_prompt(session, "queued one", "ws-1", submission_id="sub-1", source_submission_id="source-room")
+    server._enqueue_prompt(session, "queued two", "ws-1", submission_id="sub-2", source_submission_id="source-room")
+
+    assert session["queued_prompt"]["text"] == "queued one"
+    assert session["queued_prompts"][0]["text"] == "queued two"
+    assert session["queued_prompt"]["submission_id"] == "sub-1"
+    assert session["queued_prompts"][0]["submission_id"] == "sub-2"
+
+    session["running"] = False
+    assert server._drain_queued_prompt("drain-1", "sid", session) is True
+    session["running"] = False
+    assert server._drain_queued_prompt("drain-2", "sid", session) is True
+    assert [(text, kwargs["submission_id"], kwargs["source_submission_id"]) for text, kwargs in dispatched] == [
+        ("queued one", "sub-1", "source-room"),
+        ("queued two", "sub-2", "source-room"),
+    ]
 
 
 # ── steer-mode burst preservation (#86134) ─────────────────────────────────
