@@ -489,7 +489,7 @@ def test_prompt_row_id_rewind_preserves_scaffold_before_regeneration(
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
     monkeypatch.setattr(server, "render_message", lambda *_args: "")
-    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
 
     response = server._methods["prompt.submit"](
         "request-id",

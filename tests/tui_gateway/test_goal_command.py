@@ -123,7 +123,7 @@ def turn_env(server, monkeypatch, tmp_path):
     monkeypatch.setattr(
         server,
         "_emit",
-        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+        lambda event, sid, payload=None, **kwargs: emitted.append((event, sid, payload)),
     )
     monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
     monkeypatch.setattr(
