@@ -56,6 +56,13 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
+# Correlation is scoped to the worker thread that owns one execution. The
+# prompt.submit RPC dispatcher returns before that worker streams; ContextVars
+# are deliberately rebound in the worker rather than copied from the caller.
+_current_run_event_correlation: contextvars.ContextVar[tuple[str, dict] | None] = contextvars.ContextVar(
+    "tui_run_event_correlation", default=None
+)
+
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
@@ -2607,8 +2614,22 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
-def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
+def _event_frame(
+    event: str,
+    sid: str,
+    payload: dict | None = None,
+    *,
+    run_id: str | None = None,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
+) -> dict:
     params: dict = {"type": event, "session_id": sid}
+    if run_id:
+        params["run_id"] = run_id
+    if submission_id:
+        params["submission_id"] = submission_id
+    if source_submission_id:
+        params["source_submission_id"] = source_submission_id
     if event == "message.complete":
         # Explicit capability even for error/unsaved/synthetic completions:
         # absence of row_id is authoritative, not an old-server ambiguity.
@@ -2618,8 +2639,28 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
-    write_json(_event_frame(event, sid, payload))
+def _emit(
+    event: str,
+    sid: str,
+    payload: dict | None = None,
+    *,
+    run_id: str | None = None,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
+):
+    if run_id is None and submission_id is None and source_submission_id is None:
+        bound = _current_run_event_correlation.get()
+        if bound is not None and bound[0] == sid:
+            correlation = bound[1]
+            run_id = correlation.get("run_id")
+            submission_id = correlation.get("submission_id")
+            source_submission_id = correlation.get("source_submission_id")
+    write_json(_event_frame(
+        event, sid, payload,
+        run_id=run_id,
+        submission_id=submission_id,
+        source_submission_id=source_submission_id,
+    ))
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -2725,6 +2766,8 @@ def _compute_host_turn_frame(
     clock_context: str | None = None,
     voice_live_turn: dict | None = None,
     client_surface: str | None = None,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2753,6 +2796,8 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        **({"submission_id": submission_id} if submission_id else {}),
+        **({"source_submission_id": source_submission_id or submission_id} if submission_id else {}),
     }
     if clock_context:
         frame["clock_context"] = clock_context
@@ -2777,7 +2822,21 @@ def _metadata_mirror(session: dict | None) -> dict:
 def _relay_compute_host_rpc(message: dict) -> bool:
     """Relay host events while retaining the clarify snapshot needed on resume."""
     params = message.get("params") if isinstance(message, dict) else None
-    if isinstance(params, dict) and params.get("type") == "clarify.request":
+    if isinstance(params, dict) and params.get("type") == "message.complete":
+        # The host streams its terminal event before its turn-done callback
+        # clears the parent session. Publish that terminal state under the same
+        # lock used by busy steering so a submit serialized after this frame is
+        # queued instead of being linked to a run that already completed.
+        sid = str(params.get("session_id") or "")
+        session = _sessions.get(sid)
+        if session is not None:
+            with _turn_event_lock(session):
+                with session.get("history_lock", threading.Lock()):
+                    inflight = session.get("inflight_turn")
+                    if isinstance(inflight, dict):
+                        inflight["terminal_emitted"] = True
+                return write_json(message)
+    elif isinstance(params, dict) and params.get("type") == "clarify.request":
         sid = str(params.get("session_id") or "")
         payload = params.get("payload")
         session = _sessions.get(sid)
@@ -2894,28 +2953,56 @@ def _on_compute_host_turn_done(
     session: dict,
     frame: dict,
     voice_live_turn: dict | None = None,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
 ) -> None:
     is_error = frame.get("type") == "turn.error"
-    with session["history_lock"]:
-        if frame.get("session_key"):
-            session["session_key"] = str(frame.get("session_key"))
-        if frame.get("history_version") is not None:
-            try:
-                session["history_version"] = max(
-                    int(session.get("history_version", 0)),
-                    int(frame.get("history_version") or 0),
-                )
-            except Exception:
-                pass
-        _set_session_not_running(session, sid)
-        session["last_active"] = time.time()
-        _clear_inflight_turn(session)
-        session.pop("_compute_host_pending_clarify", None)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         payload = {"text": f"Error: {message}", "status": "error"}
         payload.update(live_delegation_correlation(voice_live_turn))
-        _emit("message.complete", sid, payload)
+        with _turn_event_lock(session):
+            with session["history_lock"]:
+                if frame.get("session_key"):
+                    session["session_key"] = str(frame.get("session_key"))
+                if frame.get("history_version") is not None:
+                    try:
+                        session["history_version"] = max(
+                            int(session.get("history_version", 0)),
+                            int(frame.get("history_version") or 0),
+                        )
+                    except Exception:
+                        pass
+                inflight = session.get("inflight_turn")
+                if isinstance(inflight, dict):
+                    inflight["terminal_emitted"] = True
+            _emit(
+                "message.complete", sid, payload,
+                run_id=submission_id,
+                submission_id=submission_id,
+                source_submission_id=source_submission_id or submission_id,
+            )
+            with session["history_lock"]:
+                _set_session_not_running(session, sid)
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+                session.pop("_compute_host_pending_clarify", None)
+    else:
+        with session["history_lock"]:
+            if frame.get("session_key"):
+                session["session_key"] = str(frame.get("session_key"))
+            if frame.get("history_version") is not None:
+                try:
+                    session["history_version"] = max(
+                        int(session.get("history_version", 0)),
+                        int(frame.get("history_version") or 0),
+                    )
+                except Exception:
+                    pass
+            _set_session_not_running(session, sid)
+            session["last_active"] = time.time()
+            _clear_inflight_turn(session)
+            session.pop("_compute_host_pending_clarify", None)
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
@@ -2937,6 +3024,8 @@ def _submit_prompt_to_compute_host(
     clock_context: str | None = None,
     voice_live_turn: dict | None = None,
     client_surface: str | None = None,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2950,6 +3039,8 @@ def _submit_prompt_to_compute_host(
         clock_context=clock_context,
         voice_live_turn=voice_live_turn,
         client_surface=client_surface,
+        submission_id=submission_id,
+        source_submission_id=source_submission_id,
     )
 
     def _complete(done: dict) -> None:
@@ -2961,6 +3052,8 @@ def _submit_prompt_to_compute_host(
             return
         _on_compute_host_turn_done(
             rid, sid, session, done, voice_live_turn=voice_live_turn,
+            submission_id=submission_id,
+            source_submission_id=source_submission_id,
         )
 
     try:
@@ -10485,7 +10578,12 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _start_inflight_turn(
+    session: dict,
+    text: Any,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
+) -> None:
     now = time.time()
     session["inflight_turn"] = {
         "assistant": "",
@@ -10493,7 +10591,27 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
+        **({"submission_id": submission_id} if submission_id else {}),
+        **({"source_submission_id": source_submission_id} if source_submission_id else {}),
     }
+
+
+def _turn_event_lock(session: dict) -> threading.RLock:
+    """Serialize accepted run links with this turn's terminal event.
+
+    The lock is separate from ``history_lock`` because redirect can cancel an
+    active provider request. It is only held around the short redirect/steer
+    admission and the event write, never around model or tool execution.
+    """
+    lock = session.get("_turn_event_lock")
+    if lock is not None:
+        return lock
+    with session["history_lock"]:
+        lock = session.get("_turn_event_lock")
+        if lock is None:
+            lock = threading.RLock()
+            session["_turn_event_lock"] = lock
+        return lock
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -10887,6 +11005,8 @@ def _enqueue_prompt(
     image_paths: list[str] | None = None,
     voice_live_turn: dict | None = None,
     client_surface: str | None = None,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -10916,6 +11036,10 @@ def _enqueue_prompt(
         if original and text.strip() == original:
             return
     queued = {"text": text, "transport": transport}
+    if submission_id:
+        queued["submission_id"] = submission_id
+        # For DM sends the source and execution are the same accepted row.
+        queued["source_submission_id"] = source_submission_id or submission_id
     if image_paths:
         queued["image_paths"] = image_paths
     if voice_live_turn:
@@ -10940,6 +11064,11 @@ def _enqueue_prompt(
         # merged one, or attach one turn's transcript to another's words.
         and not voice_live_turn
         and not existing.get("voice_live_turn")
+        # Pantheon must map every accepted user row to exactly one execution.
+        # Merging two accepted submissions would require a many-to-one alias
+        # contract; keep correlated prompts as distinct FIFO envelopes.
+        and not submission_id
+        and not existing.get("submission_id")
         # Merging across surfaces would either graft the HUD note onto app-window
         # words or drop it from the HUD words it belongs to. A missing key and
         # an explicit ``""`` are different pins: the former falls back to the
@@ -11072,6 +11201,8 @@ def _handle_busy_submit(
     rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
     voice_live_turn: dict | None = None,
     client_surface: str | None = None,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -11092,69 +11223,95 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
-    with session["history_lock"]:
-        if not session.get("running"):
-            # The turn ended between prompt.submit's first busy check and this
-            # helper. Let the caller retry and claim the now-idle session.
-            return None
-    with session["history_lock"]:
-        if not session.get("running"):
-            return None
-        image_paths = list(session.get("attached_images", []))
-        if image_paths:
-            # Claim at submission time. A later paste must not be consumed by
-            # this prompt after the active turn finally yields.
-            session["attached_images"] = []
-    text_only = not image_paths and _is_text_only_busy_payload(text)
-    plain_text = _coerce_message_text(text).strip() if text_only else ""
-    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
-        try:
-            if agent.steer(plain_text):
-                with session["history_lock"]:
-                    _record_inflight_correction(session, plain_text)
-                    _drop_queued_duplicates_of_inflight_user(session)
-                    session["last_active"] = time.time()
-                return _ok(rid, {"status": "steered"})
-        except Exception:
-            pass  # fall through to queue
-    # Text-only corrections redirect the live turn in place when the runtime
-    # supports it; media/attachment payloads and older agents fall through to
-    # the proven interrupt + queue path below.
-    if (
-        mode == "interrupt"
-        and text_only
-        and plain_text
-        and agent is not None
-        and getattr(agent, "_supports_active_turn_redirect", False) is True
-        and hasattr(agent, "redirect")
-    ):
-        try:
-            if agent.redirect(plain_text):
-                with session["history_lock"]:
-                    _record_inflight_correction(session, plain_text)
-                    # #84417: do not re-fire the live turn's original user text
-                    # from a stale server-queue self-duplicate after settle.
-                    _drop_queued_duplicates_of_inflight_user(session)
-                    session["last_active"] = time.time()
-                return _ok(rid, {"status": "redirected"})
-        except Exception:
-            pass  # preserve the proven interrupt + queue fallback below
-    # Queue before asking the live turn to stop. In particular, never call a
-    # provider or compute-host method while holding history_lock: an interrupt
-    # can wait behind the very operation it is trying to cancel.
-    with session["history_lock"]:
-        if not session.get("running"):
+    requested_mode = "queue" if queued else _load_busy_input_mode()
+    image_paths: list[str] = []
+    turn_event_lock = _turn_event_lock(session)
+    with turn_event_lock:
+        with session["history_lock"]:
+            if not session.get("running"):
+                # The turn ended between prompt.submit's first busy check and
+                # this helper. Let the caller claim the now-idle session.
+                return None
+            active_turn = session.get("inflight_turn")
+            active_submission_id = (
+                active_turn.get("submission_id") if isinstance(active_turn, dict) else None
+            )
+            terminal_turn = bool(
+                isinstance(active_turn, dict) and active_turn.get("terminal_emitted")
+            )
+            image_paths = list(session.get("attached_images", []))
             if image_paths:
-                session["attached_images"] = image_paths + list(session.get("attached_images", []))
-            return None
-        _enqueue_prompt(
-            session, text, transport, image_paths=image_paths,
-            voice_live_turn=voice_live_turn,
-            client_surface=client_surface,
-        )
-        session["last_active"] = time.time()
+                # Claim at submission time. A later paste must not be consumed
+                # by this prompt after the active turn finally yields.
+                session["attached_images"] = []
+
+        # Once a terminal frame is committed, the run cannot accept another
+        # correction. Keep a prompt arriving during teardown as a distinct FIFO
+        # run and leave it for the ordinary turn-end drain.
+        mode = "queue" if terminal_turn else requested_mode
+        text_only = not image_paths and _is_text_only_busy_payload(text)
+        plain_text = _coerce_message_text(text).strip() if text_only else ""
+        if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
+            try:
+                if agent.steer(plain_text):
+                    with session["history_lock"]:
+                        _record_inflight_correction(session, plain_text)
+                        _drop_queued_duplicates_of_inflight_user(session)
+                        session["last_active"] = time.time()
+                    if submission_id and active_submission_id:
+                        _emit(
+                            "run.link", sid, {"relation": "steered"},
+                            run_id=active_submission_id,
+                            submission_id=submission_id,
+                            source_submission_id=source_submission_id or submission_id,
+                        )
+                    return _ok(rid, {"status": "steered", "run_link_emitted": bool(submission_id and active_submission_id)})
+            except Exception:
+                pass  # fall through to queue
+        # Text-only corrections redirect the live turn in place when the
+        # runtime supports it; media and older agents keep the queue path.
+        if (
+            mode == "interrupt"
+            and text_only
+            and plain_text
+            and agent is not None
+            and getattr(agent, "_supports_active_turn_redirect", False) is True
+            and hasattr(agent, "redirect")
+        ):
+            try:
+                if agent.redirect(plain_text):
+                    with session["history_lock"]:
+                        _record_inflight_correction(session, plain_text)
+                        # Do not re-fire the live turn's original user text
+                        # from a stale server-queue self-duplicate after settle.
+                        _drop_queued_duplicates_of_inflight_user(session)
+                        session["last_active"] = time.time()
+                    if submission_id and active_submission_id:
+                        _emit(
+                            "run.link", sid, {"relation": "redirected"},
+                            run_id=active_submission_id,
+                            submission_id=submission_id,
+                            source_submission_id=source_submission_id or submission_id,
+                        )
+                    return _ok(rid, {"status": "redirected", "run_link_emitted": bool(submission_id and active_submission_id)})
+            except Exception:
+                pass  # preserve the interrupt + queue fallback below
+        # Queue before asking the live turn to stop. Never wait on a provider or
+        # compute-host interrupt while holding history_lock.
+        with session["history_lock"]:
+            if not session.get("running"):
+                if image_paths:
+                    session["attached_images"] = image_paths + list(session.get("attached_images", []))
+                return None
+            _enqueue_prompt(
+                session, text, transport, image_paths=image_paths,
+                voice_live_turn=voice_live_turn,
+                client_surface=client_surface,
+                submission_id=submission_id,
+                source_submission_id=source_submission_id,
+            )
+            session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
     # cancelling the active turn so the user gets both results in order.
@@ -11183,6 +11340,9 @@ def _queued_turn_dispatch_kwargs(queued: dict, queue_generation: int) -> dict:
     ``voice_live_turn`` is forwarded only when this envelope carries one.
     """
     kwargs: dict = {"queued_prompt_generation": queue_generation}
+    if queued.get("submission_id"):
+        kwargs["submission_id"] = queued["submission_id"]
+        kwargs["source_submission_id"] = queued.get("source_submission_id") or queued["submission_id"]
     image_paths = queued.get("image_paths")
     if image_paths:
         kwargs["image_paths"] = image_paths
@@ -11290,6 +11450,10 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    for field in ("run_id", "submission_id", "source_submission_id"):
+        value = turn.get(field)
+        if isinstance(value, str) and value:
+            snapshot[field] = value
     raw_corrections = turn.get("corrections") or []
     raw_offsets = turn.get("correction_offsets") or []
     correction_pairs = [
@@ -11360,36 +11524,44 @@ def _emit_terminal_turn_error(
             )
         except Exception:
             error_surface = None
-    with session["history_lock"]:
-        _fail_inflight_turn(session, error, error_surface=error_surface)
-        turn = session.get("inflight_turn") or {}
-        message = str(turn.get("error") or "turn failed")
-        partial = str(turn.get("assistant") or "")
-        cols = int(session.get("cols", 80))
-    text = partial or f"Error: {message}"
-    payload = {
-        "text": text,
-        "usage": _get_usage(agent) if agent is not None else {},
-        "status": "error",
-        "error": message,
-        "recoverable": True,
-    }
-    if error_surface:
-        payload["error_surface"] = error_surface
-    if partial:
-        payload["partial"] = True
-    # Same ids the successful final copies on. Omit the keys when this turn
-    # has none, so a plain failure stays indistinguishable from before.
-    payload.update(live_delegation_correlation(voice_live_turn))
-    try:
-        rendered = render_message(text, cols)
-    except Exception:
-        rendered = ""
-    if rendered:
-        payload["rendered"] = rendered
-    if retire_marker:
-        _retire_turn_marker(session)
-    _emit("message.complete", sid, payload)
+    turn_event_lock = _turn_event_lock(session)
+    with turn_event_lock:
+        with session["history_lock"]:
+            _fail_inflight_turn(session, error, error_surface=error_surface)
+            turn = session.get("inflight_turn") or {}
+            turn["terminal_emitted"] = True
+            message = str(turn.get("error") or "turn failed")
+            partial = str(turn.get("assistant") or "")
+            cols = int(session.get("cols", 80))
+            correlation = {
+                field: turn[field]
+                for field in ("run_id", "submission_id", "source_submission_id")
+                if isinstance(turn.get(field), str) and turn[field]
+            }
+        text = partial or f"Error: {message}"
+        payload = {
+            "text": text,
+            "usage": _get_usage(agent) if agent is not None else {},
+            "status": "error",
+            "error": message,
+            "recoverable": True,
+        }
+        if error_surface:
+            payload["error_surface"] = error_surface
+        if partial:
+            payload["partial"] = True
+        # Same ids the successful final copies on. Omit the keys when this turn
+        # has none, so a plain failure stays indistinguishable from before.
+        payload.update(live_delegation_correlation(voice_live_turn))
+        try:
+            rendered = render_message(text, cols)
+        except Exception:
+            rendered = ""
+        if rendered:
+            payload["rendered"] = rendered
+        if retire_marker:
+            _retire_turn_marker(session)
+        _emit("message.complete", sid, payload, **correlation)
 
 
 def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
@@ -11420,7 +11592,14 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
     if not isinstance(queued, dict):
         return None
     user = _inflight_text(queued.get("text"))
-    return {"user": user} if user else None
+    if not user:
+        return None
+    snapshot = {"user": user}
+    for field in ("submission_id", "source_submission_id"):
+        value = queued.get(field)
+        if isinstance(value, str) and value:
+            snapshot[field] = value
+    return snapshot
 
 
 # ── Methods: session ─────────────────────────────────────────────────
@@ -13782,6 +13961,8 @@ def _run_prompt_submit(
     clock_context: str | None = None,
     voice_live_turn: dict | None = None,
     client_surface: str | None = None,
+    submission_id: str | None = None,
+    source_submission_id: str | None = None,
 ) -> bool:
     # Ownership admission at the ONE chokepoint every fresh turn source must
     # cross. prompt.submit already claims the slot in its RPC handler (so this
@@ -13797,7 +13978,11 @@ def _run_prompt_submit(
         )
         with session["history_lock"]:
             _set_session_not_running(session, sid)
-        _emit("error", sid, {"message": str(ownership_refusal)})
+        _emit(
+            "error", sid, {"message": str(ownership_refusal)},
+            submission_id=submission_id,
+            source_submission_id=source_submission_id or submission_id,
+        )
         return False
     with session["history_lock"]:
         if session.get("_closing"):
@@ -13818,7 +14003,20 @@ def _run_prompt_submit(
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(session, text, submission_id, source_submission_id)
+            inflight = session.get("inflight_turn")
+        elif isinstance(inflight, dict):
+            if submission_id:
+                # This is the execution boundary: pre-start snapshots remain
+                # submission-scoped until message.start is emitted below.
+                inflight["run_id"] = submission_id
+            if submission_id and not inflight.get("submission_id"):
+                inflight["submission_id"] = submission_id
+            if source_submission_id and not inflight.get("source_submission_id"):
+                inflight["source_submission_id"] = source_submission_id
+        if submission_id and isinstance(inflight, dict):
+            # Also cover a fresh inflight record created by this function.
+            inflight["run_id"] = submission_id
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -13844,9 +14042,21 @@ def _run_prompt_submit(
         len(text) if isinstance(text, str) else "-",
         len(images),
     )
-    _emit("message.start", sid)
+    _emit(
+        "message.start", sid,
+        run_id=submission_id,
+        submission_id=submission_id,
+        source_submission_id=source_submission_id or submission_id,
+    )
 
     def run():
+        event_correlation = {
+            "run_id": submission_id,
+            "submission_id": submission_id,
+            "source_submission_id": source_submission_id or submission_id,
+        }
+        event_correlation = {key: value for key, value in event_correlation.items() if value}
+        run_event_token = _current_run_event_correlation.set((sid, event_correlation))
         terminal_receipt_attempted = False
         terminal_receipt_committed = terminal_callback is None
         # The conversation runs on a fresh thread, so ContextVars from the RPC
@@ -14512,7 +14722,12 @@ def _run_prompt_submit(
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
-            _emit("message.complete", sid, payload)
+            with _turn_event_lock(session):
+                with session["history_lock"]:
+                    inflight = session.get("inflight_turn")
+                    if isinstance(inflight, dict):
+                        inflight["terminal_emitted"] = True
+                _emit("message.complete", sid, payload)
             if _artifacts:
                 _emit("artifact.ready", sid, {"conversation_root_id": _artifacts[0]["conversation_root_id"]})
 
@@ -14764,6 +14979,7 @@ def _run_prompt_submit(
                 reset_terminal_scope(_terminal_scope_token)
             _clear_session_context(session_tokens)
             _current_runtime_session_record.reset(runtime_session_token)
+            _current_run_event_correlation.reset(run_event_token)
             reset_transport(transport_token)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.

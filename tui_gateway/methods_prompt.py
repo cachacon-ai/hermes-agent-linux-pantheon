@@ -386,6 +386,18 @@ def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
 
     sid = params.get("session_id", "")
+    submission_id = params.get("submission_id")
+    source_submission_id = params.get("source_submission_id")
+    for field, value in (("submission_id", submission_id), ("source_submission_id", source_submission_id)):
+        if value is not None and (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 128
+            or any(ord(char) < 0x20 or ord(char) == 0x7f for char in value)
+        ):
+            return _err(rid, 4004, f"{field} must be a nonempty string of at most 128 characters")
+    if submission_id and not source_submission_id:
+        source_submission_id = submission_id
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
     clock_context = normalize_prompt_clock_context(params.get("clock_context"))
@@ -601,6 +613,8 @@ def _(rid, params: dict) -> dict:
             queued=bool(params.get("queued")),
             voice_live_turn=voice_live_turn,
             client_surface=client_surface,
+            submission_id=submission_id,
+            source_submission_id=source_submission_id,
         )
         if busy_response is not None:
             return busy_response
@@ -1039,7 +1053,7 @@ def _(rid, params: dict) -> dict:
         session["last_active"] = time.time()
         if internal_hosted_submit:
             session["_hosted_room_task"] = dict(hosted_task)
-        _start_inflight_turn(session, text)
+        _start_inflight_turn(session, text, submission_id, source_submission_id)
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
@@ -1051,6 +1065,8 @@ def _(rid, params: dict) -> dict:
             clock_context=clock_context,
             voice_live_turn=voice_live_turn,
             client_surface=client_surface,
+            submission_id=submission_id,
+            source_submission_id=source_submission_id,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -1161,6 +1177,8 @@ def _(rid, params: dict) -> dict:
                         if session.get("_turn_cancel_requested")
                         else "Session no longer running before the agent was ready"
                     },
+                    submission_id=submission_id,
+                    source_submission_id=source_submission_id or submission_id,
                 )
                 return
         _run_prompt_submit(
@@ -1173,6 +1191,8 @@ def _(rid, params: dict) -> dict:
             clock_context=clock_context,
             voice_live_turn=voice_live_turn,
             client_surface=client_surface,
+            submission_id=submission_id,
+            source_submission_id=source_submission_id,
         )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)

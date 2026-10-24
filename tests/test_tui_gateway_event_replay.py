@@ -85,6 +85,24 @@ def test_events_since_returns_client_dispatchable_event_objects():
     assert "params" not in event
 
 
+def test_run_link_correlation_survives_the_gateway_replay_ring():
+    frame = _frame("s1", "run.link")
+    frame["params"].update(
+        run_id="active-run",
+        submission_id="correction-submission",
+        source_submission_id="correction-submission",
+        payload={"relation": "steered"},
+    )
+    event_replay._stamp_event(frame)
+
+    (event,) = events_since("s1", 0)
+    assert event["type"] == "run.link"
+    assert event["run_id"] == "active-run"
+    assert event["submission_id"] == "correction-submission"
+    assert event["source_submission_id"] == "correction-submission"
+    assert event["payload"] == {"relation": "steered"}
+
+
 def test_unknown_session_returns_empty():
     assert events_since("nope", 0) == []
     assert latest_seq("nope") == 0
