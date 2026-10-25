@@ -977,3 +977,500 @@ def test_batch_model_rejection_notice_requires_configured_model_in_text(monkeypa
     text = format_process_notification(evt)
     assert text is not None
     assert "SUBAGENT MODEL REJECTED" not in text
+
+
+def test_persist_completion_retries_transient_database_locked(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_retry",
+            "session_key": "",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": time.time(),
+        }
+    )
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_retry",
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+    result = {"summary": "ok"}
+    attempts = {"n": 0}
+
+    class _FlakyConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+            if "UPDATE async_delegations" in sql:
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+            return super().execute(sql, *args, **kwargs)
+
+    real_connect = ad.sqlite3.connect
+
+    def flaky_connect(path, timeout=10, **kwargs):
+        return real_connect(
+            path,
+            timeout=timeout,
+            factory=_FlakyConnection,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(ad.sqlite3, "connect", flaky_connect)
+    slept = []
+    monkeypatch.setattr(ad.time, "sleep", lambda s: slept.append(s))
+
+    assert ad._persist_completion(evt, result) is True
+    assert attempts["n"] == 2
+    assert slept, "expected a backoff sleep between retries"
+
+    row = ad.get_durable_delegation("deleg_retry")
+    assert row is not None
+    assert row["state"] == "completed"
+
+
+def test_finalize_finishes_in_memory_when_persist_fails(monkeypatch):
+    monkeypatch.setattr(ad, "_persist_completion", lambda *a, **k: False)
+    monkeypatch.setattr(ad, "_remember_pending_completion_write", lambda *a, **k: None)
+    published = []
+
+    def capture_publish(evt, result, *, log_label):
+        published.append(evt["delegation_id"])
+
+    monkeypatch.setattr(ad, "_publish_completion_event", capture_publish)
+
+    with ad._records_lock:
+        ad._records["deleg_fin"] = {
+            "delegation_id": "deleg_fin",
+            "status": "running",
+            "dispatched_at": time.time(),
+            "session_key": "",
+            "origin_ui_session_id": "",
+        }
+
+    ad._finalize(
+        "deleg_fin",
+        {"summary": "done", "api_calls": 1, "duration_seconds": 0.1},
+        "completed",
+    )
+
+    assert published == ["deleg_fin"]
+    with ad._records_lock:
+        assert ad._records["deleg_fin"]["status"] == "completed"
+    assert ad.active_count() == 0
+
+
+def test_pending_completion_write_flushes_on_retry(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_pending",
+            "session_key": "",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": time.time(),
+        }
+    )
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_pending",
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+    result = {"summary": "flushed"}
+    ad._remember_pending_completion_write("deleg_pending", evt, result)
+
+    assert ad._retry_pending_completion_writes() == 1
+    row = ad.get_durable_delegation("deleg_pending")
+    assert row is not None
+    assert row["state"] == "completed"
+    assert row["result"]["summary"] == "flushed"
+    with ad._pending_completion_lock:
+        assert "deleg_pending" not in ad._pending_completion_writes
+    assert not ad._pending_write_journal_path("deleg_pending").exists()
+
+
+def test_persist_completion_preserves_delivered_delivery_state(monkeypatch, tmp_path):
+    """Delayed retry must not regress an in-process delivery acknowledgment."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_ack",
+            "session_key": "sess",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": time.time(),
+        }
+    )
+    # Simulate claim + ack that raced ahead of the durable terminal UPDATE.
+    assert ad.claim_completion_delivery("deleg_ack", "claim-1")
+    assert ad.complete_completion_delivery("deleg_ack", "claim-1")
+    row = ad.get_durable_delegation("deleg_ack")
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_ack",
+        "status": "completed",
+        "completed_at": time.time(),
+        "summary": "late durable write",
+    }
+    assert ad._persist_completion(evt, {"summary": "late durable write"}) is True
+    row = ad.get_durable_delegation("deleg_ack")
+    assert row is not None
+    assert row["state"] == "completed"
+    assert row["delivery_state"] == "delivered"
+    assert row["result"]["summary"] == "late durable write"
+
+
+def test_pending_completion_write_counts_as_active_and_drains_on_shutdown(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_live",
+            "session_key": "sk",
+            "origin_ui_session_id": "ui-1",
+            "parent_session_id": "parent-1",
+            "dispatched_at": time.time(),
+        }
+    )
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_live",
+        "session_key": "sk",
+        "origin_ui_session_id": "ui-1",
+        "parent_session_id": "parent-1",
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+    result = {"summary": "drained"}
+    ad._remember_pending_completion_write("deleg_live", evt, result)
+
+    assert ad.pending_completion_write_count() == 1
+    assert ad.active_count() == 1
+    assert ad.has_live_for_session(session_key="sk")
+    assert ad._pending_write_journal_path("deleg_live").exists()
+
+    remaining = ad.drain_pending_completion_writes(timeout=2.0)
+    assert remaining == 0
+    assert ad.active_count() == 0
+    row = ad.get_durable_delegation("deleg_live")
+    assert row is not None
+    assert row["state"] == "completed"
+    assert row["result"]["summary"] == "drained"
+
+
+def test_interrupt_all_shutdown_drains_pending_writes(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_shut",
+            "session_key": "",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": time.time(),
+        }
+    )
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_shut",
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+    ad._remember_pending_completion_write("deleg_shut", evt, {"summary": "bye"})
+    assert ad.pending_completion_write_count() == 1
+
+    n = ad.interrupt_all(reason="gateway shutdown (test)")
+    assert n == 0
+    assert ad.pending_completion_write_count() == 0
+    row = ad.get_durable_delegation("deleg_shut")
+    assert row is not None
+    assert row["state"] == "completed"
+
+
+def test_journal_recovers_real_result_instead_of_unknown(monkeypatch, tmp_path):
+    """Crash after failed persist: journal beats synthetic unknown recovery."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_crash",
+            "session_key": "sk",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": time.time(),
+            "goal": "do work",
+        }
+    )
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_crash",
+        "session_key": "sk",
+        "status": "completed",
+        "completed_at": time.time(),
+        "summary": "real result",
+    }
+    result = {"status": "completed", "summary": "real result"}
+    ad._write_pending_completion_journal("deleg_crash", evt, result)
+    # Simulate process death: clear in-memory map (journal remains on disk).
+    with ad._pending_completion_lock:
+        ad._pending_completion_writes.clear()
+
+    monkeypatch.setattr(
+        "gateway.status._pid_exists", lambda _pid: False, raising=False
+    )
+    # recover_abandoned imports gateway.status lazily; patch via module after import
+    import gateway.status as gateway_status
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: False)
+    monkeypatch.setattr(gateway_status, "get_process_start_time", lambda _pid: None)
+
+    recovered = ad.recover_abandoned_delegations()
+    assert recovered == 1
+    row = ad.get_durable_delegation("deleg_crash")
+    assert row is not None
+    assert row["state"] == "completed"
+    assert row["result"]["summary"] == "real result"
+    assert not ad._pending_write_journal_path("deleg_crash").exists()
+
+
+def test_completion_retry_restarts_after_enqueue_during_exit(monkeypatch, tmp_path):
+    """Ownership release and empty-check are atomic; post-exit enqueue restarts."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.02)
+
+    ready = threading.Event()
+    release = threading.Event()
+
+    def blocking_retry(*, background=False):
+        # First sweep: pretend the map drained, then pause before the loop
+        # re-checks emptiness under the ownership locks.
+        with ad._pending_completion_lock:
+            ad._pending_completion_writes.clear()
+        ready.set()
+        release.wait(timeout=2.0)
+        return 0
+
+    monkeypatch.setattr(ad, "_retry_pending_completion_writes", blocking_retry)
+    with ad._pending_completion_lock:
+        ad._pending_completion_writes["seed"] = (
+            {"delegation_id": "seed", "status": "completed", "completed_at": 1.0},
+            {},
+        )
+    ad._ensure_completion_retry_monitor()
+    assert ready.wait(timeout=2.0)
+
+    # Insert while the worker is between retry and the atomic empty+clear.
+    # Under the fixed lock protocol this either keeps the worker alive or
+    # the post-clear remember below starts a successor — never stranded.
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_race",
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+    # Bypass remember's journal+start so we only poke the map mid-exit.
+    with ad._pending_completion_lock:
+        ad._pending_completion_writes["deleg_race"] = (evt, {"summary": "race"})
+
+    release.set()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with ad._completion_retry_lock:
+            thread = ad._completion_retry_thread
+            alive = thread is not None and thread.is_alive()
+        if not alive:
+            break
+        time.sleep(0.02)
+
+    # Worker exited. A remember after ownership clear must start a successor.
+    monkeypatch.setattr(ad, "_retry_pending_completion_writes", lambda **_kwargs: 0)
+    ad._remember_pending_completion_write(
+        "deleg_race2",
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_race2",
+            "status": "completed",
+            "completed_at": time.time(),
+        },
+        {"summary": "after-exit"},
+    )
+    with ad._completion_retry_lock:
+        successor = ad._completion_retry_thread
+    assert successor is not None and successor.is_alive()
+    with ad._pending_completion_lock:
+        assert "deleg_race2" in ad._pending_completion_writes
+
+
+def test_completion_retry_no_strand_under_concurrent_enqueue(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.01)
+    monkeypatch.setattr(ad, "_persist_completion", lambda *_a, **_k: False)
+
+    stop = threading.Event()
+
+    def hammer():
+        i = 0
+        while not stop.wait(0.005):
+            i += 1
+            did = f"deleg_h{i}"
+            ad._remember_pending_completion_write(
+                did,
+                {
+                    "type": "async_delegation",
+                    "delegation_id": did,
+                    "status": "completed",
+                    "completed_at": time.time(),
+                },
+                {},
+            )
+            with ad._pending_completion_lock:
+                if len(ad._pending_completion_writes) > 8:
+                    # Bound growth; leave at least one entry for the race window.
+                    keys = list(ad._pending_completion_writes)[:-1]
+                    for key in keys:
+                        ad._pending_completion_writes.pop(key, None)
+
+    worker = threading.Thread(target=hammer, name="pending-write-hammer")
+    worker.start()
+    time.sleep(0.25)
+    stop.set()
+    worker.join(timeout=2.0)
+
+    ad._remember_pending_completion_write(
+        "deleg_final",
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_final",
+            "status": "completed",
+            "completed_at": time.time(),
+        },
+        {"summary": "final"},
+    )
+    time.sleep(0.05)
+    with ad._pending_completion_lock:
+        pending = dict(ad._pending_completion_writes)
+    with ad._completion_retry_lock:
+        thread = ad._completion_retry_thread
+    if pending:
+        assert thread is not None and thread.is_alive(), (
+            f"pending writes stranded without retry thread: {list(pending)}"
+        )
+
+
+def test_completion_queue_does_not_wait_for_background_retry_budget(
+    monkeypatch, tmp_path
+):
+    """A durable sidecar lets delivery proceed while SQLite retry continues."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.01)
+
+    background_started = threading.Event()
+    release_background = threading.Event()
+    persist_calls = []
+
+    def controlled_persist(event, result, *, max_retries=8, busy_timeout=10.0):
+        persist_calls.append((max_retries, busy_timeout))
+        if max_retries == 0:
+            return False
+        background_started.set()
+        release_background.wait(timeout=2.0)
+        return False
+
+    monkeypatch.setattr(ad, "_persist_completion", controlled_persist)
+    real_fsync = os.fsync
+    fsync_count = []
+
+    def tracked_fsync(fd):
+        real_fsync(fd)
+        fsync_count.append(fd)
+
+    monkeypatch.setattr(ad.os, "fsync", tracked_fsync)
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_fast_handoff",
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+    result = {"summary": "available promptly"}
+    journal = ad._pending_write_journal_path(event["delegation_id"])
+    queued = []
+    original_put = process_registry.completion_queue.put
+
+    def capture_put(evt, *args, **kwargs):
+        assert journal.exists(), "the sidecar must exist before queue delivery"
+        assert fsync_count, "the sidecar must be fsynced before queue delivery"
+        assert journal.stat().st_mode & 0o777 == 0o600
+        assert journal.parent.stat().st_mode & 0o777 == 0o700
+        queued.append(time.monotonic())
+        return original_put(evt, *args, **kwargs)
+
+    monkeypatch.setattr(process_registry.completion_queue, "put", capture_put)
+
+    try:
+        ad._publish_completion_event(event, result, log_label="Async delegation")
+        assert background_started.wait(timeout=1.0)
+        assert queued, "the event should be queued while the background retry is blocked"
+        assert persist_calls[0] == (0, ad._COMPLETION_PERSIST_SYNC_TIMEOUT_S)
+        assert persist_calls[1][0] == ad._COMPLETION_PERSIST_MAX_RETRIES
+        assert process_registry.completion_queue.get_nowait() is event
+    finally:
+        release_background.set()
+        ad._completion_retry_stop.set()
+        with ad._completion_retry_lock:
+            retry_thread = ad._completion_retry_thread
+        if retry_thread is not None:
+            retry_thread.join(timeout=2.0)
+
+
+def test_completion_queue_waits_for_durable_store_if_sidecar_fails(
+    monkeypatch, tmp_path
+):
+    """Do not deliver an event that has no durable DB or sidecar copy."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.01)
+    monkeypatch.setattr(
+        ad,
+        "_write_pending_completion_journal",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    background_started = threading.Event()
+    release_background = threading.Event()
+
+    def controlled_persist(event, result, *, max_retries=8, busy_timeout=10.0):
+        if max_retries == 0:
+            return False
+        background_started.set()
+        release_background.wait(timeout=2.0)
+        return True
+
+    monkeypatch.setattr(ad, "_persist_completion", controlled_persist)
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_deferred_handoff",
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+
+    try:
+        ad._publish_completion_event(
+            event, {"summary": "wait for durable commit"}, log_label="Async delegation"
+        )
+        assert background_started.wait(timeout=1.0)
+        assert process_registry.completion_queue.empty()
+
+        release_background.set()
+        queued = _drain_for(event["delegation_id"], timeout=1.0)
+        assert queued is not None
+        assert queued["delegation_id"] == event["delegation_id"]
+    finally:
+        release_background.set()
+        ad._completion_retry_stop.set()
+        with ad._completion_retry_lock:
+            retry_thread = ad._completion_retry_thread
+        if retry_thread is not None:
+            retry_thread.join(timeout=2.0)

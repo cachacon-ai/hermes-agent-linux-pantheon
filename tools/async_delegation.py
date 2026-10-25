@@ -38,12 +38,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import random
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -88,7 +91,22 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # restore_undelivered_completions). 48h keeps overnight/weekend results
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
+# Transient SQLite failures during the terminal UPDATE (lock timeout, brief
+# I/O blips) must not permanently lose a finished subagent's result or leave
+# the in-memory record wedged in ``finalizing`` (#PAN-79).
+_COMPLETION_PERSIST_MAX_RETRIES = 8
+_COMPLETION_PERSIST_RETRY_MIN_S = 0.020
+_COMPLETION_PERSIST_RETRY_MAX_S = 0.150
+_COMPLETION_PERSIST_RETRY_SLOW_MIN_S = 0.250
+_COMPLETION_PERSIST_RETRY_SLOW_MAX_S = 1.0
+_COMPLETION_PERSIST_SYNC_TIMEOUT_S = 0.2
 _DB_LOCK = threading.Lock()
+_pending_completion_lock = threading.Lock()
+# delegation_id -> (event, result) awaiting a successful durable write
+_pending_completion_writes: Dict[str, tuple[Dict[str, Any], Dict[str, Any]]] = {}
+# Events whose sidecar could not be durably written must wait for SQLite to
+# accept the row before entering the in-memory completion queue.
+_pending_completion_publish: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -120,15 +138,19 @@ _monitor_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop = threading.Event()
 
+_completion_retry_lock = threading.Lock()
+_completion_retry_thread: Optional[threading.Thread] = None
+_completion_retry_stop = threading.Event()
+
 
 def _db_path():
     return get_hermes_home() / "state.db"
 
 
-def _connect() -> sqlite3.Connection:
+def _connect(timeout: float = 10.0) -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(path, timeout=timeout)
     try:
         _initialize_schema(conn)
     except Exception:
@@ -192,7 +214,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
     """Open a connection, commit/rollback on exit, and ALWAYS close it.
 
     ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back the
@@ -202,7 +224,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     to the garbage collector. On a long-running gateway that exhausts
     ``RLIMIT_NOFILE`` (the cron-ledger sibling of this bug was #69567 / PR #69594).
     """
-    conn = _connect()
+    conn = _connect(timeout=timeout)
     try:
         with conn:
             yield conn
@@ -320,16 +342,354 @@ def _prune_durable_records() -> None:
             )
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+def _is_retryable_delegation_db_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    msg = str(exc).lower()
+    return (
+        "database is locked" in msg
+        or "database is busy" in msg
+        or "disk i/o error" in msg
+        or "locking protocol" in msg
+    )
+
+
+def _completion_persist_sql() -> str:
+    """Terminal UPDATE that never regresses a delivered/dropped ack.
+
+    In-process queue delivery can claim and acknowledge a row while the
+    durable terminal payload is still only in the retry backlog. A later
+    successful flush must preserve that acknowledgment; rewriting
+    ``delivery_state='pending'`` would make startup recovery enqueue a
+    duplicate parent turn.
+    """
+    return (
+        """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+           event_json=?, result_json=?,
+           delivery_state=CASE
+             WHEN delivery_state IN ('delivered', 'dropped') THEN delivery_state
+             ELSE 'pending'
+           END
+           WHERE delegation_id=?"""
+    )
+
+
+def _persist_completion(
+    event: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    max_retries: int = _COMPLETION_PERSIST_MAX_RETRIES,
+    busy_timeout: float = 10.0,
+) -> bool:
+    """Durably record a terminal async-delegation event.
+
+    Returns True when the row is committed, False when retries are exhausted.
+    Callers on a user-facing completion path use a short busy timeout and no
+    retries; the background retry worker uses the longer bounded budget.
+    """
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+    params = (
+        event.get("status", "completed"),
+        event.get("completed_at", now),
+        now,
+        json.dumps(event),
+        json.dumps(result),
+        event["delegation_id"],
+    )
+    sql = _completion_persist_sql()
+    delegation_id = event["delegation_id"]
+    for attempt in range(max_retries + 1):
+        try:
+            with _DB_LOCK, _transaction(timeout=busy_timeout) as conn:
+                conn.execute(sql, params)
+            return True
+        except sqlite3.Error as exc:
+            if not _is_retryable_delegation_db_error(exc):
+                logger.error(
+                    "Async delegation %s: non-retryable completion persist "
+                    "failure: %s",
+                    delegation_id,
+                    exc,
+                )
+                return False
+            if attempt == max_retries:
+                logger.error(
+                    "Async delegation %s: completion persist failed after "
+                    "%d attempts: %s",
+                    delegation_id,
+                    max_retries + 1,
+                    exc,
+                )
+                return False
+            if attempt >= 3:
+                delay = random.uniform(
+                    _COMPLETION_PERSIST_RETRY_SLOW_MIN_S,
+                    _COMPLETION_PERSIST_RETRY_SLOW_MAX_S,
+                )
+            else:
+                delay = random.uniform(
+                    _COMPLETION_PERSIST_RETRY_MIN_S,
+                    _COMPLETION_PERSIST_RETRY_MAX_S,
+                )
+            time.sleep(delay)
+    return False
+
+
+def _pending_write_journal_dir() -> Path:
+    path = get_hermes_home() / "async_delegation_pending_writes"
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        path.chmod(0o700)
+    return path
+
+
+def _pending_write_journal_path(delegation_id: str) -> Path:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in delegation_id)
+    return get_hermes_home() / "async_delegation_pending_writes" / f"{safe}.json"
+
+
+def _write_pending_completion_journal(
+    delegation_id: str,
+    event: Dict[str, Any],
+    result: Dict[str, Any],
+) -> None:
+    """Crash-safe sidecar for terminal payloads SQLite could not accept yet.
+
+    state.db may be locked or briefly unwritable; a sibling JSON file under
+    HERMES_HOME still lets restart recovery apply the real result instead of
+    inventing ``unknown``.
+    """
+    _pending_write_journal_dir()
+    path = _pending_write_journal_path(delegation_id)
+    tmp = path.with_suffix(".tmp")
+    payload = {"delegation_id": delegation_id, "event": event, "result": result}
+    serialized = json.dumps(payload)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1  # fdopen owns and closes it from here on
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    tmp.replace(path)
+    if os.name == "posix":
+        dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
+def _clear_pending_completion_journal(delegation_id: str) -> None:
+    try:
+        _pending_write_journal_path(delegation_id).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug(
+            "Async delegation %s: pending-write journal unlink failed: %s",
+            delegation_id,
+            exc,
         )
+
+
+def _read_pending_completion_journal(
+    delegation_id: str,
+) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
+    path = _pending_write_journal_path(delegation_id)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    event = raw.get("event")
+    result = raw.get("result")
+    if not isinstance(event, dict) or not isinstance(result, dict):
+        return None
+    return event, result
+
+
+def _load_pending_completion_journals() -> Dict[str, tuple[Dict[str, Any], Dict[str, Any]]]:
+    loaded: Dict[str, tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    try:
+        paths = list(_pending_write_journal_dir().glob("*.json"))
+    except OSError:
+        return loaded
+    for path in paths:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        event = raw.get("event")
+        result = raw.get("result")
+        if not isinstance(event, dict) or not isinstance(result, dict):
+            continue
+        delegation_id = str(
+            raw.get("delegation_id") or event.get("delegation_id") or ""
+        )
+        if not delegation_id:
+            continue
+        loaded[delegation_id] = (event, result)
+    return loaded
+
+
+def _reload_pending_completion_journals_into_memory() -> int:
+    """Merge on-disk journals into the in-memory retry map. Returns new entries."""
+    journals = _load_pending_completion_journals()
+    added = 0
+    with _completion_retry_lock:
+        with _pending_completion_lock:
+            for delegation_id, payload in journals.items():
+                if delegation_id in _pending_completion_writes:
+                    continue
+                _pending_completion_writes[delegation_id] = payload
+                added += 1
+        if _pending_completion_writes:
+            _start_completion_retry_thread_locked()
+    return added
+
+
+def pending_completion_write_count() -> int:
+    """Terminal payloads waiting for a successful durable write."""
+    with _pending_completion_lock:
+        return len(_pending_completion_writes)
+
+
+def _remember_pending_completion_write(
+    delegation_id: str,
+    event: Dict[str, Any],
+    result: Dict[str, Any],
+) -> bool:
+    journaled = True
+    try:
+        _write_pending_completion_journal(delegation_id, event, result)
+    except OSError as exc:
+        journaled = False
+        logger.error(
+            "Async delegation %s: failed to journal pending completion write: %s",
+            delegation_id,
+            exc,
+        )
+    with _completion_retry_lock:
+        with _pending_completion_lock:
+            _pending_completion_writes[delegation_id] = (event, result)
+            if journaled:
+                _pending_completion_publish.discard(delegation_id)
+            else:
+                _pending_completion_publish.add(delegation_id)
+        _start_completion_retry_thread_locked()
+    return journaled
+
+
+def _enqueue_completion_event(
+    evt: Dict[str, Any],
+    *,
+    log_label: str,
+) -> bool:
+    """Put an already-durable completion on the in-process queue."""
+    delegation_id = str(evt.get("delegation_id") or "")
+    try:
+        from tools.process_registry import process_registry
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "%s %s finished but process_registry import failed; "
+            "result may be lost unless durable write succeeds: %s",
+            log_label,
+            delegation_id,
+            exc,
+        )
+        return False
+    try:
+        process_registry.completion_queue.put(evt)
+        return True
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "%s %s: failed to enqueue completion event; "
+            "result recoverable from durable store once persist succeeds: %s",
+            log_label,
+            delegation_id,
+            exc,
+        )
+        return False
+
+
+def _retry_pending_completion_writes(*, background: bool = False) -> int:
+    """Best-effort flush of completion rows whose initial persist failed."""
+    with _pending_completion_lock:
+        pending = list(_pending_completion_writes.items())
+    flushed = 0
+    for delegation_id, (event, result) in pending:
+        if background:
+            persisted = _persist_completion(event, result)
+        else:
+            persisted = _persist_completion(
+                event,
+                result,
+                max_retries=0,
+                busy_timeout=_COMPLETION_PERSIST_SYNC_TIMEOUT_S,
+            )
+        if not persisted:
+            continue
+        needs_publish = False
+        with _pending_completion_lock:
+            if _pending_completion_writes.get(delegation_id) != (event, result):
+                continue
+            _pending_completion_writes.pop(delegation_id, None)
+            needs_publish = delegation_id in _pending_completion_publish
+            _pending_completion_publish.discard(delegation_id)
+        _clear_pending_completion_journal(delegation_id)
+        if needs_publish:
+            _enqueue_completion_event(event, log_label="Async delegation")
+        flushed += 1
+    return flushed
+
+
+def drain_pending_completion_writes(timeout: float = 5.0) -> int:
+    """Flush the pending-write backlog; return how many remain after timeout.
+
+    Called from shutdown paths so a graceful exit does not discard terminal
+    payloads that only live in the retry map / journal.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        _retry_pending_completion_writes()
+        remaining = pending_completion_write_count()
+        if remaining == 0:
+            return 0
+        if time.monotonic() >= deadline:
+            return remaining
+        time.sleep(0.05)
+
+
+def _publish_completion_event(
+    evt: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    log_label: str,
+) -> None:
+    """Persist then enqueue a terminal async-delegation completion."""
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not _persist_completion(
+        evt,
+        result,
+        max_retries=0,
+        busy_timeout=_COMPLETION_PERSIST_SYNC_TIMEOUT_S,
+    ):
+        journaled = _remember_pending_completion_write(delegation_id, evt, result)
+        logger.error(
+            "%s %s: durable completion write failed; queued for background "
+            "retry%s.",
+            log_label,
+            delegation_id,
+            "" if journaled else "; in-memory delivery is deferred until SQLite commits",
+        )
+        if not journaled:
+            return
+    else:
+        _clear_pending_completion_journal(delegation_id)
+    _enqueue_completion_event(evt, log_label=log_label)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -341,13 +701,21 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 
 
 def recover_abandoned_delegations() -> int:
-    """Classify records whose owning process disappeared as outcome unknown."""
+    """Classify records whose owning process disappeared as outcome unknown.
+
+    When a pending-write journal holds the real terminal payload (persist
+    failed before the process exited), prefer that over synthesizing
+    ``unknown`` — otherwise a completed result that already reached the
+    in-process queue can be overwritten by a false unknown-outcome turn.
+    """
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
         return 0
     now = time.time()
     recovered = 0
+    journals = _load_pending_completion_journals()
+    journal_clears: List[str] = []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
@@ -364,6 +732,25 @@ def recover_abandoned_delegations() -> int:
                 if live and started is not None:
                     live = get_process_start_time(int(pid)) == int(started)
             if live:
+                continue
+            journal = journals.get(delegation_id)
+            if journal is not None:
+                event, result = journal
+                status = event.get("status", "completed")
+                completed_at = event.get("completed_at", now)
+                conn.execute(
+                    _completion_persist_sql(),
+                    (
+                        status,
+                        completed_at,
+                        now,
+                        json.dumps(event),
+                        json.dumps(result),
+                        delegation_id,
+                    ),
+                )
+                journal_clears.append(delegation_id)
+                recovered += 1
                 continue
             task = json.loads(task_json or "{}")
             event = {
@@ -389,12 +776,66 @@ def recover_abandoned_delegations() -> int:
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, event_json=?, result_json=?,
+                   delivery_state=CASE
+                     WHEN delivery_state IN ('delivered', 'dropped') THEN delivery_state
+                     ELSE 'pending'
+                   END
                    WHERE delegation_id=?""",
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
             recovered += 1
+    for delegation_id in journal_clears:
+        _clear_pending_completion_journal(delegation_id)
+        with _pending_completion_lock:
+            _pending_completion_writes.pop(delegation_id, None)
+            _pending_completion_publish.discard(delegation_id)
     return recovered
+
+
+def _start_completion_retry_thread_locked() -> None:
+    """Start the retry worker. Caller must hold ``_completion_retry_lock``."""
+    global _completion_retry_thread
+    if (
+        _completion_retry_thread is not None
+        and _completion_retry_thread.is_alive()
+    ):
+        return
+    _completion_retry_stop.clear()
+    _completion_retry_thread = threading.Thread(
+        target=_completion_retry_loop,
+        name="async-delegate-completion-retry",
+        daemon=True,
+    )
+    _completion_retry_thread.start()
+
+
+def _ensure_completion_retry_monitor() -> None:
+    """Retry failed terminal writes until the pending map drains."""
+    with _completion_retry_lock:
+        _start_completion_retry_thread_locked()
+
+
+def _completion_retry_loop() -> None:
+    """Flush pending writes; exit only while holding ownership locks.
+
+    The empty-check and ``_completion_retry_thread = None`` transition must
+    be atomic under ``_completion_retry_lock`` + ``_pending_completion_lock``.
+    Otherwise a ``_remember_pending_completion_write`` between those steps
+    sees the old thread as alive, skips starting a successor, and the
+    worker then exits — stranding the new map entry indefinitely.
+    """
+    global _completion_retry_thread
+    while not _completion_retry_stop.wait(_STALE_CHECK_INTERVAL):
+        _retry_pending_completion_writes(background=True)
+        with _completion_retry_lock:
+            with _pending_completion_lock:
+                if _pending_completion_writes:
+                    continue
+            _completion_retry_thread = None
+            return
+    with _completion_retry_lock:
+        _completion_retry_thread = None
 
 
 def restore_undelivered_completions(target_queue) -> int:
@@ -417,6 +858,8 @@ def restore_undelivered_completions(target_queue) -> int:
     on anymore; the payload stays queryable on the dropped row.
     """
     recover_abandoned_delegations()
+    _reload_pending_completion_journals_into_memory()
+    _retry_pending_completion_writes()
     now = time.time()
     restored = 0
     with _DB_LOCK, _transaction() as conn:
@@ -624,12 +1067,18 @@ def active_count() -> int:
     semantics ``dispatch_async_delegation_batch`` relies on). For the count of
     actual concurrent child subagents (batch expanded), use
     ``active_task_count()``.
+
+    Pending durable completion writes also count: once finalization finishes
+    in memory the record is no longer ``finalizing``, but the terminal
+    payload is not yet safe across shutdown / scale-to-zero until SQLite
+    accepts it. Including the backlog keeps gateway idle guards honest.
     """
     with _records_lock:
-        return sum(
+        live = sum(
             1 for r in _records.values()
             if r.get("status") in {"running", "stalling", "finalizing"}
         )
+    return live + pending_completion_write_count()
 
 
 def active_for_session(origin_ui_session_id: str) -> int:
@@ -691,12 +1140,13 @@ def has_live_for_session(
     """Whether a session still owns any live async delegation.
 
     Live = running / stalling / finalizing — the same states the reapers'
-    keepalive treats as active work.
+    keepalive treats as active work — plus any pending durable completion
+    write whose event still routes to this session.
     """
     if not session_key and not origin_ui_session_id and not parent_session_id:
         return False
     with _records_lock:
-        return any(
+        if any(
             r.get("status") in {"running", "stalling", "finalizing"}
             and _matches_session_selectors(
                 r,
@@ -705,7 +1155,19 @@ def has_live_for_session(
                 parent_session_id=parent_session_id,
             )
             for r in _records.values()
+        ):
+            return True
+    with _pending_completion_lock:
+        pending_events = [event for event, _result in _pending_completion_writes.values()]
+    return any(
+        _matches_session_selectors(
+            event,
+            session_key=session_key,
+            origin_ui_session_id=origin_ui_session_id,
+            parent_session_id=parent_session_id,
         )
+        for event in pending_events
+    )
 
 
 def _new_delegation_id() -> str:
@@ -912,8 +1374,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_completion_event(event_record, result, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
@@ -953,16 +1417,6 @@ def _push_completion_event(
     Best-effort: a failure here must not crash the worker, but it WOULD mean a
     silently-lost result, so we log loudly.
     """
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
-        return
-
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
@@ -1009,15 +1463,7 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    _persist_completion(evt, result)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
+    _publish_completion_event(evt, result, log_label="Async delegation")
 
 
 def dispatch_async_delegation_batch(
@@ -1162,24 +1608,16 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_batch_completion_event(event_record, combined, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _push_batch_completion_event(
     event_record: Dict[str, Any], combined: Dict[str, Any], status: str
 ) -> None:
     """Push a combined async-delegation batch completion event."""
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            event_record.get("delegation_id"), exc,
-        )
-        return
-
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
     evt = {
@@ -1223,15 +1661,7 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    _persist_completion(evt, combined)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
-            event_record.get("delegation_id"), exc,
-        )
+    _publish_completion_event(evt, combined, log_label="Async delegation batch")
 
 
 def _ensure_stale_monitor() -> None:
@@ -1388,32 +1818,34 @@ def _finalize_stalled(delegation_id: str) -> None:
         ),
         "stall_grace_seconds": _STALL_GRACE_SECONDS,
     }
-    if event_record.get("is_batch"):
-        _push_batch_completion_event(
-            event_record,
-            {
-                "results": [],
-                "error": error,
-                "total_duration_seconds": duration,
-                **stall_meta,
-            },
-            "stalled",
-        )
-    else:
-        _push_completion_event(
-            event_record,
-            {
-                "status": "stalled",
-                "summary": None,
-                "error": error,
-                "api_calls": 0,
-                "duration_seconds": duration,
-                "exit_reason": "stalled",
-                **stall_meta,
-            },
-            "stalled",
-        )
-    _finish_finalization(delegation_id, "stalled")
+    try:
+        if event_record.get("is_batch"):
+            _push_batch_completion_event(
+                event_record,
+                {
+                    "results": [],
+                    "error": error,
+                    "total_duration_seconds": duration,
+                    **stall_meta,
+                },
+                "stalled",
+            )
+        else:
+            _push_completion_event(
+                event_record,
+                {
+                    "status": "stalled",
+                    "summary": None,
+                    "error": error,
+                    "api_calls": 0,
+                    "duration_seconds": duration,
+                    "exit_reason": "stalled",
+                    **stall_meta,
+                },
+                "stalled",
+            )
+    finally:
+        _finish_finalization(delegation_id, "stalled")
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
@@ -1513,6 +1945,10 @@ def interrupt_all(reason: str = "shutdown") -> int:
     Used on ``/stop`` and gateway shutdown so a dangling background subagent
     can't keep burning tokens with no one listening. The child still emits a
     completion event (status='interrupted') via the normal finalize path.
+
+    On shutdown-shaped reasons, also drain the pending completion-write
+    backlog so a graceful exit does not discard terminal payloads that only
+    exist in memory / the JSON journal.
     """
     count = 0
     with _records_lock:
@@ -1533,6 +1969,16 @@ def interrupt_all(reason: str = "shutdown") -> int:
                 )
     if count:
         logger.info("Interrupted %d async delegation(s) (%s)", count, reason)
+    reason_l = (reason or "").lower()
+    if "shutdown" in reason_l or "stop" in reason_l:
+        remaining = drain_pending_completion_writes(timeout=5.0)
+        if remaining:
+            logger.warning(
+                "interrupt_all (%s): %d pending completion write(s) still "
+                "unflushed (journal retained for crash recovery)",
+                reason,
+                remaining,
+            )
     return count
 
 
@@ -1595,7 +2041,7 @@ def interrupt_for_session(
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor + monitor."""
-    global _executor, _executor_max_workers, _monitor_thread
+    global _executor, _executor_max_workers, _monitor_thread, _completion_retry_thread
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -1607,5 +2053,27 @@ def _reset_for_tests() -> None:
         _monitor_thread = None
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
+    _completion_retry_stop.set()
+    with _completion_retry_lock:
+        retry_thread = _completion_retry_thread
+        _completion_retry_thread = None
+    if retry_thread is not None and retry_thread.is_alive():
+        retry_thread.join(timeout=2)
+    with _pending_completion_lock:
+        pending_ids = list(_pending_completion_writes)
+        _pending_completion_writes.clear()
+        _pending_completion_publish.clear()
+    for delegation_id in pending_ids:
+        _clear_pending_completion_journal(delegation_id)
+    try:
+        journal_dir = get_hermes_home() / "async_delegation_pending_writes"
+        if journal_dir.is_dir():
+            for path in journal_dir.glob("*.json"):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
     with _records_lock:
         _records.clear()
