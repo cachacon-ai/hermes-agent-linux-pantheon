@@ -154,26 +154,129 @@ class PtySessionRegistry:
         self._buffer_cap = buffer_cap
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
+        self._key_locks: Dict[str, asyncio.Lock] = {}
+        # Tasks currently inside attach_or_spawn for a key (asyncio is
+        # single-threaded, so this counter is mutated only between awaits).
+        self._lock_refs: Dict[str, int] = {}
+
+    def _acquire_key_lock(self, key: str) -> asyncio.Lock:
+        lock = self._key_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._key_locks[key] = lock
+        self._lock_refs[key] = self._lock_refs.get(key, 0) + 1
+        return lock
+
+    def _release_key_lock(self, key: str) -> None:
+        """Drop the per-key lock once nothing can still reference it."""
+        refs = self._lock_refs.get(key, 0) - 1
+        if refs > 0:
+            self._lock_refs[key] = refs
+            return
+        self._lock_refs.pop(key, None)
+        if key not in self._sessions:
+            self._key_locks.pop(key, None)
+
+    def _prune_key_lock(self, key: str) -> None:
+        """Remove a key's lock when idle and unreferenced (reap/shutdown)."""
+        if self._lock_refs.get(key, 0) > 0:
+            return
+        if key in self._sessions:
+            return
+        self._key_locks.pop(key, None)
+
+    @staticmethod
+    async def _close_bridge(bridge) -> None:
+        """Close a bridge even when the calling task is being cancelled."""
+        task = asyncio.current_task()
+        cleared = 0
+        if task is not None:
+            # 3.11+: a pending cancel aborts every await, including cleanup.
+            while task.cancelling() > 0:
+                task.uncancel()
+                cleared += 1
+        try:
+            try:
+                await asyncio.shield(asyncio.to_thread(bridge.close))
+            except Exception:
+                pass
+        finally:
+            if task is not None:
+                for _ in range(cleared):
+                    task.cancel()
+
+    async def _spawn_owned(self, spawn: Callable[[], object]):
+        """Run ``spawn`` off-thread and own the bridge through cancellation.
+
+        Cancelling an executor await does not stop the worker thread, so a
+        bare await would release the per-key lock while the PTY keeps coming
+        up unregistered. Shield the spawn, reclaim the result on cancel, and
+        close any bridge that never gets registered.
+        """
+        loop = asyncio.get_running_loop()
+        spawn_fut = loop.run_in_executor(None, spawn)
+        try:
+            return await asyncio.shield(spawn_fut)
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            cleared = 0
+            if task is not None:
+                while task.cancelling() > 0:
+                    task.uncancel()
+                    cleared += 1
+            bridge = None
+            try:
+                try:
+                    bridge = await asyncio.shield(spawn_fut)
+                except Exception:
+                    bridge = None
+                if bridge is not None:
+                    # Already cleared cancel depth; close without nesting
+                    # another uncancel/restore cycle.
+                    try:
+                        await asyncio.shield(asyncio.to_thread(bridge.close))
+                    except Exception:
+                        pass
+                    bridge = None
+            finally:
+                if task is not None:
+                    for _ in range(cleared):
+                        task.cancel()
+            raise
 
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
                               ) -> Tuple[PtySession, bool]:
-        await self.reap_idle()
-        existing = self._sessions.get(key)
-        if existing is not None and existing.alive:
-            return existing, False
-        if existing is not None:                       # dead remnant
-            await existing.close()
-            self._sessions.pop(key, None)
-        if len(self._sessions) >= self._max:
-            self._reap_one_idle_or_raise()
-        # PTY spawn does blocking fork/exec work — keep it off the event
-        # loop (#53227).
-        bridge = await asyncio.to_thread(spawn)
-        session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
-                             read_timeout=self._read_timeout)
-        await session.start()
-        self._sessions[key] = session
-        return session, True
+        # Concurrent /api/pty upgrades with the same attach token must not
+        # both pass the "no session yet" check while spawn is in flight.
+        lock = self._acquire_key_lock(key)
+        try:
+            async with lock:
+                await self.reap_idle()
+                existing = self._sessions.get(key)
+                if existing is not None and existing.alive:
+                    return existing, False
+                if existing is not None:                       # dead remnant
+                    await existing.close()
+                    self._sessions.pop(key, None)
+                    self._prune_key_lock(key)
+                if len(self._sessions) >= self._max:
+                    self._reap_one_idle_or_raise()
+                # PTY spawn does blocking fork/exec work — keep it off the
+                # event loop (#53227). Own the result through cancellation so
+                # a cancelled owner cannot leak a live PTY outside the
+                # registry / cap / reaper (PAN-81).
+                bridge = await self._spawn_owned(spawn)
+                session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
+                                     read_timeout=self._read_timeout)
+                try:
+                    await session.start()
+                    self._sessions[key] = session
+                except BaseException:
+                    await self._close_bridge(bridge)
+                    raise
+                return session, True
+        finally:
+            self._release_key_lock(key)
 
     def detach(self, key: str, ws) -> None:
         s = self._sessions.get(key)
@@ -190,6 +293,7 @@ class PtySessionRegistry:
         ]
         for key in doomed:
             await self._sessions.pop(key).close()
+            self._prune_key_lock(key)
 
     def _reap_one_idle_or_raise(self) -> None:
         idle = [s for s in self._sessions.values()
@@ -198,8 +302,15 @@ class PtySessionRegistry:
             raise RegistryFull()
         oldest = min(idle, key=lambda s: s.last_detached_at or 0.0)
         self._sessions.pop(oldest.key, None)
+        self._prune_key_lock(oldest.key)
         asyncio.create_task(oldest.close())
 
     async def close_all(self) -> None:
         for key in list(self._sessions):
             await self._sessions.pop(key).close()
+            self._prune_key_lock(key)
+        # Drop any leftover locks from rejected/cancelled attaches that had
+        # no in-flight waiter left. Locks still referenced by an in-flight
+        # attach_or_spawn stay until that caller's finally releases them.
+        for key in list(self._key_locks):
+            self._prune_key_lock(key)
