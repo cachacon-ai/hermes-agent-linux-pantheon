@@ -62,6 +62,20 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+def _content_rendered_from_connector(result: Any) -> bool:
+    """Map a connector outbound result onto ``SendResult.content_rendered``.
+
+    Connectors that omit the field (legacy) default to ``True`` — same as
+    ``SendResult`` itself. When the field is present, it is coerced with
+    ``bool()`` so explicit ``False`` / ``0`` mean the call was ACKed but the
+    frame was not applied (#82656); stream consumers must not treat that as
+    on-screen delivery.
+    """
+    if not isinstance(result, dict) or "content_rendered" not in result:
+        return True
+    return bool(result.get("content_rendered"))
+
+
 # Table-driven length-unit selection from the descriptor's ``len_unit``.
 _LEN_FNS: Dict[str, Callable[[str], int]] = {
     "chars": len,
@@ -752,9 +766,13 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if result.get("success"):
             # The connector returns the stream's ts as the message identity.
+            # Propagate content_rendered: an ACKed-but-unapplied seal must not
+            # suppress the gateway's corrective final (#82656).
             return SendResult(
                 success=True,
                 message_id=str(result.get("message_id") or "") or None,
+                content_rendered=_content_rendered_from_connector(result),
+                raw_response=result,
             )
         return SendResult(
             success=False, error=str(result.get("error") or "draft seal failed")
@@ -1871,6 +1889,7 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
+            content_rendered=_content_rendered_from_connector(result),
             raw_response=result,
         )
 
@@ -2080,6 +2099,8 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
+            content_rendered=_content_rendered_from_connector(result),
+            raw_response=result,
         )
 
     def auto_thread_info_for_chat(
@@ -2296,6 +2317,8 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id") or message_id,
             error=result.get("error"),
+            content_rendered=_content_rendered_from_connector(result),
+            raw_response=result,
         )
 
     async def delete_message(
