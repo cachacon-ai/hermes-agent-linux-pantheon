@@ -13401,6 +13401,7 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
         tail_count: int = 0,
+        system_prompt: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -13455,7 +13456,8 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
         session's JSON config in the same transaction; a ``None`` value
-        removes that key. Returns the new active count.
+        removes that key. When supplied, ``system_prompt`` is also persisted
+        in the same transaction. Returns the new active count.
         """
 
         def _do(conn):
@@ -13612,6 +13614,14 @@ class SessionDB(SessionArtifactsMixin, SessionSearchMixin, SessionSchemaMixin, S
                     "model_config = ? WHERE id = ?",
                     (inserted, tool_calls_total, patched_model_config, session_id),
                 )
+            if system_prompt is not None:
+                system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+                conn.execute(
+                    "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL "
+                    "WHERE id = ?",
+                    (system_prompt_hash, session_id),
+                )
+                self._delete_unreferenced_system_prompts(conn)
             return inserted
 
         return self._execute_write(_do)

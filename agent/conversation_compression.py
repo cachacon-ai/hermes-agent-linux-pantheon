@@ -3442,6 +3442,11 @@ def compress_context(
     # boundary, so the previous flush baseline remains authoritative.
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    # Per-attempt durability signal consumed by hosts that also own a
+    # SessionManager DB handle. A DB handle alone does not mean this compressor
+    # wrote the transcript; restored agents commonly start with
+    # _session_db_created=False while their live row already exists.
+    agent._last_compression_db_commit_succeeded = False
     # Clear the lock-skip signal at the VERY TOP, before the codex route and
     # the breaker gates below can early-return (per-attempt state rule,
     # #58630/#69853). A stale ``True``/holder value from a prior lock-skip
@@ -4987,6 +4992,9 @@ def compress_context(
                         lock_holder=_lock_holder,
                         tail_count=_tail_count,
                     )
+                    # Set immediately after the atomic transcript write so a
+                    # host never repeats it through a second, unfenced commit.
+                    agent._last_compression_db_commit_succeeded = True
                     split_status = "in_place_committed"
                     # Post-commit contract (#98450, mirrors
                     # _sync_micro_compact_to_db): archive_and_compact just
@@ -5181,6 +5189,10 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
+                    # The parent closure and child transcript are committed
+                    # atomically; the outer ACP handler must not publish them
+                    # a second time after this fenced write.
+                    agent._last_compression_db_commit_succeeded = True
                     # For the `already_present` outcome the live-dict stamping is
                     # handled by the run_agent _compress_context wrapper's
                     # _sync_persisted_markers (it mirrors the handoff stamps back

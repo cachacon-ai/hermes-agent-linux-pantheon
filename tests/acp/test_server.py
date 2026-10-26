@@ -457,7 +457,109 @@ class TestPrompt:
 
 
 
+@pytest.mark.asyncio
+async def test_model_switch_after_rotated_restore_keeps_live_tip_for_next_turn(
+    agent, mock_manager, tmp_path
+):
+    import time
 
+    db = SessionDB(tmp_path / "state.db")
+    mock_manager._db_instance = db
+    initial = mock_manager.create_session(cwd="/tmp")
+    parent_id = initial.session_id
+    child_id = f"{parent_id}-child"
+    parent_messages = [
+        {"role": "user", "content": "before compression"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+    db.append_messages_batch(parent_id, parent_messages)
+    db.create_session(
+        session_id=child_id,
+        source="acp",
+        parent_session_id=parent_id,
+    )
+    db.append_messages_batch(
+        child_id,
+        [{"role": "user", "content": "compressed summary"}],
+    )
+
+    def _end_parent(conn):
+        conn.execute(
+            "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
+            "WHERE id = ?",
+            (time.time(), parent_id),
+        )
+
+    db._execute_write(_end_parent)
+
+    made_session_ids = []
+
+    class FakeAgent:
+        def __init__(self, session_id, model=None):
+            self.session_id = session_id
+            self.model = model or "test-model"
+            self.provider = "openrouter"
+            self.base_url = None
+            self.api_mode = None
+            self._session_db = db
+            self._session_db_created = False
+
+        def run_conversation(
+            self,
+            *,
+            user_message,
+            conversation_history,
+            task_id,
+            persist_user_message,
+        ):
+            made_session_ids.append(self.session_id)
+            messages = list(conversation_history)
+            messages.extend(
+                [
+                    {"role": "user", "content": persist_user_message},
+                    {"role": "assistant", "content": "continued reply"},
+                ]
+            )
+            return {"messages": messages, "final_response": "continued reply"}
+
+    def _make_agent(**kwargs):
+        return FakeAgent(
+            session_id=kwargs["session_id"],
+            model=kwargs.get("model"),
+        )
+
+    mock_manager._make_agent = _make_agent
+    with mock_manager._lock:
+        del mock_manager._sessions[parent_id]
+
+    state = mock_manager.get_session(parent_id)
+    assert state is not None
+    assert state.agent.session_id == child_id
+
+    with patch.object(
+        agent,
+        "_resolve_model_selection",
+        return_value=("openrouter", "new-model"),
+    ):
+        response = await agent.set_session_model("new-model", parent_id)
+
+    assert isinstance(response, SetSessionModelResponse)
+    assert state.agent.session_id == child_id
+
+    turn_response = await agent.prompt(
+        prompt=[TextContentBlock(type="text", text="next turn")],
+        session_id=parent_id,
+    )
+
+    assert turn_response.stop_reason == "end_turn"
+    assert made_session_ids == [child_id]
+    child_contents = [
+        message.get("content")
+        for message in db.get_messages_as_conversation(child_id)
+    ]
+    assert "compressed summary" in child_contents
+    assert "next turn" in child_contents
+    assert "continued reply" in child_contents
 
 
 
@@ -510,12 +612,37 @@ class TestSlashCommands:
     def test_reset_clears_history(self, agent, mock_manager):
         state = self._make_state(mock_manager)
         state.history = [{"role": "user", "content": "hello"}]
-        result = agent._handle_slash_command("/reset", state)
+        state.agent.session_id = state.session_id
+        with patch.object(
+            agent.session_manager, "save_session", wraps=agent.session_manager.save_session
+        ) as mock_save:
+            result = agent._handle_slash_command("/reset", state)
         assert "cleared" in result.lower()
         assert len(state.history) == 0
+        mock_save.assert_called_once_with(state.session_id, sync_transcript=True)
 
+    def test_reset_rejects_while_turn_running(self, agent, mock_manager):
+        state = self._make_state(mock_manager)
+        state.history = [{"role": "user", "content": "hello"}]
+        state.is_running = True
+        with patch.object(agent.session_manager, "save_session") as mock_save:
+            result = agent._handle_slash_command("/reset", state)
+        assert "while a turn is in progress" in result.lower()
+        assert state.history == [{"role": "user", "content": "hello"}]
+        mock_save.assert_not_called()
 
-
+    def test_reset_restores_history_when_persist_fails(self, agent, mock_manager):
+        state = self._make_state(mock_manager)
+        state.history = [{"role": "user", "content": "keep me"}]
+        state.agent.session_id = state.session_id
+        with patch.object(
+            agent.session_manager,
+            "save_session",
+            side_effect=RuntimeError("disk full"),
+        ):
+            result = agent._handle_slash_command("/reset", state)
+        assert "failed to persist" in result.lower()
+        assert state.history == [{"role": "user", "content": "keep me"}]
 
     def test_compact_compresses_context(self, agent, mock_manager):
         state = self._make_state(mock_manager)
@@ -528,12 +655,20 @@ class TestSlashCommands:
         state.agent.compression_enabled = True
         state.agent._cached_system_prompt = "system"
         state.agent.tools = None
-        original_session_db = object()
-        state.agent._session_db = original_session_db
+        state.agent.session_id = state.session_id
+        state.agent._session_db = None
+        state.agent._session_db_created = False
+        state.agent._last_compaction_in_place = False
 
         def _compress_context(messages, system_prompt, *, approx_tokens, task_id, force):
+            # SessionDB must stay attached when present — mock has none.
             assert state.agent._session_db is None
-            assert messages == state.history
+            assert messages == [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+                {"role": "user", "content": "three"},
+                {"role": "assistant", "content": "four"},
+            ]
             assert system_prompt == "system"
             assert approx_tokens == 40
             assert task_id == state.session_id
@@ -543,7 +678,11 @@ class TestSlashCommands:
         state.agent._compress_context = MagicMock(side_effect=_compress_context)
 
         with (
-            patch.object(agent.session_manager, "save_session") as mock_save,
+            patch.object(
+                agent.session_manager,
+                "commit_compressed_transcript",
+                wraps=agent.session_manager.commit_compressed_transcript,
+            ) as mock_commit,
             patch(
                 "agent.model_metadata.estimate_request_tokens_rough",
                 side_effect=[40, 12],
@@ -553,8 +692,10 @@ class TestSlashCommands:
 
         assert "Context compressed: 4 -> 1 messages" in result
         assert "~40 -> ~12 tokens" in result
-        assert state.history == [{"role": "user", "content": "summary"}]
-        assert state.agent._session_db is original_session_db
+        assert len(state.history) == 1
+        assert state.history[0]["role"] == "user"
+        assert state.history[0]["content"] == "summary"
+        assert state.agent._cached_system_prompt == "new-system"
         state.agent._compress_context.assert_called_once_with(
             [
                 {"role": "user", "content": "one"},
@@ -567,7 +708,247 @@ class TestSlashCommands:
             task_id=state.session_id,
             force=True,
         )
-        mock_save.assert_called_once_with(state.session_id)
+        assert mock_commit.call_count == 1
+        commit_args, commit_kwargs = mock_commit.call_args
+        assert commit_args[0] == state.session_id
+        assert commit_args[1][0]["content"] == "summary"
+        assert commit_kwargs["system_prompt"] == "new-system"
+        db = agent.session_manager._get_db()
+        live = db.get_messages_as_conversation(state.session_id)
+        assert len(live) == 1
+        assert live[0]["content"] == "summary"
+        assert db.get_session(state.session_id)["system_prompt"] == "new-system"
+
+    def test_compress_rejects_while_turn_running(self, agent, mock_manager):
+        state = self._make_state(mock_manager)
+        state.history = [{"role": "user", "content": "one"}]
+        state.is_running = True
+        state.agent._compress_context = MagicMock()
+        result = agent._handle_slash_command("/compress", state)
+        assert "while a turn is in progress" in result.lower()
+        state.agent._compress_context.assert_not_called()
+
+    def test_compress_restores_memory_when_persist_fails(self, agent, mock_manager):
+        state = self._make_state(mock_manager)
+        original = [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+        ]
+        state.history = list(original)
+        state.agent._cached_system_prompt = "old-system"
+        state.agent.tools = None
+        state.agent.session_id = state.session_id
+        state.agent._session_db = None
+        state.agent._session_db_created = False
+        state.agent._last_compaction_in_place = False
+        state.agent._compress_context = MagicMock(
+            return_value=([{"role": "user", "content": "summary"}], "new-system")
+        )
+        with (
+            patch.object(
+                agent.session_manager,
+                "commit_compressed_transcript",
+                side_effect=RuntimeError("locked"),
+            ),
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                return_value=10,
+            ),
+        ):
+            result = agent._handle_slash_command("/compress", state)
+        assert "failed to persist" in result.lower()
+        assert state.history == original
+        assert state.agent._cached_system_prompt == "old-system"
+
+    def test_compress_rolls_back_db_and_memory_when_prompt_write_fails(
+        self, agent, mock_manager, tmp_path
+    ):
+        db = SessionDB(tmp_path / "state.db")
+        mock_manager._db_instance = db
+        state = self._make_state(mock_manager)
+        original = [
+            {"role": "user", "content": "long question"},
+            {"role": "assistant", "content": "long answer"},
+        ]
+        compacted = [{"role": "user", "content": "summary"}]
+        db.append_messages_batch(state.session_id, original)
+        db.update_system_prompt(state.session_id, "old-system")
+        state.history = list(original)
+        state.agent.session_id = state.session_id
+        state.agent._session_db = None  # Exercise the manager-owned fallback commit.
+        state.agent._session_db_created = False
+        state.agent._cached_system_prompt = "old-system"
+        state.agent.tools = None
+        state.agent._last_compression_db_commit_succeeded = False
+        state.agent._compress_context = MagicMock(
+            return_value=(compacted, "new-system")
+        )
+
+        with (
+            patch.object(
+                db,
+                "_store_system_prompt",
+                side_effect=OSError("prompt storage failed"),
+            ),
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                return_value=10,
+            ),
+        ):
+            result = agent._handle_slash_command("/compress", state)
+
+        assert "failed to persist" in result.lower()
+        assert state.history == original
+        assert state.agent._cached_system_prompt == "old-system"
+        assert [
+            message.get("content")
+            for message in db.get_messages_as_conversation(state.session_id)
+        ] == ["long question", "long answer"]
+        assert db.get_session(state.session_id)["system_prompt"] == "old-system"
+        assert all(
+            message.get("content") != "summary"
+            for message in db.get_messages(
+                state.session_id, include_compacted=True
+            )
+        )
+
+    def test_compress_keeps_session_db_for_owned_in_place_commit(self, agent, mock_manager):
+        state = self._make_state(mock_manager)
+        db = agent.session_manager._get_db()
+        state.history = [
+            {"role": "user", "content": "long one"},
+            {"role": "assistant", "content": "long two"},
+        ]
+        db.append_messages_batch(state.session_id, state.history)
+        db.update_system_prompt(state.session_id, "old-system")
+        state.agent.session_id = state.session_id
+        state.agent._session_db = db
+        state.agent._session_db_created = True
+        state.agent._cached_system_prompt = "old-system"
+        state.agent.tools = None
+        state.agent._last_compaction_in_place = False
+
+        def _compress_context(messages, system_prompt, *, approx_tokens, task_id, force):
+            assert state.agent._session_db is db
+            compacted = [{"role": "user", "content": "summary only"}]
+            db.archive_and_compact(state.session_id, compacted)
+            db.update_system_prompt(state.session_id, "new-system")
+            state.agent._cached_system_prompt = "new-system"
+            state.agent._last_compression_db_commit_succeeded = True
+            state.agent._last_compaction_in_place = True
+            return compacted, "new-system"
+
+        state.agent._compress_context = MagicMock(side_effect=_compress_context)
+
+        with (
+            patch.object(agent.session_manager, "save_session") as mock_save,
+            patch.object(
+                agent.session_manager, "commit_compressed_transcript"
+            ) as mock_commit,
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                side_effect=[40, 12],
+            ),
+        ):
+            result = agent._handle_slash_command("/compress", state)
+
+        assert "Context compressed: 2 -> 1 messages" in result
+        assert len(state.history) == 1
+        assert state.history[0]["content"] == "summary only"
+        mock_save.assert_not_called()
+        mock_commit.assert_not_called()
+        live = db.get_messages_as_conversation(state.session_id)
+        assert len(live) == 1
+        assert live[0]["content"] == "summary only"
+        assert db.get_session(state.session_id)["system_prompt"] == "new-system"
+        archived = db.get_messages(state.session_id, include_compacted=True)
+        assert any(row.get("content") == "long one" for row in archived)
+
+
+
+    def test_compress_after_cold_restore_uses_commit_signal_and_preserves_tail(
+        self, agent, mock_manager, tmp_path
+    ):
+        db = SessionDB(tmp_path / "state.db")
+        mock_manager._db_instance = db
+        initial = self._make_state(mock_manager)
+        session_id = initial.session_id
+        original = [
+            {"role": "user", "content": "long question"},
+            {"role": "assistant", "content": "long answer"},
+        ]
+        initial.history = list(original)
+        db.append_messages_batch(session_id, original)
+        db.update_system_prompt(session_id, "old-system")
+
+        with mock_manager._lock:
+            del mock_manager._sessions[session_id]
+        mock_manager._agent_factory = lambda: MagicMock(
+            name="RestoredAIAgent",
+            session_id=session_id,
+            _session_db=db,
+            _session_db_created=False,
+            _cached_system_prompt="old-system",
+            tools=None,
+        )
+        state = mock_manager.get_session(session_id)
+        assert state is not None
+        assert state.agent._session_db_created is False
+        assert state.agent._session_db is db
+
+        compacted = [{"role": "user", "content": "summary"}]
+        concurrent_tail = [
+            {"role": "user", "content": "concurrent user turn"},
+            {"role": "assistant", "content": "concurrent assistant reply"},
+        ]
+
+        def _compress_context(
+            messages, system_prompt, *, approx_tokens, task_id, force
+        ):
+            watermark = db.get_active_message_watermark(session_id)
+            db.append_messages_batch(session_id, concurrent_tail)
+            db.archive_and_compact(
+                session_id,
+                compacted,
+                watermark=watermark,
+            )
+            db.update_system_prompt(session_id, "new-system")
+            state.agent._last_compression_db_commit_succeeded = True
+            state.agent._cached_system_prompt = "new-system"
+            return compacted, "new-system"
+
+        state.agent._compress_context = MagicMock(side_effect=_compress_context)
+
+        with (
+            patch.object(
+                mock_manager,
+                "commit_compressed_transcript",
+                wraps=mock_manager.commit_compressed_transcript,
+            ) as mock_commit,
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                side_effect=[40, 12],
+            ),
+        ):
+            result = agent._handle_slash_command("/compress", state)
+
+        assert "Context compressed: 2 -> 1 messages" in result
+        mock_commit.assert_not_called()
+        live_contents = [
+            message.get("content")
+            for message in db.get_messages_as_conversation(session_id)
+        ]
+        assert live_contents == [
+            "summary",
+            "concurrent user turn",
+            "concurrent assistant reply",
+        ]
+        archived_contents = [
+            message.get("content")
+            for message in db.get_messages(session_id, include_compacted=True)
+        ]
+        assert "long question" in archived_contents
+        assert "long answer" in archived_contents
 
 
     def test_unknown_command_returns_none(self, agent, mock_manager):
