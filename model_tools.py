@@ -33,6 +33,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import (
     CHECK_FN_CACHE_BYPASS,
+    _CHECK_FN_TTL_SECONDS,
     check_fn_cache_scope,
     discover_builtin_tools,
     registry,
@@ -297,11 +298,15 @@ _LEGACY_TOOLSET_MAP = {
 # because quiet_mode=False has stdout side effects (tool-selection prints).
 #
 # Invalidation happens transparently via the registry's _generation counter,
-# which bumps on register() / deregister() / register_toolset_alias(). The
-# inner check_fn TTL cache in registry.py handles environment drift (Docker
-# daemon start/stop, env var changes, etc.) on a 30 s horizon.
-_tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+# which bumps on register() / deregister() / register_toolset_alias().
+# Availability probes are TTL-cached in registry.py (~30 s); the memoized
+# tool list must expire on the same horizon so a transient probe failure on
+# the first quiet-mode build cannot pin terminal/file tools as unavailable
+# until process restart (PAN-82).
+_tool_defs_cache: Dict[tuple, Tuple[float, List[Dict[str, Any]]]] = {}
 _tool_defs_cache_lock = threading.Lock()
+# Prevent invalidated in-flight misses from repopulating stale results.
+_tool_defs_cache_epoch = 0
 
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
@@ -316,7 +321,9 @@ def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
     execute_code sandbox reconfigured)."""
+    global _tool_defs_cache_epoch
     with _tool_defs_cache_lock:
+        _tool_defs_cache_epoch += 1
         _tool_defs_cache.clear()
 
 
@@ -376,15 +383,20 @@ def get_tool_definitions(
                 profile_scope,
             )
         with _tool_defs_cache_lock:
-            cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
-        if cached is not None:
-            # Update _last_resolved_tool_names so downstream callers see
-            # consistent state even on a cache hit.
-            global _last_resolved_tool_names
-            _last_resolved_tool_names = [t["function"]["name"] for t in cached]
-            # Return a shallow copy of the list but share the dict references —
-            # schemas are treated as read-only by all known callers.
-            return list(cached)
+            cached_entry = _tool_defs_cache.get(cache_key) if cache_key is not None else None
+            cache_epoch = _tool_defs_cache_epoch
+        if cached_entry is not None:
+            cached_at, cached = cached_entry
+            if time.monotonic() - cached_at < _CHECK_FN_TTL_SECONDS:
+                # Update _last_resolved_tool_names so downstream callers see
+                # consistent state even on a cache hit.
+                global _last_resolved_tool_names
+                _last_resolved_tool_names = [t["function"]["name"] for t in cached]
+                # Return a shallow copy of the list but share the dict references —
+                # schemas are treated as read-only by all known callers.
+                return list(cached)
+            with _tool_defs_cache_lock:
+                _tool_defs_cache.pop(cache_key, None)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
@@ -402,11 +414,18 @@ def get_tool_definitions(
         with _tool_defs_cache_lock:
             # Another thread may have populated this exact key while this
             # thread computed. Reuse it and serialize capacity eviction.
-            cached = _tool_defs_cache.get(cache_key)
-            if cached is None:
+            cached_entry = _tool_defs_cache.get(cache_key)
+            if cached_entry is None and cache_epoch == _tool_defs_cache_epoch:
                 if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
                     _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
-                _tool_defs_cache[cache_key] = result
+                cached_at = time.monotonic()
+                _tool_defs_cache[cache_key] = (cached_at, result)
+                cached = result
+            elif cached_entry is not None:
+                cached = cached_entry[1]
+            else:
+                # Invalidation raced this computation; return this result to
+                # the current caller, but never let it refill the shared cache.
                 cached = result
         return list(cached)
     if quiet_mode:

@@ -253,6 +253,168 @@ class TestCheckFnTransientFailureSuppression:
         assert len(reg._check_fn_cache) <= reg._CHECK_FN_CACHE_MAX
         assert len(reg._check_fn_last_good) <= reg._CHECK_FN_CACHE_MAX
 
+    def test_quiet_mode_tool_defs_recover_after_probe_failure(self, monkeypatch):
+        """PAN-82: a failed first quiet-mode build must not pin missing tools
+        after the availability probe recovers."""
+        import model_tools
+        import tools.registry as reg
+
+        state = {"ok": False}
+
+        def flaky_terminal_check():
+            return state["ok"]
+
+        monkeypatch.setattr(
+            terminal_tool_module, "check_terminal_requirements", flaky_terminal_check
+        )
+        import tools as tools_pkg
+
+        monkeypatch.setattr(
+            tools_pkg, "check_file_requirements", flaky_terminal_check
+        )
+
+        t = {"now": 2000.0}
+        monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
+        monkeypatch.setattr(model_tools.time, "monotonic", lambda: t["now"])
+
+        reg.invalidate_check_fn_cache()
+        failed = get_tool_definitions(
+            enabled_toolsets=["terminal", "file"], quiet_mode=True
+        )
+        failed_names = {x["function"]["name"] for x in failed}
+        assert "read_file" not in failed_names
+
+        state["ok"] = True
+        t["now"] += reg._CHECK_FN_TTL_SECONDS + 1
+        recovered = get_tool_definitions(
+            enabled_toolsets=["terminal", "file"], quiet_mode=True
+        )
+        recovered_names = {x["function"]["name"] for x in recovered}
+        assert {"read_file", "terminal"}.issubset(recovered_names)
+
+    def test_quiet_mode_staggered_keys_clear_on_availability_recovery(
+        self, monkeypatch
+    ):
+        """PAN-82: a late-built outer key must not retain a False verdict after
+        a sibling key's re-probe recovers the shared availability check."""
+        import model_tools
+        import tools.registry as reg
+
+        tool_name = "staggered_quiet_availability_probe"
+        state = {"ok": False}
+        probe_calls = {"n": 0}
+
+        def probe():
+            probe_calls["n"] += 1
+            return state["ok"]
+
+        reg.registry.register(
+            name=tool_name,
+            toolset="staggered-cache-test",
+            schema={
+                "name": tool_name,
+                "description": "test-only staggered quiet-mode availability probe",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args: "ok",
+            check_fn=probe,
+        )
+
+        t = {"now": 1000.0}
+        monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
+        monkeypatch.setattr(model_tools.time, "monotonic", lambda: t["now"])
+
+        try:
+            reg.invalidate_check_fn_cache()
+            model_tools._clear_tool_defs_cache()
+
+            # t=0: key A probes False and memoizes the empty tool list.
+            first = get_tool_definitions(
+                enabled_toolsets=["staggered-cache-test"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            assert tool_name not in {x["function"]["name"] for x in first}
+            assert probe_calls["n"] == 1
+
+            # t=20: key B wraps the still-cached False registry verdict under a
+            # different outer key (distinct enabled_toolsets fingerprint).
+            t["now"] += 20.0
+            staggered = get_tool_definitions(
+                enabled_toolsets=["staggered-cache-test", "terminal"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            assert tool_name not in {x["function"]["name"] for x in staggered}
+            assert probe_calls["n"] == 1  # registry TTL still serving False
+            assert len(model_tools._tool_defs_cache) == 2
+
+            # t=31: probe recovers; key A expires and re-probes True. That
+            # effective verdict change must clear *all* outer keys so key B
+            # cannot keep serving the pre-recovery False list.
+            state["ok"] = True
+            t["now"] = 1000.0 + reg._CHECK_FN_TTL_SECONDS + 1.0
+            recovered = get_tool_definitions(
+                enabled_toolsets=["staggered-cache-test"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            assert tool_name in {x["function"]["name"] for x in recovered}
+            assert probe_calls["n"] == 2
+
+            staggered_after = get_tool_definitions(
+                enabled_toolsets=["staggered-cache-test", "terminal"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            staggered_names = {x["function"]["name"] for x in staggered_after}
+            assert tool_name in staggered_names
+            # The recovery-triggered invalidation leaves key A uncached;
+            # key B is the sole fresh entry after this second miss.
+            assert len(model_tools._tool_defs_cache) == 1
+        finally:
+            reg.registry.deregister(tool_name)
+            reg.invalidate_check_fn_cache()
+            model_tools._clear_tool_defs_cache()
+
+    def test_invalidate_check_fn_cache_clears_quiet_mode_tool_defs(
+        self, monkeypatch
+    ):
+        """Explicit availability invalidation must drop poisoned tool-def caches."""
+        import model_tools
+        import tools.registry as reg
+
+        state = {"ok": False}
+
+        def flaky_terminal_check():
+            return state["ok"]
+
+        monkeypatch.setattr(
+            terminal_tool_module, "check_terminal_requirements", flaky_terminal_check
+        )
+        import tools as tools_pkg
+
+        monkeypatch.setattr(
+            tools_pkg, "check_file_requirements", flaky_terminal_check
+        )
+
+        reg.invalidate_check_fn_cache()
+        failed = get_tool_definitions(
+            enabled_toolsets=["terminal", "file"], quiet_mode=True
+        )
+        assert "read_file" not in {x["function"]["name"] for x in failed}
+        assert model_tools._tool_defs_cache
+
+        state["ok"] = True
+        reg.invalidate_check_fn_cache()
+        assert not model_tools._tool_defs_cache
+
+        recovered = get_tool_definitions(
+            enabled_toolsets=["terminal", "file"], quiet_mode=True
+        )
+        recovered_names = {x["function"]["name"] for x in recovered}
+        assert {"read_file", "terminal"}.issubset(recovered_names)
+
     def test_subagent_keeps_file_tools_through_docker_flake(self, monkeypatch):
         """End-to-end: a docker probe that flakes on the 2nd build keeps the
         file/terminal toolset available for the subagent being constructed."""

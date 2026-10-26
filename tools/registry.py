@@ -370,7 +370,16 @@ def _check_fn_cached(fn: Callable) -> bool:
     if scope == CHECK_FN_CACHE_BYPASS:
         return _run_check_fn_uncached(fn, unresolved_scope=True)
     cache_key = (fn, scope)
+    # Capture the prior effective verdict BEFORE pruning expired entries.
+    # Normal false→true recovery after TTL deletes the stale False first; if we
+    # only compare after prune, ``prior_value`` is always None and the quiet-mode
+    # tool-def cache is never cleared for sibling keys built later in the TTL
+    # window (PAN-82 staggered-key case).
+    prior_value = None
     with _check_fn_cache_lock:
+        prior = _check_fn_cache.get(cache_key)
+        if prior is not None:
+            prior_value = prior[1]
         _prune_check_fn_caches(now)
         cached = _check_fn_cache.get(cache_key)
         if cached is not None:
@@ -385,36 +394,57 @@ def _check_fn_cached(fn: Callable) -> bool:
         value = False
         raised = True
 
+    availability_changed = False
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
         if value:
             _check_fn_last_good[cache_key] = now
             _check_fn_cache[cache_key] = (now, True)
-            return True
+            result = True
+        else:
+            last_good = _check_fn_last_good.get(cache_key)
+            if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
+                # Recent success → treat this failure as a flake. Serve last-good
+                # True and do NOT cache the failure, so the next call re-probes
+                # rather than pinning a stale verdict for the full TTL.
+                logger.warning(
+                    "check_fn %s failed (%s) within %.0fs of last success; "
+                    "treating as transient and keeping tool(s) available",
+                    getattr(fn, "__qualname__", fn),
+                    "raised" if raised else "returned False",
+                    _CHECK_FN_FAILURE_GRACE_SECONDS,
+                )
+                result = True
+            else:
+                # No recent success (or grace expired) — honor the failure. Log it so
+                # silent tool loss in quiet mode (subagents) is diagnosable.
+                logger.warning(
+                    "check_fn %s %s; dependent tools will be unavailable this turn",
+                    getattr(fn, "__qualname__", fn),
+                    "raised" if raised else "returned False",
+                )
+                _check_fn_cache[cache_key] = (now, False)
+                result = False
+        # Compare against the grace-adjusted effective verdict, not the raw probe.
+        if prior_value is not None and prior_value != result:
+            availability_changed = True
+    if availability_changed:
+        _clear_quiet_mode_tool_defs_cache()
+    return result
 
-        last_good = _check_fn_last_good.get(cache_key)
-        if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
-            # Recent success → treat this failure as a flake. Serve last-good
-            # True and do NOT cache the failure, so the next call re-probes
-            # rather than pinning a stale verdict for the full TTL.
-            logger.warning(
-                "check_fn %s failed (%s) within %.0fs of last success; "
-                "treating as transient and keeping tool(s) available",
-                getattr(fn, "__qualname__", fn),
-                "raised" if raised else "returned False",
-                _CHECK_FN_FAILURE_GRACE_SECONDS,
-            )
-            return True
 
-        # No recent success (or grace expired) — honor the failure. Log it so
-        # silent tool loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
-            "check_fn %s %s; dependent tools will be unavailable this turn",
-            getattr(fn, "__qualname__", fn),
-            "raised" if raised else "returned False",
+def _clear_quiet_mode_tool_defs_cache() -> None:
+    """Drop memoized quiet-mode tool lists after availability changes."""
+    try:
+        from model_tools import _clear_tool_defs_cache
+
+        _clear_tool_defs_cache()
+    except Exception:
+        logger.debug(
+            "Could not clear quiet-mode tool definition cache after "
+            "availability change",
+            exc_info=True,
         )
-        _check_fn_cache[cache_key] = (now, False)
-        return False
 
 
 def invalidate_check_fn_cache() -> None:
@@ -423,6 +453,7 @@ def invalidate_check_fn_cache() -> None:
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+    _clear_quiet_mode_tool_defs_cache()
 
 
 def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
