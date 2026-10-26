@@ -17,7 +17,7 @@ These tests pin:
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
@@ -41,7 +41,7 @@ class TestQuietModeCacheIsolation:
         assert isinstance(first, list)
         # Find the cached value to compare identity.
         assert len(model_tools._tool_defs_cache) == 1
-        cached = next(iter(model_tools._tool_defs_cache.values()))
+        cached = next(iter(model_tools._tool_defs_cache.values()))[1]
         assert first is not cached, (
             "issue #17335: first quiet_mode call returned the cached list "
             "by reference \u2014 mutations will leak into subsequent calls."
@@ -52,7 +52,7 @@ class TestQuietModeCacheIsolation:
         first = model_tools.get_tool_definitions(quiet_mode=True)
         second = model_tools.get_tool_definitions(quiet_mode=True)
         assert first is not second
-        cached = next(iter(model_tools._tool_defs_cache.values()))
+        cached = next(iter(model_tools._tool_defs_cache.values()))[1]
         assert second is not cached
 
 
@@ -94,7 +94,7 @@ class TestQuietModeCacheIsolation:
 
         monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute)
         for index in range(model_tools._TOOL_DEFS_CACHE_MAX):
-            model_tools._tool_defs_cache[("old", index)] = []
+            model_tools._tool_defs_cache[("old", index)] = (0.0, [])
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [
@@ -108,3 +108,42 @@ class TestQuietModeCacheIsolation:
             assert [future.result(timeout=2) for future in futures] == [[], []]
 
         assert len(model_tools._tool_defs_cache) == model_tools._TOOL_DEFS_CACHE_MAX
+
+    def test_invalidation_does_not_repopulate_stale_inflight_miss(
+        self, monkeypatch
+    ):
+        """A miss started before invalidation cannot refill the shared cache."""
+        compute_started = Event()
+        continue_compute = Event()
+        stale = [{"function": {"name": "stale"}}]
+        fresh = [{"function": {"name": "fresh"}}]
+        compute_calls = {"count": 0}
+
+        def compute(*args, **kwargs):
+            compute_calls["count"] += 1
+            if compute_calls["count"] == 1:
+                compute_started.set()
+                assert continue_compute.wait(timeout=5)
+                return stale
+            return fresh
+
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                model_tools.get_tool_definitions,
+                enabled_toolsets=["race-test"],
+                quiet_mode=True,
+            )
+            try:
+                assert compute_started.wait(timeout=5)
+                model_tools._clear_tool_defs_cache()
+            finally:
+                continue_compute.set()
+            assert future.result(timeout=5) == stale
+
+        assert not model_tools._tool_defs_cache
+        assert model_tools.get_tool_definitions(
+            enabled_toolsets=["race-test"],
+            quiet_mode=True,
+        ) == fresh
+        assert next(iter(model_tools._tool_defs_cache.values()))[1] == fresh

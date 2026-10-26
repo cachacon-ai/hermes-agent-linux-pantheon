@@ -302,6 +302,195 @@ class TestPersistence:
         session_ids = {r["session_id"] for r in results}
         assert state.session_id in session_ids
 
+    def test_sync_transcript_persists_reset_when_agent_owns_db(self, tmp_path):
+        """Regression PAN-83: /reset must rewrite the live transcript even when
+        the agent already flushed incrementally during a prior turn."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session()
+        db.append_messages_batch(
+            state.session_id,
+            [
+                {"role": "user", "content": "before reset"},
+                {"role": "assistant", "content": "old reply"},
+            ],
+        )
+        state.agent._session_db = db
+        state.agent._session_db_created = True
+        state.agent.session_id = state.session_id
+        state.history.clear()
+
+        manager.save_session(state.session_id, sync_transcript=True)
+
+        restored = db.get_messages_as_conversation(state.session_id)
+        assert restored == []
+
+        with manager._lock:
+            del manager._sessions[state.session_id]
+        reloaded = manager.get_session(state.session_id)
+        assert reloaded is not None
+        assert reloaded.history == []
+
+    def test_sync_transcript_rejects_active_turn_lease(self, tmp_path):
+        """User-initiated rewrite must refuse while a turn lease is held."""
+        import os
+
+        from hermes_state import SessionTurnLeaseLostError
+
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session()
+        db.append_messages_batch(
+            state.session_id,
+            [
+                {"role": "user", "content": "live ask"},
+                {"role": "assistant", "content": "live reply"},
+            ],
+        )
+        state.agent._session_db = db
+        state.agent._session_db_created = True
+        state.agent.session_id = state.session_id
+        holder = f"pid={os.getpid()}:turn=active"
+        assert db.try_acquire_session_turn_lease(
+            state.session_id, holder, ttl_seconds=60
+        )
+        before = db.get_messages_as_conversation(state.session_id)
+        state.history.clear()
+
+        with pytest.raises(SessionTurnLeaseLostError):
+            manager.save_session(state.session_id, sync_transcript=True)
+
+        after = db.get_messages_as_conversation(state.session_id)
+        assert [m["content"] for m in after] == [m["content"] for m in before]
+        db.release_session_turn_lease(state.session_id, holder)
+
+    def test_sync_transcript_targets_compression_child_tip(self, tmp_path):
+        """Forced sync must mutate the live tip, not the ended ACP parent."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session()
+        parent_id = state.session_id
+        child_id = f"{parent_id}-child"
+        db.append_messages_batch(
+            parent_id,
+            [
+                {"role": "user", "content": "parent old"},
+                {"role": "assistant", "content": "parent reply"},
+            ],
+        )
+        db.create_session(
+            session_id=child_id,
+            source="acp",
+            parent_session_id=parent_id,
+        )
+        db.append_messages_batch(
+            child_id,
+            [
+                {"role": "user", "content": "child live context"},
+                {"role": "assistant", "content": "child reply"},
+            ],
+        )
+        # End the parent the way rotating compression does.
+        def _end_parent(conn):
+            conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
+                "WHERE id = ?",
+                (time.time(), parent_id),
+            )
+
+        db._execute_write(_end_parent)
+
+        state.agent._session_db = db
+        state.agent._session_db_created = True
+        state.agent.session_id = child_id
+        state.history.clear()
+
+        manager.save_session(parent_id, sync_transcript=True)
+
+        assert db.get_messages_as_conversation(parent_id)  # parent untouched
+        assert [m["content"] for m in db.get_messages_as_conversation(parent_id)] == [
+            "parent old",
+            "parent reply",
+        ]
+        assert db.get_messages_as_conversation(child_id) == []
+
+        assert db.get_compression_tip(parent_id) == child_id
+        with manager._lock:
+            del manager._sessions[parent_id]
+        reloaded = manager.get_session(parent_id)
+        assert reloaded is not None
+        assert reloaded.session_id == parent_id
+        # Tip-following restore loads the child's (now empty) live set.
+        assert reloaded.history == []
+
+    def test_commit_compressed_transcript_archives_source(self, tmp_path):
+        """Compression publication must archive pre-compaction rows, not DELETE."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session()
+        db.append_messages_batch(
+            state.session_id,
+            [
+                {"role": "user", "content": "long question"},
+                {"role": "assistant", "content": "long answer"},
+            ],
+        )
+        db.update_system_prompt(state.session_id, "old-system")
+        state.agent.session_id = state.session_id
+        compacted = [{"role": "user", "content": "summary only"}]
+
+        manager.commit_compressed_transcript(
+            state.session_id,
+            compacted,
+            system_prompt="new-system",
+        )
+
+        live = db.get_messages_as_conversation(state.session_id)
+        assert len(live) == 1
+        assert live[0]["content"] == "summary only"
+        assert db.get_session(state.session_id)["system_prompt"] == "new-system"
+        archived = db.get_messages(state.session_id, include_compacted=True)
+        assert any(row.get("content") == "long question" for row in archived)
+        assert db.search_messages("long question")
+
+        with manager._lock:
+            del manager._sessions[state.session_id]
+        reloaded = manager.get_session(state.session_id)
+        assert reloaded is not None
+        assert len(reloaded.history) == 1
+        assert reloaded.history[0]["content"] == "summary only"
+
+    def test_sync_transcript_raises_on_persistence_failure(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session()
+        state.agent._session_db = db
+        state.agent._session_db_created = True
+        state.agent.session_id = state.session_id
+        state.history = []
+
+        with patch.object(db, "replace_messages", side_effect=OSError("readonly")):
+            with pytest.raises(OSError, match="readonly"):
+                manager.save_session(state.session_id, sync_transcript=True)
+
+    def test_owned_agent_post_turn_save_skips_transcript_replace(self, tmp_path):
+        """Normal post-turn save must not clobber incremental agent writes."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session()
+        db.append_messages_batch(
+            state.session_id,
+            [{"role": "user", "content": "from agent flush"}],
+        )
+        state.agent._session_db = db
+        state.agent._session_db_created = True
+        state.history = [{"role": "user", "content": "stale in-memory view"}]
+
+        manager.save_session(state.session_id)
+
+        live = db.get_messages_as_conversation(state.session_id)
+        assert len(live) == 1
+        assert live[0]["content"] == "from agent flush"
 
     def test_assistant_reasoning_fields_persisted(self, manager):
         """ACP session restore should preserve assistant reasoning context."""

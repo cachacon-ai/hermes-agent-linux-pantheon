@@ -68,14 +68,9 @@ EDIT_BEHAVIOURS = {
 SEND_BEHAVIOURS = {
     "send_always": ALWAYS,
     "send_never": NEVER,
+    "send_lies_always": LIES_ALWAYS,
+    "send_lies_after_1": lambda rendered: True if rendered < 1 else "lie",
 }
-
-# Only a lying edit transport can put a claim on the wire that the consumer
-# cannot audit.  Those combinations are tracked separately (see
-# ``test_lying_edit_transport_is_the_open_gap``) so the honest-transport matrix
-# stays a hard guarantee.
-LYING_EDITS = {"edit_lies_after_2", "edit_lies_always"}
-
 
 class WireAdapter(BasePlatformAdapter):
     """Adapter that records only the frames a user could actually see."""
@@ -104,7 +99,15 @@ class WireAdapter(BasePlatformAdapter):
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
-        if self._send_behaviour(len(self.wire)) is not True:
+        verdict = self._send_behaviour(len(self.wire))
+        if verdict == "lie":
+            self._next_id += 1
+            return SendResult(
+                success=True,
+                message_id=f"m-{self._next_id}",
+                content_rendered=False,
+            )
+        if verdict is not True:
             return SendResult(success=False, error="send rejected")
         self._next_id += 1
         self.wire.append(("send", content))
@@ -118,7 +121,11 @@ class WireAdapter(BasePlatformAdapter):
             self.wire.append(("edit", content))
             return SendResult(success=True, message_id=message_id)
         if verdict == "lie":
-            return SendResult(success=True, message_id=message_id)
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                content_rendered=False,
+            )
         return SendResult(success=False, error="flood control")
 
     async def delete_message(self, chat_id, message_id) -> bool:
@@ -126,11 +133,30 @@ class WireAdapter(BasePlatformAdapter):
         return True
 
     def rendered_complete_answer(self, final_text: str) -> bool:
-        """True when some frame the platform rendered carried *final_text*."""
-        return any(
-            kind in ("send", "edit") and final_text.strip() in payload
+        """True when the platform rendered the complete *final_text*."""
+        target = final_text.strip()
+
+        def _norm(payload: str) -> str:
+            p = payload
+            if CURSOR and p.endswith(CURSOR):
+                p = p[: -len(CURSOR)]
+            return p.rstrip()
+
+        if any(
+            kind in ("send", "edit")
+            and (target in _norm(payload) or _norm(payload) == target)
             for kind, payload in self.wire
-        )
+        ):
+            return True
+        # Fresh/fallback continuation sends only the missing tail as a second
+        # message while the head stays in the first send.  Compare with
+        # whitespace collapsed — ``_continuation_text`` may drop a single
+        # leading space at the join boundary while the two rendered messages
+        # still form the complete answer for the user.
+        send_text = "".join(_norm(p) for kind, p in self.wire if kind == "send")
+        if send_text == target:
+            return True
+        return "".join(send_text.split()) == "".join(target.split())
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +203,8 @@ def _consumer_claims_final_delivery(consumer, final_text: str) -> bool:
     return bool(consumer.final_response_sent or consumer.final_content_delivered)
 
 
-def _scenarios(*, lying_edits: bool):
+def _scenarios():
     for edit_name, edit_behaviour in EDIT_BEHAVIOURS.items():
-        if (edit_name in LYING_EDITS) is not lying_edits:
-            continue
         for send_name, send_behaviour in SEND_BEHAVIOURS.items():
             for prefers_fresh_final in (False, True):
                 for interrupt in (False, True):
@@ -202,7 +226,7 @@ def _scenarios(*, lying_edits: bool):
 
 @pytest.mark.parametrize(
     "edit_behaviour,send_behaviour,prefers_fresh_final,interrupt",
-    list(_scenarios(lying_edits=False)),
+    list(_scenarios()),
 )
 @pytest.mark.asyncio
 async def test_suppression_requires_the_complete_answer_on_the_wire(
@@ -222,51 +246,24 @@ async def test_suppression_requires_the_complete_answer_on_the_wire(
     )
     consumer = await _drive(adapter, interrupt=interrupt)
 
-    if _consumer_claims_final_delivery(consumer, FULL):
-        assert adapter.rendered_complete_answer(FULL), (
+    claims = _consumer_claims_final_delivery(consumer, FULL)
+    rendered = adapter.rendered_complete_answer(FULL)
+    if claims:
+        assert rendered, (
             "consumer claims the turn final was delivered, but no rendered frame "
             "carried the complete answer — the gateway would suppress its final "
             f"send and lose it. flags=(response_sent={consumer.final_response_sent}, "
             f"content_delivered={consumer.final_content_delivered}) "
             f"verdict={consumer.delivered_final_matches(FULL)!r} wire={adapter.wire!r}"
         )
-
-
-@pytest.mark.parametrize(
-    "edit_behaviour,send_behaviour,prefers_fresh_final,interrupt",
-    list(_scenarios(lying_edits=True)),
-)
-@pytest.mark.asyncio
-async def test_lying_edit_transport_is_the_open_gap(
-    edit_behaviour, send_behaviour, prefers_fresh_final, interrupt
-):
-    """An edit ACKed but never rendered can still suppress the final send.
-
-    ``_send_or_edit`` advances ``_last_sent_text`` from the call's return value,
-    and every ``got_done`` branch records its turn-final payload from that same
-    (or an even more optimistic) source.  When the transport ACKs a frame it
-    drops, both the recorded payload and the acked text hold the complete
-    answer while the screen still shows the cursor-suffixed preview — exactly
-    the #82656 report.
-
-    This test documents the remaining exposure rather than asserting it away:
-    the invariant is checked, and the scenarios that still violate it are
-    reported as expected failures.  Closing the gap turns them into passes,
-    at which point this test's ``xfail`` branch stops being reached and the
-    marker can be dropped along with the fix.
-    """
-    adapter = WireAdapter(
-        edit_behaviour=edit_behaviour,
-        send_behaviour=send_behaviour,
-        prefers_fresh_final=prefers_fresh_final,
-    )
-    consumer = await _drive(adapter, interrupt=interrupt)
-
-    claims = _consumer_claims_final_delivery(consumer, FULL)
-    rendered = adapter.rendered_complete_answer(FULL)
-    if claims and not rendered:
-        pytest.xfail(
-            "known gap (#82656): claim rests on an ACK the platform dropped; "
+    # Positive half: when the platform fully rendered a clean (non-interrupted)
+    # answer via honest sends, the consumer must claim delivery so the gateway
+    # suppresses its duplicate full final (prefix+tail split included).
+    if not interrupt and rendered and send_behaviour is ALWAYS:
+        assert claims, (
+            "complete answer is on the wire but the consumer did not claim "
+            "delivery — gateway would re-send a duplicate full final. "
+            f"flags=(response_sent={consumer.final_response_sent}, "
+            f"content_delivered={consumer.final_content_delivered}) "
             f"wire={adapter.wire!r}"
         )
-    assert not claims or rendered

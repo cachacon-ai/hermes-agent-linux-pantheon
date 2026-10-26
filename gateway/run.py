@@ -32620,7 +32620,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             content=_final,
                             finalize=True,
                         )
-                        if getattr(_reconcile_res, "success", True):
+                        _reconcile_ok = getattr(_reconcile_res, "success", True)
+                        _reconcile_rendered = (
+                            getattr(_reconcile_res, "content_rendered", True)
+                            is not False
+                        )
+                        if _reconcile_ok and _reconcile_rendered:
                             response["already_sent"] = True
                             logger.info(
                                 "Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).",
@@ -32628,8 +32633,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         else:
                             logger.warning(
-                                "Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
+                                "Stale-finalize reconciliation edit failed for session %s (success=%s rendered=%s error=%s); sending complete response via normal final send.",
                                 session_key or "?",
+                                _reconcile_ok,
+                                _reconcile_rendered,
                                 getattr(_reconcile_res, "error", None),
                             )
                     except Exception as _edit_err:
@@ -32648,17 +32655,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _xform_res = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
+                        _xform_ok = getattr(_xform_res, "success", True)
+                        _xform_rendered = (
+                            getattr(_xform_res, "content_rendered", True)
+                            is not False
                         )
+                        if _xform_ok and _xform_rendered:
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Transformed-response reconciliation edit did not render for session %s (success=%s rendered=%s error=%s); leaving already_sent unset for normal final send.",
+                                session_key or "?",
+                                _xform_ok,
+                                _xform_rendered,
+                                getattr(_xform_res, "error", None),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

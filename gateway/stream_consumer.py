@@ -297,6 +297,12 @@ class GatewayStreamConsumer:
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
+        # True when ``_last_sent_text`` / ``_fallback_prefix`` was established by
+        # a render-confirmed send/edit.  False only if bookkeeping advanced on an
+        # ACKed-but-unapplied frame (should not happen once content_rendered is
+        # honored); a prefix+tail fallback then must NOT suppress the gateway's
+        # corrective full send (#82656).
+        self._visible_prefix_confirmed = True
         # True when the most recent _send_or_edit split-and-delivered across
         # continuation messages (the adapter adopted a new message id).
         self._last_edit_overflowed = False
@@ -518,6 +524,17 @@ class GatewayStreamConsumer:
     def already_sent(self) -> bool:
         """True if at least one message was sent or edited during the run."""
         return self._already_sent
+
+    @staticmethod
+    def _send_result_confirms_render(result) -> bool:
+        """Return True when a successful send/edit result confirms on-screen content.
+
+        Some transports ACK ``edit_message`` or finalize frames without applying
+        them (#82656). Those responses set ``SendResult.content_rendered`` to
+        ``False``; they must not advance delivery bookkeeping or suppress the
+        gateway's corrective final send.
+        """
+        return getattr(result, "content_rendered", True) is not False
 
     @property
     def final_response_sent(self) -> bool:
@@ -2090,11 +2107,16 @@ class GatewayStreamConsumer:
                     expect_edits=not final,
                 ),
             )
-            if result.success and result.message_id:
+            if (
+                result.success
+                and result.message_id
+                and self._send_result_confirms_render(result)
+            ):
                 self._message_id = str(result.message_id)
                 self._track_preview_ids_from_result(result)
                 self._already_sent = True
                 self._last_sent_text = text
+                self._visible_prefix_confirmed = True
                 # Fresh content bubble — close off any stale tool bubble
                 # above so the next tool starts a new bubble below.
                 self._notify_new_message()
@@ -2214,6 +2236,15 @@ class GatewayStreamConsumer:
                 delivery = await self._send_empty_fallback_final(final_text)
                 if delivery == "delivered":
                     return
+                if delivery == "preview" and not self._visible_prefix_confirmed:
+                    # Flood control left only a preview whose render was never
+                    # confirmed. Keep the gateway's full final send enabled.
+                    self._already_sent = False
+                    self._fallback_prefix = ""
+                    self._fallback_preserve_partial_messages = False
+                    self._final_response_sent = False
+                    self._final_content_delivered = False
+                    return
                 self._already_sent = True
                 self._fallback_prefix = ""
                 self._fallback_preserve_partial_messages = False
@@ -2246,7 +2277,12 @@ class GatewayStreamConsumer:
             # calculation may wrongly conclude "already shown" because the
             # streamed prefix was from a *previous* segment (before the tool
             # boundary).  In that case, send the full final_text as-is (#10807).
-            if final_text.strip() and final_text != self._visible_prefix():
+            if final_text.strip() and (
+                final_text != self._visible_prefix()
+                or not self._visible_prefix_confirmed
+            ):
+                # An ACK without render confirmation is not a delivery baseline;
+                # retry the complete answer and require a rendered send.
                 continuation = final_text
             else:
                 # Defence-in-depth for #7183: the last edit may still show the
@@ -2268,8 +2304,9 @@ class GatewayStreamConsumer:
                             message_id=self._message_id,
                             content=clean_text,
                         )
-                        if result.success:
+                        if result.success and self._send_result_confirms_render(result):
                             self._last_sent_text = clean_text
+                            self._visible_prefix_confirmed = True
                     except Exception:
                         pass
                 self._already_sent = True
@@ -2314,7 +2351,12 @@ class GatewayStreamConsumer:
                     content=chunk,
                     metadata=self._metadata_for_send(final=True),
                 )
-                if result.success:
+                # Require render confirmation — an ACKed-but-unapplied send
+                # must not advance delivery bookkeeping (#82656).
+                if result.success and self._send_result_confirms_render(result):
+                    break
+                if result.success and not self._send_result_confirms_render(result):
+                    # Known unrendered ACK — not flood, not ambiguous timeout.
                     break
                 retry_delay = self._fallback_flood_retry_delay(result)
                 if attempt == 0 and retry_delay is not None:
@@ -2326,7 +2368,11 @@ class GatewayStreamConsumer:
                 else:
                     break  # non-flood error, long flood wait, or second failure
 
-            if not result or not result.success:
+            if (
+                not result
+                or not result.success
+                or not self._send_result_confirms_render(result)
+            ):
                 if sent_any_chunk:
                     # Some continuation text already reached the user, but not
                     # the full response. Do NOT set _final_response_sent — the
@@ -2381,16 +2427,29 @@ class GatewayStreamConsumer:
 
         self._message_id = last_message_id
         self._already_sent = True
-        self._final_response_sent = True
-        self._final_content_delivered = True
-        # The fallback delivered the complete ``final_text`` (as one message
-        # or prefix + continuation chunks that union to it), so record it as
-        # the turn-final payload for the gateway's reconciliation (#71643).
-        # On a split turn ``final_text`` is only the tail — the recorder
-        # substitutes the unsplit ledger so the sealed heads count as
-        # delivered too (#78541).
-        self._record_turn_final_payload(final_text)
         self._last_sent_text = chunks[-1]
+        # A confirmed visible prefix plus a render-confirmed tail is complete
+        # delivery (prefix + continuation union to ``final_text``) — retain
+        # suppression so the gateway does not duplicate the full answer.
+        # Only an *unverified* prefix (ACK without render) forces the
+        # corrective full send (#82656).
+        prefix_confirmed = (
+            continuation == final_text or self._visible_prefix_confirmed
+        )
+        if prefix_confirmed:
+            self._final_response_sent = True
+            self._final_content_delivered = True
+            self._visible_prefix_confirmed = True
+            # The fallback delivered the complete ``final_text`` (as one message
+            # or prefix + continuation chunks that union to it), so record it as
+            # the turn-final payload for the gateway's reconciliation (#71643).
+            # On a split turn ``final_text`` is only the tail — the recorder
+            # substitutes the unsplit ledger so the sealed heads count as
+            # delivered too (#78541).
+            self._record_turn_final_payload(final_text)
+        else:
+            self._final_response_sent = False
+            self._final_content_delivered = False
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
 
@@ -2426,8 +2485,16 @@ class GatewayStreamConsumer:
                     else "failed"
                 )
 
-            if getattr(result, "success", False):
+            if getattr(result, "success", False) and self._send_result_confirms_render(
+                result
+            ):
                 break
+            if getattr(result, "success", False) and not self._send_result_confirms_render(
+                result
+            ):
+                # Explicit unrendered ACK — do NOT treat as ambiguous timeout;
+                # the gateway must be free to perform its corrective send.
+                return "failed"
             retry_delay = self._fallback_flood_retry_delay(result)
             if attempt == 0 and retry_delay is not None:
                 logger.debug(
@@ -2443,6 +2510,13 @@ class GatewayStreamConsumer:
                 if self._send_failure_may_have_delivered(result)
                 else "failed"
             )
+
+        if (
+            not result
+            or not getattr(result, "success", False)
+            or not self._send_result_confirms_render(result)
+        ):
+            return "failed"
 
         new_message_id = getattr(result, "message_id", None)
         delete_fn = getattr(self.adapter, "delete_message", None)
@@ -2474,6 +2548,7 @@ class GatewayStreamConsumer:
         self._already_sent = True
         self._final_response_sent = True
         self._final_content_delivered = True
+        self._visible_prefix_confirmed = True
         # Fresh commit of the complete answer after a failed finalize (#71643).
         #
         # Record ``final_text`` VERBATIM -- do not route through
@@ -2950,10 +3025,13 @@ class GatewayStreamConsumer:
             return False
         if not getattr(result, "success", False):
             return False
+        if not self._send_result_confirms_render(result):
+            return False
         # Adopt the new message id as the current message so subsequent
         # callers (e.g. overflow split loops, finalize retries) see a
         # consistent state.
         new_message_id = getattr(result, "message_id", None)
+        self._visible_prefix_confirmed = True
         # Successful fresh send — try to delete the stale preview(s) so the
         # user doesn't see the old edit-stuck message(s) underneath.  Cleanup
         # is best-effort; platforms that don't implement ``delete_message``
@@ -3414,7 +3492,7 @@ class GatewayStreamConsumer:
                         content=text,
                         finalize=finalize,
                     )
-                    if result.success:
+                    if result.success and self._send_result_confirms_render(result):
                         self._already_sent = True
                         # Record any continuation fragments an oversized edit
                         # split off, so fresh-final can clean them all up.
@@ -3443,13 +3521,34 @@ class GatewayStreamConsumer:
                             self._message_id = str(result.message_id)
                             self._message_created_ts = time.monotonic()
                             self._last_sent_text = ""
+                            self._visible_prefix_confirmed = True
                             self._notify_new_message()
                         else:
                             self._last_sent_text = text
+                            self._visible_prefix_confirmed = True
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
                         return True
                     else:
+                        if (
+                            result.success
+                            and not self._send_result_confirms_render(result)
+                        ):
+                            # ACKed but not applied (#82656).  If bookkeeping
+                            # already claims this text as visible (legacy /
+                            # raced advance), the prefix is unverified and a
+                            # prefix+tail fallback must not suppress the
+                            # corrective full send.
+                            visible = self._visible_prefix()
+                            if visible and visible == self._clean_for_display(text):
+                                self._visible_prefix_confirmed = False
+                            # Enter fallback without flood-strike accounting —
+                            # this is a definite non-render, not rate limiting.
+                            self._fallback_prefix = visible
+                            self._fallback_final_send = True
+                            self._edit_supported = False
+                            self._already_sent = True
+                            return False
                         immediate_final_fallback = False
                         if (
                             finalize
@@ -3580,7 +3679,7 @@ class GatewayStreamConsumer:
                         expect_edits=not finalize,
                     ),
                 )
-                if result.success:
+                if result.success and self._send_result_confirms_render(result):
                     if result.message_id:
                         self._message_id = result.message_id
                         # Track when the preview first became visible to
@@ -3594,6 +3693,7 @@ class GatewayStreamConsumer:
                         self._edit_supported = False
                     self._already_sent = True
                     self._last_sent_text = text
+                    self._visible_prefix_confirmed = True
                     if not result.message_id:
                         self._fallback_prefix = self._visible_prefix()
                         self._fallback_final_send = True
@@ -3608,7 +3708,13 @@ class GatewayStreamConsumer:
                     self._notify_new_message()
                     return True
                 else:
-                    # Initial send failed — disable streaming for this session
+                    # Initial send failed or was ACKed without rendering —
+                    # disable streaming for this session.
+                    if (
+                        getattr(result, "success", False)
+                        and not self._send_result_confirms_render(result)
+                    ):
+                        self._visible_prefix_confirmed = False
                     self._edit_supported = False
                     return False
         except Exception as e:

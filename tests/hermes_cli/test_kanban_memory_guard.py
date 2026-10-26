@@ -86,6 +86,20 @@ def test_resolve_max_in_progress_unset_and_unknown_memory_is_uncapped(monkeypatc
     assert kb.resolve_max_in_progress(None) is None
 
 
+def test_cap_max_spawn_to_host_limit_clamps_to_derived_cap(monkeypatch):
+    monkeypatch.setattr(
+        kb, "_system_memory_sample", lambda: {"mem_total_kib": 1024 * 1024}
+    )
+    assert kb.cap_max_spawn_to_host_limit(8) == 2
+    assert kb.cap_max_spawn_to_host_limit(1) == 1
+
+
+def test_cap_max_spawn_to_host_limit_passes_through_when_uncapped(monkeypatch):
+    monkeypatch.setattr(kb, "_system_memory_sample", lambda: {})
+    assert kb.cap_max_spawn_to_host_limit(8) == 8
+    assert kb.cap_max_spawn_to_host_limit(None) is None
+
+
 # ---------------------------------------------------------------------------
 # _memory_pressure_level
 # ---------------------------------------------------------------------------

@@ -515,6 +515,95 @@ def test_dispatch_dry_run(client):
     assert isinstance(body, dict)
 
 
+def test_dispatch_nudge_passes_host_max_in_progress(
+    client, kanban_home, monkeypatch,
+):
+    """Dashboard dispatch must resolve kanban.max_in_progress like the gateway."""
+    captured: dict = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: None)
+    monkeypatch.setattr(kb, "derive_default_max_in_progress", lambda sample=None: 2)
+
+    r = client.post("/api/plugins/kanban/dispatch?max=8")
+    assert r.status_code == 200
+    assert captured.get("max_in_progress") == 2
+    assert captured.get("max_spawn") == 2
+
+
+def test_dispatch_nudge_without_max_uses_host_cap_only(
+    client, kanban_home, monkeypatch,
+):
+    captured: dict = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: None)
+    monkeypatch.setattr(kb, "derive_default_max_in_progress", lambda sample=None: 2)
+
+    r = client.post("/api/plugins/kanban/dispatch")
+    assert r.status_code == 200
+    assert captured.get("max_in_progress") == 2
+    assert captured.get("max_spawn") is None
+
+
+def test_dispatch_nudge_has_safe_fallback_when_memory_unknown(
+    client, kanban_home, monkeypatch,
+):
+    """When memory is unknown, dashboard nudges retain the old max=8 bound."""
+    captured: dict = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: None)
+    monkeypatch.setattr(
+        kb, "derive_default_max_in_progress", lambda sample=None: None,
+    )
+
+    r = client.post("/api/plugins/kanban/dispatch")
+    assert r.status_code == 200
+    assert captured.get("max_in_progress") == kb.DERIVED_MAX_IN_PROGRESS_CEILING
+    assert captured.get("max_spawn") is None
+
+    captured.clear()
+    r = client.post("/api/plugins/kanban/dispatch?max=12")
+    assert r.status_code == 200
+    assert captured.get("max_in_progress") == kb.DERIVED_MAX_IN_PROGRESS_CEILING
+    assert captured.get("max_spawn") == kb.DERIVED_MAX_IN_PROGRESS_CEILING
+
+
+def test_dispatch_dry_run_caps_spawn_on_small_vm(
+    client, kanban_home, monkeypatch,
+):
+    """?max=8 on a 1 GiB host must not dry-run more than two spawns."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    GIB = 1024 * 1024
+    monkeypatch.setattr(
+        kb, "_system_memory_sample", lambda: {"mem_total_kib": GIB, "mem_available_kib": GIB // 2}
+    )
+    for i in range(5):
+        client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"work-{i}", "assignee": "researcher"},
+        )
+    r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=8")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body.get("spawned") or []) <= 2
+
+
 # ---------------------------------------------------------------------------
 # Triage column (new v1 status)
 # ---------------------------------------------------------------------------

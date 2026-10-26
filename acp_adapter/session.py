@@ -385,16 +385,101 @@ class SessionManager:
             except Exception:
                 logger.debug("Failed to cleanup ACP sessions from DB", exc_info=True)
 
-    def save_session(self, session_id: str) -> None:
+    @staticmethod
+    def _durable_session_id(state: SessionState) -> str:
+        """Return the live Hermes DB head for transcript mutations.
+
+        After rotating compression, ``state.session_id`` stays the stable ACP
+        client handle while ``agent.session_id`` advances to the compression
+        child. Forced rewrites must target that live tip — writing the ended
+        parent either raises ``CompressionSessionClosedError`` or leaves the
+        child's transcript stale.
+        """
+        agent = state.agent
+        agent_sid = getattr(agent, "session_id", None) if agent is not None else None
+        if isinstance(agent_sid, str) and agent_sid.strip():
+            return agent_sid.strip()
+        return state.session_id
+
+    def save_session(self, session_id: str, *, sync_transcript: bool = False) -> None:
         """Persist the current state of a session to the database.
 
         Called by the server after prompt completion, slash commands that
         mutate history, and model switches.
+
+        Pass ``sync_transcript=True`` when a slash command (/reset) replaced
+        ``state.history`` in memory while the agent already owns incremental
+        persistence — the normal post-turn save skips ``replace_messages`` in
+        that case, so destructive history edits must opt in explicitly.
+
+        When ``sync_transcript=True``, persistence failures are re-raised so
+        callers can report failure and restore in-memory state instead of
+        claiming success over a no-op write. Manual /compress must NOT use
+        this path for the compaction commit — use
+        :meth:`commit_compressed_transcript` or the agent's in-place
+        ``archive_and_compact`` path instead.
         """
         with self._lock:
             state = self._sessions.get(session_id)
         if state is not None:
-            self._persist(state)
+            self._persist(state, sync_transcript=sync_transcript)
+
+    def commit_compressed_transcript(
+        self,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+        *,
+        system_prompt: Optional[str] = None,
+    ) -> None:
+        """Publish a compacted live set via ``archive_and_compact``.
+
+        Soft-archives prior active rows under the live durable head and
+        inserts ``compacted_messages`` as the new active set. Optionally
+        persists the rebuilt system prompt in the same SessionDB. Raises on
+        failure so callers can keep the pre-compression in-memory state.
+        """
+        with self._lock:
+            state = self._sessions.get(session_id)
+        if state is None:
+            raise RuntimeError(f"unknown ACP session {session_id}")
+        db = self._get_db()
+        if db is None:
+            raise RuntimeError("SessionDB unavailable for ACP compression commit")
+
+        durable_id = self._durable_session_id(state)
+        if db.get_session(durable_id) is None:
+            # Tip should already exist for a real conversation; create only
+            # when tests / early sessions write before the first agent flush.
+            db.create_session(
+                session_id=durable_id,
+                source="acp",
+                model=str(state.model) if state.model else None,
+                model_config={"cwd": state.cwd},
+            )
+        db.archive_and_compact(
+            durable_id,
+            compacted_messages,
+            system_prompt=system_prompt,
+        )
+
+        agent = state.agent
+        try:
+            from agent.context_compressor import stamp_db_persisted_markers
+
+            stamp_db_persisted_markers(compacted_messages)
+        except Exception:
+            logger.debug(
+                "Failed to stamp ACP compressed transcript durability markers",
+                exc_info=True,
+            )
+        if agent is not None:
+            if hasattr(agent, "_last_flushed_db_idx"):
+                agent._last_flushed_db_idx = len(compacted_messages)
+            if hasattr(agent, "_db_flush_scan_prefix"):
+                agent._db_flush_scan_prefix = (
+                    compacted_messages[:] if compacted_messages else None
+                )
+            agent._flushed_db_message_session_id = durable_id
 
     # ---- persistence via SessionDB ------------------------------------------
 
@@ -420,7 +505,7 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
-    def _persist(self, state: SessionState) -> None:
+    def _persist(self, state: SessionState, *, sync_transcript: bool = False) -> None:
         """Write session state to the database.
 
         Creates the session record if it doesn't exist, then replaces all
@@ -428,6 +513,8 @@ class SessionManager:
         """
         db = self._get_db()
         if db is None:
+            if sync_transcript:
+                raise RuntimeError("SessionDB unavailable for ACP transcript sync")
             return
 
         # Ensure model is a plain string (not a MagicMock or other proxy).
@@ -443,9 +530,10 @@ class SessionManager:
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
         cwd_json = json.dumps(session_meta)
+        durable_id = self._durable_session_id(state)
 
         try:
-            # Ensure the session record exists.
+            # Ensure the ACP handle session record exists (stable client id).
             existing = db.get_session(state.session_id)
             if existing is None:
                 db.create_session(
@@ -460,6 +548,17 @@ class SessionManager:
                     db.update_session_meta(state.session_id, cwd_json, model_str)
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
+
+            # When the live tip diverges from the ACP handle (rotating
+            # compression), ensure the tip row exists before mutating it.
+            if durable_id != state.session_id and db.get_session(durable_id) is None:
+                db.create_session(
+                    session_id=durable_id,
+                    source="acp",
+                    model=model_str,
+                    model_config={"cwd": state.cwd},
+                    parent_session_id=state.session_id,
+                )
 
             # When the agent owns persistence to this same SessionDB it has
             # already flushed the live transcript incrementally during
@@ -484,7 +583,7 @@ class SessionManager:
                 and agent_db is db
                 and bool(getattr(agent, "_session_db_created", False))
             )
-            if not agent_owns_persistence:
+            if sync_transcript or not agent_owns_persistence:
                 # Even when the current agent doesn't "own" persistence, the
                 # session on disk may already carry compaction-archived rows —
                 # e.g. after a model switch or a /restore, both of which mint a
@@ -500,11 +599,45 @@ class SessionManager:
                 # replace on any DB error and can race a concurrent
                 # archive_and_compact — the same probe failure mode #80216's
                 # /retry fix (gateway/slash_commands.py) deliberately avoids.
+                #
+                # When ``sync_transcript`` is set, the agent DOES own persistence
+                # but an external caller (/reset) rewrote ``state.history``
+                # without going through the incremental flush path — persist the
+                # live tip so reload/resume matches memory. User-initiated
+                # rewrites that do not own the turn lease must reject an active
+                # lease in the same write transaction.
                 db.replace_messages(
-                    state.session_id, state.history, active_only=True
+                    durable_id,
+                    state.history,
+                    active_only=True,
+                    reject_active_turn_lease=bool(sync_transcript),
                 )
+                if sync_transcript and agent_owns_persistence:
+                    try:
+                        from agent.context_compressor import stamp_db_persisted_markers
+
+                        stamp_db_persisted_markers(state.history)
+                    except Exception:
+                        logger.debug(
+                            "Failed to stamp ACP transcript durability markers",
+                            exc_info=True,
+                        )
+                    if hasattr(agent, "_last_flushed_db_idx"):
+                        agent._last_flushed_db_idx = len(state.history)
+                    if hasattr(agent, "_db_flush_scan_prefix"):
+                        agent._db_flush_scan_prefix = (
+                            state.history[:] if state.history else None
+                        )
+                    agent._flushed_db_message_session_id = durable_id
         except Exception:
-            logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
+            logger.warning(
+                "Failed to persist ACP session %s (durable=%s)",
+                state.session_id,
+                durable_id,
+                exc_info=True,
+            )
+            if sync_transcript:
+                raise
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
@@ -546,6 +679,19 @@ class SessionManager:
 
         model = row.get("model") or None
 
+        # Follow the compression tip when the ACP handle is an ended parent
+        # (legacy compression.in_place: false). Live transcript + agent id must
+        # bind to the tip; the ACP client handle stays ``session_id``.
+        try:
+            tip_id = db.get_compression_tip(session_id) or session_id
+        except Exception:
+            logger.debug(
+                "Failed to resolve compression tip for ACP session %s",
+                session_id,
+                exc_info=True,
+            )
+            tip_id = session_id
+
         # Load conversation history. repair_alternation: this restore feeds
         # LIVE REPLAY — the loaded list becomes the resumed agent's working
         # conversation. A durable ``user;user`` violation left in state.db would
@@ -553,7 +699,7 @@ class SessionManager:
         # for the rest of the session (see hermes_state.get_messages_as_conversation).
         try:
             history = db.get_messages_as_conversation(
-                session_id, repair_alternation=True
+                tip_id, repair_alternation=True
             )
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
@@ -561,7 +707,7 @@ class SessionManager:
 
         try:
             agent = self._make_agent(
-                session_id=session_id,
+                session_id=tip_id,
                 cwd=cwd,
                 model=model,
                 requested_provider=requested_provider,
@@ -583,7 +729,19 @@ class SessionManager:
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
-        logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
+        if tip_id != session_id:
+            logger.info(
+                "Restored ACP session %s from DB tip %s (%d messages)",
+                session_id,
+                tip_id,
+                len(history),
+            )
+        else:
+            logger.info(
+                "Restored ACP session %s from DB (%d messages)",
+                session_id,
+                len(history),
+            )
         return state
 
     def _delete_persisted(self, session_id: str) -> bool:

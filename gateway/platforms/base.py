@@ -2674,6 +2674,12 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # When ``success`` is True, ``content_rendered`` confirms the platform
+    # actually showed ``content`` to the user.  ``False`` means the call was
+    # ACKed (HTTP/API success) but the frame was dropped or not applied —
+    # stream consumers must not treat that as delivery (#82656).  Default
+    # ``True`` preserves legacy adapter behavior.
+    content_rendered: bool = True
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every

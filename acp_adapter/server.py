@@ -2464,22 +2464,51 @@ class HermesACPAgent(acp.Agent):
         return "\n".join(lines)
 
     def _cmd_reset(self, args: str, state: SessionState) -> str:
-        state.history.clear()
+        with state.runtime_lock:
+            if state.is_running:
+                return (
+                    "Cannot /reset while a turn is in progress. "
+                    "Wait for the current turn to finish, or interrupt it first."
+                )
+
+        previous_history = list(state.history)
         reset_failed = False
         try:
+            state.history.clear()
             reset_session_state = getattr(state.agent, "reset_session_state", None)
             if callable(reset_session_state):
-                reset_session_state()
-        except Exception:
-            reset_failed = True
-            logger.warning("ACP session state reset failed for %s", state.session_id, exc_info=True)
-        finally:
-            self.session_manager.save_session(state.session_id)
+                try:
+                    reset_session_state()
+                except Exception:
+                    reset_failed = True
+                    logger.warning(
+                        "ACP session state reset failed for %s",
+                        state.session_id,
+                        exc_info=True,
+                    )
+            self.session_manager.save_session(
+                state.session_id, sync_transcript=True
+            )
+        except Exception as exc:
+            state.history[:] = previous_history
+            logger.warning(
+                "ACP /reset persistence failed for %s",
+                state.session_id,
+                exc_info=True,
+            )
+            return f"Reset failed to persist: {exc}"
         if reset_failed:
             return "Conversation history cleared. Agent session state reset failed; see logs."
         return "Conversation history cleared."
 
     def _cmd_compress(self, args: str, state: SessionState) -> str:
+        with state.runtime_lock:
+            if state.is_running:
+                return (
+                    "Cannot /compress while a turn is in progress. "
+                    "Wait for the current turn to finish, or interrupt it first."
+                )
+
         if not state.history:
             return "Nothing to compress — conversation is empty."
         try:
@@ -2500,24 +2529,69 @@ class HermesACPAgent(acp.Agent):
             approx_tokens = estimate_request_tokens_rough(
                 state.history, system_prompt=_sys_prompt, tools=_tools
             )
-            original_session_db = getattr(agent, "_session_db", None)
+            previous_history = list(state.history)
+            previous_prompt = _sys_prompt
+            pre_hermes_id = getattr(agent, "session_id", None)
+            agent_db = getattr(agent, "_session_db", None)
+            manager_db = self.session_manager._get_db()
+            compressor_db_is_manager_db = (
+                agent_db is not None
+                and manager_db is not None
+                and agent_db is manager_db
+            )
 
-            try:
-                # ACP sessions must keep a stable session id, so avoid the
-                # SQLite session-splitting side effect inside _compress_context.
-                agent._session_db = None
-                compressed, _ = agent._compress_context(
-                    state.history,
-                    getattr(agent, "_cached_system_prompt", "") or "",
-                    approx_tokens=approx_tokens,
-                    task_id=state.session_id,
-                    force=True,
+            # Keep SessionDB attached so _compress_context can run the fenced
+            # archive_and_compact + update_system_prompt commit (gateway
+            # contract). Detaching it forced a destructive replace_messages
+            # fallback that deleted the source transcript.
+            working_history = list(state.history)
+            compressed, new_system = agent._compress_context(
+                working_history,
+                _sys_prompt,
+                approx_tokens=approx_tokens,
+                task_id=pre_hermes_id or state.session_id,
+                force=True,
+            )
+
+            compression_db_commit_succeeded = bool(
+                getattr(agent, "_last_compression_db_commit_succeeded", False)
+            )
+
+            if compressor_db_is_manager_db and not compression_db_commit_succeeded:
+                # The compressor had the shared SessionDB but did not report a
+                # durable transcript commit (e.g. summary no-op or persistence
+                # failure). Do not replay its snapshot through an unfenced
+                # fallback write; preserve the source transcript.
+                agent._cached_system_prompt = previous_prompt
+                state.history = previous_history
+                return (
+                    "Compression did not commit durably. "
+                    "Original transcript preserved."
                 )
-            finally:
-                agent._session_db = original_session_db
 
-            state.history = compressed
-            self.session_manager.save_session(state.session_id)
+            if compressor_db_is_manager_db and compression_db_commit_succeeded:
+                # The compressor already published the live transcript through
+                # its fenced SessionDB path. In particular, a restored agent can
+                # own this DB even before _session_db_created is set by a turn.
+                state.history = list(compressed)
+                if new_system:
+                    agent._cached_system_prompt = new_system
+            else:
+                # Agents without the shared SessionDB need the ACP manager to
+                # publish the compacted transcript via archive_and_compact.
+                try:
+                    self.session_manager.commit_compressed_transcript(
+                        state.session_id,
+                        list(compressed),
+                        system_prompt=new_system if new_system else None,
+                    )
+                except Exception as persist_exc:
+                    agent._cached_system_prompt = previous_prompt
+                    state.history = previous_history
+                    return f"Compression failed to persist: {persist_exc}"
+                state.history = list(compressed)
+                if new_system:
+                    agent._cached_system_prompt = new_system
 
             new_count = len(state.history)
             _sys_prompt_after = getattr(agent, "_cached_system_prompt", "") or _sys_prompt
@@ -2582,8 +2656,9 @@ class HermesACPAgent(acp.Agent):
             provider_changed = bool(current_provider and requested_provider != current_provider)
             current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)
             current_api_mode = None if provider_changed else getattr(state.agent, "api_mode", None)
+            durable_session_id = self.session_manager._durable_session_id(state)
             state.agent = self.session_manager._make_agent(
-                session_id=session_id,
+                session_id=durable_session_id,
                 cwd=state.cwd,
                 model=resolved_model,
                 requested_provider=requested_provider,

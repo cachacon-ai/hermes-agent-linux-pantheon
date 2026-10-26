@@ -1446,18 +1446,25 @@ def _(rid, params: dict) -> dict:
             "-f", str(first_page), "-l", str(last_page),
             str(pdf_path), str(out_prefix),
         ]
-        from hermes_cli._subprocess_compat import windows_hide_flags
+        from hermes_cli._subprocess_compat import bounded_captured_run
 
+        # Ceiling is intentionally below the client RPC deadline so a real
+        # pdftoppm timeout can still deliver 5028 (PAN-78). bounded_captured_run
+        # also bounds Windows post-timeout pipe drains.
         try:
-            res = subprocess.run(
-                argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+            res = bounded_captured_run(
+                argv,
+                timeout=_PDF_ATTACH_SUBPROCESS_TIMEOUT_S,
                 # Force UTF-8 + lossy decode so non-UTF-8 child output can't
                 # crash the gateway thread on locale-mismatched Windows (#53137).
-                encoding="utf-8", errors="replace",
-                creationflags=windows_hide_flags(),
+                errors="replace",
             )
         except subprocess.TimeoutExpired:
-            return _err(rid, 5028, "pdftoppm timed out (>120s)")
+            return _err(
+                rid,
+                5028,
+                f"pdftoppm timed out (>{_PDF_ATTACH_SUBPROCESS_TIMEOUT_S:g}s)",
+            )
         if res.returncode != 0:
             tail = (res.stderr or res.stdout or "").strip().splitlines()[-3:]
             return _err(rid, 5028, "pdftoppm failed: " + " | ".join(tail))

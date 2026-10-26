@@ -44,6 +44,7 @@ __all__ = [
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "bounded_captured_run",
     "bounded_git_probe",
     "bounded_probe_run",
     "noninteractive_git_env",
@@ -564,6 +565,87 @@ def _legacy_kill_process_tree(proc: "subprocess.Popen") -> None:
             pass
 
 
+def bounded_captured_run(
+    args: "str | Sequence[str]",
+    *,
+    timeout: float,
+    shell: bool = False,
+    env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
+    errors: str = "replace",
+) -> "subprocess.CompletedProcess[str]":
+    """Deadlock-safe ``subprocess.run(..., capture_output=True, timeout=...)``.
+
+    Same contract as ``subprocess.run`` for captured text output — returns a
+    ``CompletedProcess`` on completion (any exit code), raises
+    ``TimeoutExpired`` after a *bounded* post-timeout cleanup — but never
+    hangs forever on Windows when a descendant still holds the captured pipe
+    handles (the ``run()`` cleanup does an unbounded ``communicate()`` join).
+
+    Supports ``shell=True`` (string command) for user-defined quick commands
+    while preserving tree-kill + 1s drain semantics. On POSIX the child is
+    placed in its own process group so timeout cleanup can take descendants
+    with the launcher; on Windows ``creationflags`` hide the console and
+    :func:`kill_process_tree` uses ``taskkill /T``.
+    """
+    if shell:
+        if not isinstance(args, str):
+            raise TypeError("shell=True requires a string command")
+        popen_args: str | list[str] = args
+        cmd_for_exc: str | list[str] = args
+    else:
+        popen_args = list(args)
+        cmd_for_exc = list(args)
+
+    _popen_kwargs: dict = {}
+    if IS_WINDOWS:
+        _popen_kwargs["creationflags"] = windows_hide_flags()
+    else:
+        _popen_kwargs["process_group"] = 0
+    if env is not None:
+        _popen_kwargs["env"] = dict(env)
+    if cwd is not None:
+        _popen_kwargs["cwd"] = cwd
+
+    proc = subprocess.Popen(
+        popen_args,
+        shell=shell,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors=errors,
+        **_popen_kwargs,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # Kill the tree first so a pipe-holding descendant cannot keep the
+        # drain's communicate() from ever seeing EOF (#87134 / PAN-78).
+        kill_process_tree(proc)
+        drained_out: str | None = None
+        drained_err: str | None = None
+        try:
+            drained_out, drained_err = proc.communicate(timeout=1)
+        except Exception:
+            pass
+        raise subprocess.TimeoutExpired(
+            cmd=cmd_for_exc,
+            timeout=timeout,
+            output=drained_out if drained_out is not None else getattr(exc, "output", None),
+            stderr=drained_err if drained_err is not None else getattr(exc, "stderr", None),
+        ) from None
+    except Exception:
+        kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=1)
+        except Exception:
+            pass
+        raise
+    return subprocess.CompletedProcess(cmd_for_exc, proc.returncode, stdout, stderr)
+
+
 def bounded_probe_run(
     argv: Sequence[str],
     *,
@@ -584,45 +666,13 @@ def bounded_probe_run(
     scan hit exactly this during ``hermes update`` on slow-WMI machines
     (#87134); the git probes hit it first (#68609 / #66037).
 
-    The bounded flow: an explicit ``communicate(timeout)``, then on any
-    failure a tree-kill (see :func:`kill_process_tree`) plus a bounded 1s
-    post-kill drain; if the pipes are still held after that, they're abandoned
-    (the orphaned reader threads are daemonic and cost nothing).
-
-    The spawn contract mirrors the ``run`` calls it replaces: PIPE/PIPE/DEVNULL,
-    ``text`` with UTF-8 decoding (*errors* configurable — the process scans use
-    ``"ignore"``), and the hidden-window ``creationflags`` on Windows only. On
-    POSIX the child is placed in its own process group (``process_group=0``,
-    Python ≥3.11) so timeout cleanup can take down descendants with the
-    launcher instead of orphaning them.
+    Built on :func:`bounded_captured_run` (tree-kill + bounded drain); probes
+    just map every failure — including timeout — to ``None``.
     """
-    _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
     try:
-        proc = subprocess.Popen(
-            list(argv),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors=errors,
-            **_popen_kwargs,
-        )
+        return bounded_captured_run(list(argv), timeout=timeout, errors=errors)
     except Exception:
         return None
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except Exception:
-        # Timeout OR any other communicate() failure (torn-down pipe, decode
-        # error): terminate the child + descendants and drain bounded. Leaving
-        # it running would leak the same suspended-descendant class this guards.
-        kill_process_tree(proc)
-        try:
-            proc.communicate(timeout=1)
-        except Exception:
-            pass
-        return None
-    return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
 
 
 def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:

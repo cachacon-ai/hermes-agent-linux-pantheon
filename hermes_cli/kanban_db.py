@@ -1776,6 +1776,110 @@ def _dispatch_tick_lock(db_path: Path):
                 handle.close()
 
 
+# In-process half of the host-cap lock. ``fcntl.flock`` / ``msvcrt.locking``
+# serialize across processes, but same-process threads (dashboard nudges for
+# two boards, tests) share one interpreter and need an explicit threading
+# lock — flock alone is not a reliable cross-thread mutex on every platform
+# when file descriptors are duplicated oddly.
+_HOST_CAP_THREAD_LOCK = threading.Lock()
+
+
+def _lock_dispatch_host_cap_file(handle) -> None:
+    """Acquire the cross-process half of the host-cap lock or raise."""
+    if _IS_WINDOWS:
+        import msvcrt
+
+        # msvcrt.locking addresses a byte range. Ensure byte zero exists on
+        # filesystems that reject locks past EOF, then lock that same byte.
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(bytes([0]))
+            handle.flush()
+        handle.seek(0)
+        locking = getattr(msvcrt, "locking")
+        block_lock = getattr(msvcrt, "LK_LOCK")
+        locking(handle.fileno(), block_lock, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_dispatch_host_cap_file(handle) -> None:
+    """Release the cross-process half of the host-cap lock."""
+    if _IS_WINDOWS:
+        import msvcrt
+
+        handle.seek(0)
+        locking = getattr(msvcrt, "locking")
+        unlock_mode = getattr(msvcrt, "LK_UNLCK")
+        locking(handle.fileno(), unlock_mode, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _dispatch_host_cap_lock():
+    """Mutually exclude host-cap check + worker claims across all boards.
+
+    Board-scoped :func:`_dispatch_tick_lock` intentionally lets unrelated
+    boards tick in parallel (distinct DB files, distinct integrity domains).
+    ``kanban.max_in_progress`` is a **host** budget though — workers are OS
+    processes sharing one machine's memory — so the cross-board running
+    count and the claims that consume that budget must be exclusive on the
+    same Kanban host. Without this, two concurrent board ticks can each
+    observe unused budget and oversubscribe (the exact OOM/swap-thrash
+    failure the host cap exists to prevent).
+
+    Blocking (unlike the non-blocking board lock): a sibling board waiting
+    on the host cap still has useful work to do with whatever budget
+    remains after the holder finishes claiming. A non-blocking skip would
+    drop that opportunity for a whole tick. Holders are expected to finish
+    the count+claim+spawn critical section promptly; the OS releases the
+    file lock if the holder process dies.
+
+    Lock file: ``<kanban_home>/kanban/.dispatch-host-cap.lock``. Combines
+    :data:`_HOST_CAP_THREAD_LOCK` (same-process) with a cross-process lock.
+    Yields ``False`` when the cross-process lock cannot be opened or
+    acquired. Callers must skip dispatch in that case; continuing with only
+    the thread lock would allow another process to oversubscribe the host.
+    """
+    lock_path = kanban_home() / "kanban" / ".dispatch-host-cap.lock"
+    handle = None
+    acquired_file_lock = False
+    with _HOST_CAP_THREAD_LOCK:
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+b")
+            _lock_dispatch_host_cap_file(handle)
+            acquired_file_lock = True
+        except (OSError, AttributeError, ImportError) as exc:
+            _log.error(
+                "kanban dispatch: could not acquire host-cap lock at %s; "
+                "skipping this tick: %s",
+                lock_path, exc,
+            )
+        try:
+            yield acquired_file_lock
+        finally:
+            if handle is not None:
+                try:
+                    if acquired_file_lock:
+                        _unlock_dispatch_host_cap_file(handle)
+                except (OSError, AttributeError, ImportError) as exc:
+                    _log.warning(
+                        "kanban dispatch: failed to release host-cap lock at %s: %s",
+                        lock_path, exc,
+                    )
+                finally:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+
+
 # Periodic WAL checkpoint state for the dispatcher tick path. The kanban
 # connections run with ``wal_autocheckpoint=100``, but a passive
 # autocheckpoint can be starved on a busy multi-process board (any reader
@@ -8081,11 +8185,10 @@ class DispatchResult:
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
     skipped_locked: bool = False
-    """True when this tick was skipped because another process already held
-    the board's dispatch lock (issue #35240). A losing dispatcher does no
-    DB writes this tick — the lock holder is making progress on the same
-    board. This is the steady-state signal that a single-writer guard is
-    actively preventing two dispatchers from racing on ``kanban.db``."""
+    """True when this tick was skipped because a required dispatch lock
+    prevented safe execution. This includes another process holding the
+    board lock (issue #35240) or failure to acquire the cross-process
+    host-cap lock. No dispatch reclaim, claim, or spawn work runs this tick."""
     memory_pressure: Optional[str] = None
     """System memory pressure observed at spawn time when the memory guard
     restricted this tick (OOF-30/OOF-77): ``"critical"`` — no new workers
@@ -9705,6 +9808,34 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
+def cap_max_spawn_to_host_limit(
+    requested: Optional[int],
+    *,
+    max_in_progress: Optional[int] = None,
+) -> Optional[int]:
+    """Clamp an explicit ``max_spawn`` request to the host concurrency cap.
+
+    Dashboard nudges and other one-shot dispatch entry points may ask for
+    more workers than ``resolve_max_in_progress`` allows on small VMs. The
+    dispatch tick still honours ``max_in_progress`` when passed through, but
+    capping the requested ``max_spawn`` keeps per-board limits aligned with
+    the host budget and avoids advertising unsafe values in API logs.
+    """
+    if requested is None:
+        return None
+    try:
+        spawn_cap = int(requested)
+    except (TypeError, ValueError):
+        return None
+    if spawn_cap < 1:
+        return None
+    if max_in_progress is None:
+        max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+    if max_in_progress is not None:
+        spawn_cap = min(spawn_cap, max_in_progress)
+    return spawn_cap
+
+
 def configured_max_in_progress() -> Optional[int]:
     """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
 
@@ -9842,17 +9973,18 @@ def dispatch_once(
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
     the holder is already making progress on the same board.
 
-    The lock is keyed off the board's resolved DB path, so unrelated
-    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
+    The board lock is keyed off the board's resolved DB path, so unrelated
+    boards keep independent integrity domains and can tick their
+    reclaim/promote paths without blocking each other. When
+    ``max_in_progress`` is set, however, the host-cap check and the
+    claims that consume that budget are additionally wrapped in
+    :func:`_dispatch_host_cap_lock` so concurrent board ticks cannot
+    oversubscribe the shared host concurrency budget. See
+    :func:`_dispatch_tick_lock` / :func:`_dispatch_host_cap_lock` for the
     cross-process / cross-platform mechanics.
     """
-    try:
-        db_path = kanban_db_path(board=board)
-    except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        result = _dispatch_once_locked(
+    def _run_locked() -> DispatchResult:
+        return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
             ttl_seconds=ttl_seconds,
@@ -9866,29 +9998,38 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
         )
+
+    def _run_with_host_cap() -> DispatchResult:
+        # Host-cap lock nests INSIDE the board lock (callers that already
+        # hold the board lock acquire host next). Always board → host so
+        # two boards never deadlock on lock order.
+        if max_in_progress is not None:
+            with _dispatch_host_cap_lock() as acquired:
+                if not acquired:
+                    return DispatchResult(skipped_locked=True)
+                return _run_locked()
+        return _run_locked()
+
+    try:
+        db_path = kanban_db_path(board=board)
+    except Exception:
+        # Path resolution should never fail, but if it somehow does we
+        # must not lose the tick — fall through to an unguarded (board)
+        # dispatch rather than dropping work. Host-cap lock still applies
+        # when a host budget is in force.
+        result = _run_with_host_cap()
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _dispatch_once_locked(
-                conn,
-                spawn_fn=spawn_fn,
-                ttl_seconds=ttl_seconds,
-                dry_run=dry_run,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
-                failure_limit=failure_limit,
-                stale_timeout_seconds=stale_timeout_seconds,
-                board=board,
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-                reconcile_orphans=reconcile_orphans,
-            )
-            # Still under the dispatch lock: run the periodic PASSIVE WAL
-            # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
-            # bounded by journal_size_limit on the writer's natural reset).
+            result = _run_with_host_cap()
+            # Still under the board dispatch lock: run the periodic PASSIVE
+            # WAL checkpoint (see _maybe_checkpoint_wal; the -wal file size
+            # is bounded by journal_size_limit on the writer's natural reset).
+            # Checkpoint stays outside the host-cap lock so a sibling board
+            # waiting on host capacity is not blocked by WAL hygiene.
             _maybe_checkpoint_wal(conn, db_path)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
@@ -10012,7 +10153,19 @@ def _dispatch_once_locked(
     # workers on every other board count against the same budget. Without
     # this, N active boards multiply the cap by N — exactly the fan-out
     # the memory-derived default exists to prevent.
+    #
+    # Cross-board mutual exclusion for this read/check + the claims below
+    # is provided by :func:`_dispatch_host_cap_lock` in :func:`dispatch_once`
+    # whenever ``max_in_progress`` is set. Re-count this board's running
+    # tasks here so the budget reflects any claims that landed while we
+    # waited on that host lock (or between the preliminary count above and
+    # entering the host-cap critical section).
     if max_in_progress is not None:
+        running_count = count_running_tasks(conn)
+        if max_spawn is not None:
+            if running_count >= max_spawn:
+                return result
+            spawn_budget = max_spawn - running_count
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
             return result
