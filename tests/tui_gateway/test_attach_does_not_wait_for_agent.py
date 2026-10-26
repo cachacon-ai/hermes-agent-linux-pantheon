@@ -2,10 +2,12 @@
 
 ``image.attach``, ``image.attach_bytes``, ``file.attach``, ``pdf.attach`` and
 ``clipboard.paste`` need the session RECORD (cwd, profile_home,
-attached_images) — never the agent. They also run inline on the socket reader
-thread (none is in ``_LONG_HANDLERS``), so any wait there stalls every RPC
-queued behind them on the same socket, including the ``prompt.submit`` that
-carries the image.
+attached_images) — never the agent. Most of them stay on the fast inline
+reader path; ``pdf.attach`` is the exception — it is in ``_LONG_HANDLERS``
+because ``pdftoppm`` can block for tens of seconds, so pool routing keeps
+the stdio/WS reader free (PAN-78). Either way, waiting on the deferred
+agent build here would stall every RPC queued behind the attach on the
+same socket, including the ``prompt.submit`` that carries the image.
 
 These are invariants, not timings: the handler must complete while the build
 event is still unset, and the staged image must still reach the turn.

@@ -483,21 +483,28 @@ def _(rid, params: dict) -> dict:
             # has all API keys in os.environ.
             from tools.environments.local import build_subprocess_env
             sanitized_env = build_subprocess_env()
-            from hermes_cli._subprocess_compat import windows_hide_flags
+            from hermes_cli._subprocess_compat import bounded_captured_run
 
-            r = subprocess.run(
-                qc.get("command", ""),
-                shell=True,
-                capture_output=True,
-                text=True,
-                # Force UTF-8 + lossy decode so non-UTF-8 child output can't
-                # crash the gateway thread on locale-mismatched Windows (#53137).
-                encoding="utf-8", errors="replace",
-                timeout=30,
-                stdin=subprocess.DEVNULL,
-                env=sanitized_env,
-                creationflags=windows_hide_flags(),
-            )
+            try:
+                # bounded_captured_run (not subprocess.run): on Windows,
+                # run()'s post-timeout communicate() can hang forever when a
+                # descendant holds captured pipe handles, occupying an RPC
+                # pool worker indefinitely (PAN-78).
+                r = bounded_captured_run(
+                    qc.get("command", ""),
+                    shell=True,
+                    # Force UTF-8 + lossy decode so non-UTF-8 child output can't
+                    # crash the gateway thread on locale-mismatched Windows (#53137).
+                    errors="replace",
+                    timeout=_QUICK_COMMAND_EXEC_TIMEOUT_S,
+                    env=sanitized_env,
+                )
+            except subprocess.TimeoutExpired:
+                return _err(
+                    rid,
+                    5016,
+                    f"quick command exec timed out (>{_QUICK_COMMAND_EXEC_TIMEOUT_S:g}s)",
+                )
             output = (
                 (r.stdout or "")
                 + ("\n" if r.stdout and r.stderr else "")

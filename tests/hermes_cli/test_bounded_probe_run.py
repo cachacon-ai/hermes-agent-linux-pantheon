@@ -26,7 +26,11 @@ import time
 
 import pytest
 
-from hermes_cli._subprocess_compat import bounded_git_probe, bounded_probe_run
+from hermes_cli._subprocess_compat import (
+    bounded_captured_run,
+    bounded_git_probe,
+    bounded_probe_run,
+)
 
 _PY = sys.executable
 
@@ -110,3 +114,39 @@ def test_posix_child_gets_own_process_group():
     )
     assert result is not None
     assert result.stdout.strip() == "True"
+
+
+def test_bounded_captured_run_raises_timeout_expired():
+    """Callers that need the TimeoutExpired contract (quick commands, pdf.attach)
+    get a real exception after a bounded drain — not an indefinite hang."""
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        bounded_captured_run(
+            [_PY, "-c", "import time; time.sleep(300)"],
+            timeout=0.5,
+        )
+    assert time.monotonic() - start < 30
+
+
+def test_bounded_captured_run_shell_timeout_with_pipe_holding_descendant(tmp_path):
+    """shell=True quick-command shape: descendant holds pipes after timeout."""
+    script = tmp_path / "pipe_hold.py"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    cmd = f"{_PY} {script}"
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        bounded_captured_run(cmd, shell=True, timeout=0.5)
+    assert time.monotonic() - start < 15
+
+
+def test_bounded_captured_run_success_and_nonzero():
+    ok = bounded_captured_run([_PY, "-c", "print('hi')"], timeout=30)
+    assert ok.returncode == 0
+    assert ok.stdout.strip() == "hi"
+    bad = bounded_captured_run([_PY, "-c", "raise SystemExit(7)"], timeout=30)
+    assert bad.returncode == 7

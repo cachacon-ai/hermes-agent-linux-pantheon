@@ -11505,8 +11505,7 @@ def test_command_dispatch_exec_nonzero_surfaces_error(monkeypatch):
         lambda: {"quick_commands": {"boom": {"type": "exec", "command": "boom"}}},
     )
     monkeypatch.setattr(
-        server.subprocess,
-        "run",
+        "hermes_cli._subprocess_compat.bounded_captured_run",
         lambda *args, **kwargs: types.SimpleNamespace(
             returncode=1, stdout="", stderr="failed"
         ),

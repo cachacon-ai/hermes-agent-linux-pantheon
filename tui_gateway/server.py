@@ -409,6 +409,15 @@ _LONG_HANDLERS = frozenset(
         "shell.exec",
         "skills.manage",
         "slash.exec",
+        # pdf.attach runs pdftoppm at 150 DPI — up to 25 pages with a
+        # subprocess cap below the client RPC deadline. Inline on the
+        # stdio/WS reader it blocked prompt.submit, approval.respond, and
+        # session.interrupt for the whole render (PAN-78).
+        "pdf.attach",
+        # command.dispatch quick_commands.type=exec uses bounded_captured_run
+        # with a 30s timeout. Uncaught TimeoutExpired on the stdio reader
+        # loop terminated the gateway; pool routing contains it (PAN-78).
+        "command.dispatch",
     }
 )
 
@@ -3805,15 +3814,16 @@ def _sess_building(params, rid):
     ``_wait_agent`` was buying nothing and charging up to 30 seconds for it.
 
     That charge landed in the worst possible place. Attach runs BEFORE
-    ``prompt.submit``, none of these methods is in ``_LONG_HANDLERS``, and a
-    non-pooled handler runs inline on the socket reader thread — so pasting an
-    image into a session whose deferred build was still running (MCP
-    discovery, model metadata, skills scan: routinely tens of seconds on a
-    cold start) stalled the send AND every RPC queued behind it on the same
-    socket, with no spinner to explain it. Plain text was unaffected because
-    ``prompt.submit`` already resolves via ``_sess_nowait`` and waits later,
-    off the reader thread — which is exactly why the bug reads as "text is
-    instant, images hang."
+    ``prompt.submit``; most attach RPCs stay on the fast inline path, but
+    ``pdf.attach`` is in ``_LONG_HANDLERS`` because pdftoppm can block for
+    tens of seconds. A non-pooled attach handler runs inline on the socket
+    reader thread — so pasting an image into a session whose deferred build
+    was still running (MCP discovery, model metadata, skills scan: routinely
+    tens of seconds on a cold start) stalled the send AND every RPC queued
+    behind it on the same socket, with no spinner to explain it. Plain text
+    was unaffected because ``prompt.submit`` already resolves via
+    ``_sess_nowait`` and waits later, off the reader thread — which is
+    exactly why the bug reads as "text is instant, images hang."
 
     The build is still kicked off (it warms the agent the following
     ``prompt.submit`` needs); we simply stop blocking on it here.
@@ -15144,6 +15154,16 @@ def _run_prompt_submit(
 _ATTACH_BYTES_MAX_BYTES = 25 * 1024 * 1024
 _PDF_ATTACH_MAX_BYTES = 50 * 1024 * 1024
 _PDF_ATTACH_MAX_PAGES = 25
+# pdftoppm wall clock must stay strictly below the default client RPC
+# deadline (ui-tui REQUEST_TIMEOUT_MS / apps/shared DEFAULT_REQUEST_TIMEOUT_MS
+# = 120s). Pool queue + validation eat part of that budget, so a 120s
+# subprocess ceiling would let the client reject the call with a generic
+# timeout before error 5028 could be delivered (PAN-78).
+_PDF_ATTACH_CLIENT_RPC_DEADLINE_S = 120
+_PDF_ATTACH_SUBPROCESS_TIMEOUT_S = 90
+# Quick-command exec ceiling. Uses bounded_captured_run so Windows
+# post-timeout pipe drains cannot hang the shared RPC worker pool.
+_QUICK_COMMAND_EXEC_TIMEOUT_S = 30
 
 # Leading magic bytes → file extension, for filename-less uploads.
 _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (

@@ -1,13 +1,13 @@
-"""Regression tests for UTF-8 encoding hardening in tui_gateway/server.py (#53137).
+"""Regression tests for UTF-8 encoding hardening in TUI subprocesses (#53137).
 
 On Windows with a non-UTF-8 system locale (e.g. GBK on Chinese Windows),
 text-mode subprocess reads defaulted to the locale encoding. When a child
 process emitted bytes invalid in that locale, an unhandled UnicodeDecodeError
 crashed the reader thread / gateway thread.
 
-#53137 added encoding="utf-8", errors="replace" to every text-mode subprocess
-call in tui_gateway/server.py. These tests assert that the kwargs survive so
-the crash class cannot silently regress.
+These tests assert that text-mode subprocess paths use UTF-8 with replacement.
+PAN-78 moved quick-command exec to bounded_captured_run, so that test verifies
+the helper's Popen kwargs instead of patching subprocess.run.
 
 # Test pattern adapted from @devorun's PR #52700 (salvage convention).
 """
@@ -111,22 +111,21 @@ def test_shell_exec_uses_utf8_replace():
 # ── quick-command exec path (via command.dispatch) ───────────────────────
 
 def test_quick_command_exec_uses_utf8_replace():
-    """A quick_command of type 'exec' is dispatched via command.dispatch;
-    the underlying subprocess.run must pass encoding="utf-8" and
-    errors="replace" (#53137)."""
+    """command.dispatch uses bounded_captured_run with UTF-8 replacement decoding."""
     handler = server._methods["command.dispatch"]
-    fake_cp = _make_completed_process()
-    with patch("subprocess.run", return_value=fake_cp) as mock_run, \
+    with patch("hermes_cli._subprocess_compat.subprocess.Popen") as mock_popen, \
          patch("tui_gateway.server._load_cfg", return_value={
              "quick_commands": {"runcmd": {"type": "exec", "command": "echo hi"}}
          }), \
          patch("tools.environments.local._sanitize_subprocess_env", return_value={"PATH": "/usr/bin"}):
+        mock_popen.return_value.communicate.return_value = ("", "")
+        mock_popen.return_value.returncode = 0
         resp = handler(1, {"name": "runcmd", "arg": "", "session_id": ""})
-        assert mock_run.called, "subprocess.run was not invoked for quick-command exec"
-        kwargs = mock_run.call_args[1]
+        assert mock_popen.called, "Popen was not invoked for quick-command exec"
+        kwargs = mock_popen.call_args[1]
         assert kwargs.get("encoding") == "utf-8", (
-            f"quick-command exec subprocess.run must set encoding='utf-8' (got {kwargs.get('encoding')!r})"
+            f"quick-command exec Popen must set encoding='utf-8' (got {kwargs.get('encoding')!r})"
         )
         assert kwargs.get("errors") == "replace", (
-            f"quick-command exec subprocess.run must set errors='replace' (got {kwargs.get('errors')!r})"
+            f"quick-command exec Popen must set errors='replace' (got {kwargs.get('errors')!r})"
         )
