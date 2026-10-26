@@ -1293,7 +1293,7 @@
           laneByProfile, setLaneByProfile,
           search, setSearch,
           onNudgeDispatch: function () {
-            SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
+            SDK.fetchJSON(withBoard(`${API}/dispatch`, board), { method: "POST" })
               .then(loadBoard)
               .catch(function (e) { setError(String(e.message || e)); });
           },
