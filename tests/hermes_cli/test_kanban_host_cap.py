@@ -15,8 +15,12 @@ Three gaps found in review of the original memory-guard PR:
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -184,6 +188,175 @@ def test_count_running_tasks_other_boards_fails_open(
         lambda **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     assert kb.count_running_tasks_other_boards() == 0
+
+
+def test_concurrent_board_ticks_cannot_oversubscribe_host_cap(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Two boards ticking at once must never exceed ``max_in_progress``.
+
+    Regression for the host-cap race: board-scoped dispatch locks allow
+    unrelated boards to tick in parallel, and a plain read/check of
+    ``count_running_tasks_other_boards`` then let each tick observe zero
+    running workers and each reserve the full budget. Forcing both ticks
+    through that former race window (sync inside the cross-board count)
+    must still leave total running workers ≤ the host cap.
+    """
+    kb.create_board("second")
+
+    with kb.connect() as conn:
+        for title in ("d1", "d2", "d3"):
+            kb.create_task(conn, title=title, assignee="alice")
+    with kb.connect(board="second") as conn:
+        for title in ("s1", "s2", "s3"):
+            kb.create_task(conn, title=title, assignee="alice")
+
+    # Hold both board locks simultaneously so the test proves the host-cap
+    # lock — not the board locks — is what serializes the budget check.
+    # (Board locks are independent by design; see test_lock_is_board_scoped.)
+    entered_count = threading.Event()
+    release_count = threading.Event()
+    in_count = 0
+    in_count_lock = threading.Lock()
+    concurrent_count_entries = threading.Event()
+    orig_count = kb.count_running_tasks_other_boards
+
+    def racing_count(board=None):
+        nonlocal in_count
+        with in_count_lock:
+            in_count += 1
+            if in_count > 1:
+                concurrent_count_entries.set()
+        entered_count.set()
+        # Widen the former race window: without the host-cap lock the
+        # sibling tick reaches this same point and sets
+        # concurrent_count_entries. With the lock it blocks before entry.
+        assert release_count.wait(timeout=5), "host-cap holder stuck in count"
+        with in_count_lock:
+            in_count -= 1
+        return orig_count(board)
+
+    monkeypatch.setattr(kb, "count_running_tasks_other_boards", racing_count)
+
+    results: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def tick(slug: str) -> None:
+        try:
+            spawns: list = []
+            with kb.connect(board=slug) as conn:
+                results[slug] = kb.dispatch_once(
+                    conn,
+                    board=slug,
+                    spawn_fn=_fake_spawn_factory(spawns),
+                    max_in_progress=2,
+                )
+            results[f"{slug}_spawns"] = spawns
+        except BaseException as exc:  # noqa: BLE001 — surface in parent
+            errors.append(exc)
+
+    t_default = threading.Thread(target=tick, args=("default",))
+    t_second = threading.Thread(target=tick, args=("second",))
+    t_default.start()
+    t_second.start()
+
+    assert entered_count.wait(timeout=5), "neither tick reached host-cap count"
+    # Give the sibling ample time to also enter the count if the host-cap
+    # lock is missing. Under the lock it must still be blocked here.
+    assert not concurrent_count_entries.wait(timeout=0.3), (
+        "both board ticks entered count_running_tasks_other_boards concurrently "
+        "— host-cap lock is not serializing the read/check"
+    )
+    release_count.set()
+    t_default.join(timeout=10)
+    t_second.join(timeout=10)
+    assert not t_default.is_alive() and not t_second.is_alive()
+    assert not errors, errors
+
+    running = {}
+    for slug in ("default", "second"):
+        with kb.connect(board=slug) as conn:
+            running[slug] = kb.count_running_tasks(conn)
+    total_running = sum(running.values())
+    assert total_running <= 2, {
+        "errors": errors,
+        "spawned": {
+            "default": len(results.get("default_spawns") or []),
+            "second": len(results.get("second_spawns") or []),
+        },
+        "running": running,
+        "total_running": total_running,
+    }
+    assert not concurrent_count_entries.is_set()
+
+
+def test_host_cap_lock_serializes_separate_processes(kanban_home, tmp_path):
+    """A second process must wait while another process holds the host lock."""
+    started = tmp_path / "host-lock-child-started"
+    acquired = tmp_path / "host-lock-child-acquired"
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(repo_root) + (
+        os.pathsep + current_pythonpath if current_pythonpath else ""
+    )
+    child_code = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "started, acquired = map(Path, sys.argv[1:])\n"
+        "started.touch()\n"
+        "with kb._dispatch_host_cap_lock() as locked:\n"
+        "    acquired.write_text(str(locked), encoding='utf-8')\n"
+    )
+    child = None
+    try:
+        with kb._dispatch_host_cap_lock() as parent_locked:
+            assert parent_locked
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code, str(started), str(acquired)],
+                cwd=repo_root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 5
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert started.exists(), "child process did not reach lock attempt"
+            time.sleep(0.25)
+            assert child.poll() is None, "child completed without waiting for the process lock"
+            assert not acquired.exists(), "child bypassed the cross-process host lock"
+    finally:
+        if child is not None:
+            stdout, stderr = child.communicate(timeout=10)
+            assert child.returncode == 0, f"child failed: {stderr}\n{stdout}"
+
+    assert acquired.read_text(encoding="utf-8") == "True"
+
+
+def test_dispatch_skips_when_host_cap_lock_cannot_be_acquired(
+    kanban_home, all_assignees_spawnable, monkeypatch, caplog,
+):
+    """A file-lock error must fail closed without claiming or spawning work."""
+    spawns: list = []
+    with kb.connect() as conn:
+        kb.create_task(conn, title="keep-ready", assignee="alice")
+        monkeypatch.setattr(
+            kb, "_lock_dispatch_host_cap_file",
+            lambda handle: (_ for _ in ()).throw(OSError("lock unavailable")),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=1,
+        )
+
+    assert not spawns
+    assert not result.spawned
+    assert result.skipped_locked
+    assert "could not acquire host-cap lock" in caplog.text
 
 
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):

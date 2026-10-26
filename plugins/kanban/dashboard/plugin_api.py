@@ -2282,14 +2282,28 @@ def get_task_log(
 @router.post("/dispatch")
 def dispatch(
     dry_run: bool = Query(False),
-    max_n: int = Query(8, alias="max"),
+    max_n: Optional[int] = Query(None, alias="max", ge=1),
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    max_in_progress = kanban_db.resolve_max_in_progress(
+        kanban_db.configured_max_in_progress()
+    )
+    if max_in_progress is None:
+        # Preserve the dashboard's former max=8 safety bound when the host
+        # memory probe is unavailable and no cap is configured.
+        max_in_progress = kanban_db.DERIVED_MAX_IN_PROGRESS_CEILING
+    max_spawn = kanban_db.cap_max_spawn_to_host_limit(
+        max_n, max_in_progress=max_in_progress,
+    )
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            board=board,
         )
         # DispatchResult is a dataclass.
         try:
